@@ -414,30 +414,6 @@ def test_v1_models_fetches_codex_registry_under_chatgpt_auth(monkeypatch) -> Non
             "Fetched Codex model IDs from upstream model registry: %s",
             (["gpt-5.5", "gpt-5.3-codex-spark"],),
         ),
-        (
-            "Returning Codex model metadata response source=%s model_ids=%s payload=%s",
-            (
-                "upstream_registry",
-                ["gpt-5.5", "gpt-5.3-codex-spark"],
-                {
-                    "object": "list",
-                    "data": [
-                        {
-                            "id": "gpt-5.5",
-                            "object": "model",
-                            "created": 0,
-                            "owned_by": "openai",
-                        },
-                        {
-                            "id": "gpt-5.3-codex-spark",
-                            "object": "model",
-                            "created": 0,
-                            "owned_by": "openai",
-                        },
-                    ],
-                },
-            ),
-        ),
     ]
 
 

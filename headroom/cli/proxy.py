@@ -204,13 +204,6 @@ def _selected_context_tool() -> str:
         "Env: HEADROOM_ANTHROPIC_PRE_UPSTREAM_MEMORY_CONTEXT_TIMEOUT_SECONDS."
     ),
 )
-@click.option(
-    "--log-level",
-    type=click.Choice(["debug", "info", "warning", "error"], case_sensitive=False),
-    default=None,
-    envvar="HEADROOM_LOG_LEVEL",
-    help="Set Headroom proxy file log level. Env: HEADROOM_LOG_LEVEL.",
-)
 @click.option("--log-file", default=None, help="Path to JSONL log file")
 @click.option(
     "--log-messages",
@@ -461,7 +454,6 @@ def proxy(
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
     anthropic_pre_upstream_memory_context_timeout_seconds: float | None,
-    log_level: str | None,
     log_file: str | None,
     log_messages: bool,
     codex_wire_debug: bool,
@@ -513,9 +505,6 @@ def proxy(
         OPENAI_BASE_URL=http://localhost:8787/v1 your-app
     """
     # Import here to avoid slow startup
-    if log_level:
-        os.environ["HEADROOM_LOG_LEVEL"] = log_level.upper()
-
     try:
         from headroom.proxy.server import ProxyConfig, run_server
     except ImportError as e:

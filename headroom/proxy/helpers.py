@@ -910,14 +910,6 @@ def _headroom_log_dir() -> Path:
     return _paths.log_dir()
 
 
-def _file_log_level() -> int:
-    raw_level = os.environ.get("HEADROOM_LOG_LEVEL", "INFO").strip().upper()
-    level = getattr(logging, raw_level, None)
-    if isinstance(level, int):
-        return level
-    return logging.INFO
-
-
 def _setup_file_logging() -> None:
     """Add a RotatingFileHandler to the headroom root logger.
 
@@ -937,8 +929,7 @@ def _setup_file_logging() -> None:
             backupCount=5,
             encoding="utf-8",
         )
-        log_level = _file_log_level()
-        handler.setLevel(log_level)
+        handler.setLevel(logging.INFO)
         handler.setFormatter(
             logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
@@ -946,7 +937,7 @@ def _setup_file_logging() -> None:
         # Disable propagation to root to avoid duplicate writes when
         # wrap.py redirects stderr to the same log file.
         headroom_logger = logging.getLogger("headroom")
-        headroom_logger.setLevel(log_level)
+        headroom_logger.setLevel(logging.INFO)
         if not any(isinstance(h, RotatingFileHandler) for h in headroom_logger.handlers):
             headroom_logger.addHandler(handler)
         headroom_logger.propagate = False

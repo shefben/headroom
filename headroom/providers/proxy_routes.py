@@ -114,12 +114,6 @@ def _models_list_response(model_ids: tuple[str, ...], *, source: str) -> Respons
         "object": "list",
         "data": [_openai_model_item(model_id) for model_id in model_ids],
     }
-    logger.debug(
-        "Returning Codex model metadata response source=%s model_ids=%s payload=%s",
-        source,
-        list(model_ids),
-        payload,
-    )
     return Response(
         content=json.dumps(payload),
         status_code=200,
