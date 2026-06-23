@@ -344,6 +344,13 @@ def _ensure_responses_store_for_memory_tools(
     return False
 
 
+def _allow_responses_memory_tools(*, is_chatgpt_auth: bool) -> bool:
+    # ChatGPT Codex rejects Responses payloads unless store=false. The
+    # transparent memory-tool continuation flow needs stored responses, so keep
+    # it on the regular API path only.
+    return not is_chatgpt_auth
+
+
 def _responses_input_item_text_bytes(item: Any) -> int:
     if not isinstance(item, dict):
         return _json_byte_len(item)
@@ -2971,6 +2978,12 @@ class OpenAIHandlerMixin:
             stripped_count=_pre_strip_count_resp,
             request_id=request_id,
         )
+        headers, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
+        if is_chatgpt_auth:
+            client = "codex"
+        responses_memory_tools_allowed = _allow_responses_memory_tools(
+            is_chatgpt_auth=is_chatgpt_auth
+        )
 
         # PR-A6 (P5-50, preps P0-6): session-sticky `OpenAI-Beta` merge
         # for /v1/responses. Compute a session_id off the same store the
@@ -3187,7 +3200,7 @@ class OpenAIHandlerMixin:
 
                 memory_tool_defs_chat = (
                     self.memory_handler.compute_memory_tool_definitions("openai")
-                    if self.memory_handler.config.inject_tools
+                    if self.memory_handler.config.inject_tools and responses_memory_tools_allowed
                     else []
                 )
                 memory_tool_defs_responses: list[dict[str, Any]] = []
@@ -3208,11 +3221,14 @@ class OpenAIHandlerMixin:
                 resp_tools = body.get("tools") or []
                 resp_tools, mem_tools_injected = _apply_sticky_mem_tools_resp(
                     provider="openai",
-                    session_id=_responses_session_id,
+                    session_id=_responses_session_id if responses_memory_tools_allowed else None,
                     request_id=request_id,
                     existing_tools=resp_tools,
                     memory_tools_to_inject=memory_tool_defs_responses,
-                    inject_this_turn=bool(self.memory_handler.config.inject_tools),
+                    inject_this_turn=bool(
+                        self.memory_handler.config.inject_tools
+                        and responses_memory_tools_allowed
+                    ),
                 )
                 if mem_tools_injected:
                     body["tools"] = resp_tools
@@ -3246,10 +3262,6 @@ class OpenAIHandlerMixin:
                 f"[{request_id}] /v1/responses always routes to OpenAI direct "
                 f"(backend '{self.anthropic_backend.name}' not used for Responses API)"
             )
-
-        headers, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
-        if is_chatgpt_auth:
-            client = "codex"
 
         # Route to correct endpoint based on auth mode.
         # ChatGPT session auth (codex login) uses chatgpt.com, not api.openai.com.
@@ -3467,6 +3479,7 @@ class OpenAIHandlerMixin:
                 if (
                     self.memory_handler
                     and memory_user_id
+                    and responses_memory_tools_allowed
                     and resp_json
                     and response.status_code == 200
                     and self.memory_handler.has_memory_tool_calls(resp_json, "openai")
@@ -3782,6 +3795,9 @@ class OpenAIHandlerMixin:
         )
 
         upstream_headers, is_chatgpt_auth = _resolve_codex_routing_headers(upstream_headers)
+        ws_memory_tools_allowed = _allow_responses_memory_tools(
+            is_chatgpt_auth=is_chatgpt_auth
+        )
         _lower_headers = {k.lower(): v for k, v in upstream_headers.items()}
 
         # Build upstream WebSocket URL based on auth mode
@@ -4386,7 +4402,7 @@ class OpenAIHandlerMixin:
 
                     ws_mem_defs_chat = (
                         self.memory_handler.compute_memory_tool_definitions("openai")
-                        if self.memory_handler.config.inject_tools
+                        if self.memory_handler.config.inject_tools and ws_memory_tools_allowed
                         else []
                     )
                     ws_mem_defs_responses: list[dict[str, Any]] = []
@@ -4407,11 +4423,13 @@ class OpenAIHandlerMixin:
                     ws_tools = ws_response_body.get("tools") or []
                     ws_tools, mem_injected = _apply_sticky_mem_tools_ws(
                         provider="openai",
-                        session_id=session_id,
+                        session_id=session_id if ws_memory_tools_allowed else None,
                         request_id=request_id,
                         existing_tools=ws_tools,
                         memory_tools_to_inject=ws_mem_defs_responses,
-                        inject_this_turn=bool(self.memory_handler.config.inject_tools),
+                        inject_this_turn=bool(
+                            self.memory_handler.config.inject_tools and ws_memory_tools_allowed
+                        ),
                     )
                     if mem_injected:
                         ws_response_body["tools"] = ws_tools
@@ -5073,7 +5091,9 @@ class OpenAIHandlerMixin:
                         nonlocal ws_upstream_frames_total, ws_last_upstream_frame_type
                         nonlocal ws_ttfb_ms
 
-                        memory_enabled = bool(self.memory_handler and memory_user_id)
+                        memory_enabled = bool(
+                            self.memory_handler and memory_user_id and ws_memory_tools_allowed
+                        )
 
                         # Per-response state (reset after each response.completed)
                         event_buffer: list[str] = []
