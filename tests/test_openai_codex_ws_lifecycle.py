@@ -78,6 +78,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         self.anthropic_backend = None
         self.cost_tracker = None
         self.memory_handler = None
+        self.traffic_learner = None
         self.ws_sessions = ws_sessions or WebSocketSessionRegistry()
         self.compression_executor_calls = 0
         self.compression_executor_timeouts: list[float] = []

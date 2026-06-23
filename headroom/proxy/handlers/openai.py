@@ -460,12 +460,9 @@ def _openai_responses_tool_results_for_learning(
         if not isinstance(item, dict):
             continue
         item_type = item.get("type")
-        if (
-            item_type != "function_call"
-            and (
-                not isinstance(item_type, str)
-                or f"{item_type}_output" not in _RESPONSES_OUTPUT_ITEM_TYPES
-            )
+        if item_type != "function_call" and (
+            not isinstance(item_type, str)
+            or f"{item_type}_output" not in _RESPONSES_OUTPUT_ITEM_TYPES
         ):
             continue
         call_id = item.get("call_id") or item.get("id")
@@ -3226,8 +3223,7 @@ class OpenAIHandlerMixin:
                     existing_tools=resp_tools,
                     memory_tools_to_inject=memory_tool_defs_responses,
                     inject_this_turn=bool(
-                        self.memory_handler.config.inject_tools
-                        and responses_memory_tools_allowed
+                        self.memory_handler.config.inject_tools and responses_memory_tools_allowed
                     ),
                 )
                 if mem_tools_injected:
@@ -3795,9 +3791,7 @@ class OpenAIHandlerMixin:
         )
 
         upstream_headers, is_chatgpt_auth = _resolve_codex_routing_headers(upstream_headers)
-        ws_memory_tools_allowed = _allow_responses_memory_tools(
-            is_chatgpt_auth=is_chatgpt_auth
-        )
+        ws_memory_tools_allowed = _allow_responses_memory_tools(is_chatgpt_auth=is_chatgpt_auth)
         _lower_headers = {k.lower(): v for k, v in upstream_headers.items()}
 
         # Build upstream WebSocket URL based on auth mode
