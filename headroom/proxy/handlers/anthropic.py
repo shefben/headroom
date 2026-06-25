@@ -1835,6 +1835,7 @@ class AnthropicHandlerMixin:
                 body, _tools_modified, _tools_before_bytes, _tools_after_bytes = compact_tools(body)
                 if _tools_modified:
                     tools = body["tools"]
+                    transforms_applied.append("anthropic:tool_schema_compaction")
                     _tools_compaction_ms = (time.time() - _tools_compaction_started) * 1000
                     logger.debug(
                         "[%s] tool schema compaction: %d -> %d bytes (%.0f%% saved) in %.1fms",
@@ -1861,6 +1862,7 @@ class AnthropicHandlerMixin:
                     body, _desc_modified, _desc_before, _desc_after = compact_tool_descriptions(body, _desc_max)
                     if _desc_modified:
                         tools = body["tools"]
+                        transforms_applied.append("anthropic:tool_desc_compaction")
                         logger.debug(
                             "[%s] tool description compaction: %d -> %d bytes (%.0f%% saved, max_chars=%d)",
                             request_id,
