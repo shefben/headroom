@@ -18,6 +18,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .retrieve_policy import (
+    render_retrieve_query_description,
+    render_retrieve_system_instructions,
+    render_retrieve_tool_description,
+)
+
 # Tool name constant - used for matching tool calls
 CCR_TOOL_NAME = "headroom_retrieve"
 
@@ -43,11 +49,7 @@ def create_ccr_tool_definition(
         "type": "function",
         "function": {
             "name": CCR_TOOL_NAME,
-            "description": (
-                "Retrieve original uncompressed content that was compressed to save tokens. "
-                "Use this when you need more data than what's shown in compressed tool results. "
-                "The hash is provided in compression markers like [N items compressed... hash=abc123]."
-            ),
+            "description": render_retrieve_tool_description(),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -57,11 +59,7 @@ def create_ccr_tool_definition(
                     },
                     "query": {
                         "type": "string",
-                        "description": (
-                            "Optional search query to filter results. "
-                            "If provided, only returns items matching the query. "
-                            "If omitted, returns all original items."
-                        ),
+                        "description": render_retrieve_query_description(),
                     },
                 },
                 "required": ["hash"],
@@ -76,11 +74,7 @@ def create_ccr_tool_definition(
         # Anthropic uses a slightly different format
         return {
             "name": CCR_TOOL_NAME,
-            "description": (
-                "Retrieve original uncompressed content that was compressed to save tokens. "
-                "Use this when you need more data than what's shown in compressed tool results. "
-                "The hash is provided in compression markers like [N items compressed... hash=abc123]."
-            ),
+            "description": render_retrieve_tool_description(),
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -90,11 +84,7 @@ def create_ccr_tool_definition(
                     },
                     "query": {
                         "type": "string",
-                        "description": (
-                            "Optional search query to filter results. "
-                            "If provided, only returns items matching the query. "
-                            "If omitted, returns all original items."
-                        ),
+                        "description": render_retrieve_query_description(),
                     },
                 },
                 "required": ["hash"],
@@ -105,10 +95,7 @@ def create_ccr_tool_definition(
         # Google/Gemini format
         return {
             "name": CCR_TOOL_NAME,
-            "description": (
-                "Retrieve original uncompressed content that was compressed to save tokens. "
-                "Use this when you need more data than what's shown in compressed tool results."
-            ),
+            "description": render_retrieve_tool_description(),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -118,7 +105,7 @@ def create_ccr_tool_definition(
                     },
                     "query": {
                         "type": "string",
-                        "description": "Optional search query to filter results",
+                        "description": render_retrieve_query_description(),
                     },
                 },
                 "required": ["hash"],
@@ -146,23 +133,7 @@ def create_system_instructions(
     Returns:
         Instruction text to append to system message.
     """
-    hash_list = ", ".join(hashes) if len(hashes) <= 5 else f"{', '.join(hashes[:5])} ..."
-
-    return f"""
-## Compressed Context Available
-
-Some tool outputs have been compressed to reduce context size. If you need
-the full uncompressed data, you can retrieve it using the `{CCR_TOOL_NAME}` tool.
-
-**How to retrieve:**
-- Call `{CCR_TOOL_NAME}(hash="<hash>")` to get all original items
-- Call `{CCR_TOOL_NAME}(hash="<hash>", query="search terms")` to search within
-
-**Available hashes:** {hash_list}
-
-Look for markers like `[N items compressed to M. Retrieve more: hash=abc123]`
-in tool results to find the hash for each compressed output.
-"""
+    return render_retrieve_system_instructions(hashes, CCR_TOOL_NAME)
 
 
 @dataclass
