@@ -60,11 +60,18 @@ def _build_runtime_contract() -> tuple[str, tuple[str, str]]:
     return spec.name, spec.args[-2:]
 
 
+def _build_mcp_package_spec(metadata: ProjectMetadata) -> str:
+    """Return the PyPI requirement needed to launch ``headroom mcp serve``."""
+
+    return f"{metadata.package_name}[mcp]"
+
+
 def build_server_json(metadata: ProjectMetadata | None = None) -> dict[str, object]:
     """Build the canonical ``server.json`` payload for Headroom."""
 
     metadata = metadata or load_project_metadata()
     command_name, runtime_tail = _build_runtime_contract()
+    package_spec = _build_mcp_package_spec(metadata)
     return {
         "$schema": SCHEMA_URL,
         "name": SERVER_NAME,
@@ -89,7 +96,7 @@ def build_server_json(metadata: ProjectMetadata | None = None) -> dict[str, obje
                     {
                         "type": "named",
                         "name": "--from",
-                        "value": metadata.package_name,
+                        "value": package_spec,
                     }
                 ],
                 "transport": {

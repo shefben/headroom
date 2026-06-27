@@ -14,6 +14,7 @@ from headroom.mcp_registry.server_json import (
     SERVER_DESCRIPTION,
     SERVER_NAME,
     WEBSITE_URL,
+    _build_mcp_package_spec,
     load_project_metadata,
 )
 
@@ -40,6 +41,13 @@ def test_build_server_json_uses_project_metadata() -> None:
     assert package["registryBaseUrl"] == "https://pypi.org"
     assert package["identifier"] == metadata.package_name
     assert package["version"] == metadata.version
+    assert package["runtimeArguments"] == [
+        {
+            "type": "named",
+            "name": "--from",
+            "value": _build_mcp_package_spec(metadata),
+        }
+    ]
 
 
 def test_build_server_json_matches_runtime_contract() -> None:
@@ -52,7 +60,7 @@ def test_build_server_json_matches_runtime_contract() -> None:
         {
             "type": "named",
             "name": "--from",
-            "value": load_project_metadata().package_name,
+            "value": _build_mcp_package_spec(load_project_metadata()),
         }
     ]
     assert [arg["value"] for arg in package["packageArguments"]] == [
