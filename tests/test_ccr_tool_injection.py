@@ -32,10 +32,15 @@ class TestCCRToolDefinition:
         assert "description" in tool
         assert "input_schema" in tool
         assert tool["input_schema"]["type"] == "object"
-        assert "hash" in tool["input_schema"]["properties"]
-        # Retrieval is by hash only — no query/search parameter.
-        assert "query" not in tool["input_schema"]["properties"]
+        props = tool["input_schema"]["properties"]
+        assert "hash" in props
+        # Unified-21 #3: hash stays the only required argument (a plain
+        # headroom_retrieve(hash) is the byte-exact full retrieval); the
+        # selective arguments are optional.
         assert tool["input_schema"]["required"] == ["hash"]
+        assert props["mode"]["enum"] == ["full", "search", "range", "metadata"]
+        for optional in ("query", "top_k", "cursor", "start", "end"):
+            assert optional in props
 
     def test_openai_format(self):
         """OpenAI tool definition has correct format."""

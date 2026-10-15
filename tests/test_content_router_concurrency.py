@@ -44,6 +44,11 @@ from headroom.telemetry.toin import TOINConfig, get_toin, reset_toin
 from headroom.transforms.compression_policy import policy_for_mode
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
 
+# Synthetic compressors below return fabricated summaries to exercise
+# plumbing; they run under an explicit unlimited lossy budget (the
+# SafetyGate invariants still apply). See conftest.permissive_lossy_budget.
+pytestmark = pytest.mark.usefixtures("permissive_lossy_budget")
+
 
 @pytest.fixture
 def fresh_toin():

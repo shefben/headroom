@@ -11,6 +11,8 @@ DIFF content is never lossy-chained (Kompressing hunks breaks ``git apply``).
 Kompress is mocked so these run without the ModernBERT model.
 """
 
+import pytest
+
 from headroom.transforms.content_router import (
     CompressionStrategy,
     ContentRouter,
@@ -88,6 +90,7 @@ def _run(r, content):
     return out, was, tr, rc
 
 
+@pytest.mark.usefixtures("permissive_lossy_budget")  # synthetic "TINY" lossy stage
 def test_lossy_after_fold_chains_when_it_helps():
     block = _grep_block()
     # kompress removes far more than the min-extra-savings floor → lossy kept.

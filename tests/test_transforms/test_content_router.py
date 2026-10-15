@@ -24,6 +24,11 @@ from headroom.transforms.content_router import (
 )
 from headroom.transforms.lossless_compaction import search_unheading
 
+# Synthetic compressors below return fabricated summaries to exercise
+# plumbing; they run under an explicit unlimited lossy budget (the
+# SafetyGate invariants still apply). See conftest.permissive_lossy_budget.
+pytestmark = pytest.mark.usefixtures("permissive_lossy_budget")
+
 # =============================================================================
 # Test Fixtures
 # =============================================================================
@@ -1677,7 +1682,10 @@ class TestCompressBlockContent:
         """Tier 2 (result cache): cached content is returned without
         re-running compression."""
         cache = router_with_cache._cache
-        key = hash("cacheable-content")
+        # A realistic cache entry: the cached form is smaller than its input
+        # (the SafetyGate re-checks a cached form against the current task).
+        content = "cacheable content line with several words in it\n" * 20
+        key = hash(content)
         original = "compressed-version-of-content"
 
         # Populate result cache
@@ -1686,7 +1694,7 @@ class TestCompressBlockContent:
 
         # _compress_block_content should return cached result
         compressed, was_compressed = router_with_cache._compress_block_content(
-            content="cacheable-content",
+            content=content,
             content_key=key,
             context="",
             bias=1.0,

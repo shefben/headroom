@@ -20,12 +20,19 @@ from __future__ import annotations
 import json
 from types import MethodType, SimpleNamespace
 
+import pytest
+
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 from headroom.transforms.content_router import (
     CompressionStrategy,
     ContentRouter,
     RouterCompressionResult,
 )
+
+# Synthetic compressors below return fabricated summaries to exercise
+# plumbing; they run under an explicit unlimited lossy budget (the
+# SafetyGate invariants still apply). See conftest.permissive_lossy_budget.
+pytestmark = pytest.mark.usefixtures("permissive_lossy_budget")
 
 
 class TokenCounter:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 import headroom.transforms.kompress_compressor as kc
 from headroom.transforms.content_detector import ContentType
 from headroom.transforms.content_router import (
@@ -12,6 +14,11 @@ from headroom.transforms.content_router import (
     RoutingDecision,
 )
 from headroom.transforms.kompress_compressor import KompressCompressor, KompressConfig
+
+# Synthetic compressors below return fabricated summaries to exercise
+# plumbing; they run under an explicit unlimited lossy budget (the
+# SafetyGate invariants still apply). See conftest.permissive_lossy_budget.
+pytestmark = pytest.mark.usefixtures("permissive_lossy_budget")
 
 
 class _Tokenizer:

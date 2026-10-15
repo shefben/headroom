@@ -577,3 +577,28 @@ def _detach_leaked_proxy_log_handler():
                 handler.close()
             except Exception:  # pragma: no cover - a closed/rotated file is fine
                 pass
+
+
+@pytest.fixture
+def permissive_lossy_budget(monkeypatch):
+    """Run the SafetyGate with an explicitly unlimited lossy budget.
+
+    For adapter/plumbing tests whose synthetic compressors return fabricated
+    summaries (``"kept words"``) to exercise splicing, caching and routing.
+    The SafetyGate invariants still run; only ``max_lossy_ratio`` and the
+    volatile bound are lifted. The enforced budget itself is covered by
+    ``tests/test_safety_gate.py`` and the Rust ``safety_gate`` tests.
+    """
+    import headroom.transforms.content_router as content_router_module
+    from headroom.transforms.compression_policy import CompressionPolicy
+
+    unlimited = CompressionPolicy(
+        live_zone_only=False,
+        cache_aligner_enabled=True,
+        volatile_token_threshold=1_000_000,
+        max_lossy_ratio=1.0,
+        toin_read_only=False,
+    )
+    monkeypatch.setattr(content_router_module, "default_gate_policy", lambda: unlimited)
+    monkeypatch.setattr(content_router_module.ContentRouter, "_gate_policy", lambda self: unlimited)
+    return unlimited

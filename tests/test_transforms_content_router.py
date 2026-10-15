@@ -25,6 +25,11 @@ from headroom.transforms.content_router import (
     split_into_sections,
 )
 
+# Synthetic compressors below return fabricated summaries to exercise
+# plumbing; they run under an explicit unlimited lossy budget (the
+# SafetyGate invariants still apply). See conftest.permissive_lossy_budget.
+pytestmark = pytest.mark.usefixtures("permissive_lossy_budget")
+
 
 @pytest.fixture(autouse=True)
 def _reset_detect_module_state(monkeypatch: pytest.MonkeyPatch) -> None:

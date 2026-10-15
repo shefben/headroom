@@ -47,6 +47,11 @@ GREP_OUTPUT = (
     "headroom/config.py:676:class TransformResult:  # messages, tokens_before, tokens_after\n"
 )
 
+# Synthetic compressors below return fabricated summaries to exercise
+# plumbing; they run under an explicit unlimited lossy budget (the
+# SafetyGate invariants still apply). See conftest.permissive_lossy_budget.
+pytestmark = pytest.mark.usefixtures("permissive_lossy_budget")
+
 LOSSY_SUMMARY = "grep found 8 matches across config and proxy modules (kompressed)."
 CCR_MARKER_SUMMARY = "grep matches (kompressed) <<ccr:9f3a21>>"
 

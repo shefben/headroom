@@ -17,6 +17,11 @@ from headroom.transforms.content_router import (
     RouterCompressionResult,
 )
 
+# Synthetic compressors below return fabricated summaries to exercise
+# plumbing; they run under an explicit unlimited lossy budget (the
+# SafetyGate invariants still apply). See conftest.permissive_lossy_budget.
+pytestmark = pytest.mark.usefixtures("permissive_lossy_budget")
+
 
 class TokenCounter:
     def count_text(self, text: str) -> int:

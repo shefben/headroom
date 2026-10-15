@@ -299,32 +299,47 @@ def test_sessionless_history_reference_forces_reinjection():
 # active session's prompt cache (the tool list bytes are part of the
 # cache key).
 _ANTHROPIC_CCR_TOOL_SNAPSHOT_BYTES = (
-    b'{"name":"headroom_retrieve",'
-    b'"description":"Retrieve original uncompressed content that was '
-    b"compressed to save tokens. Use this when you need more data than "
-    b"what's shown in compressed tool results. The hash is provided in "
-    b'compression markers like [N items compressed... hash=abc123].",'
-    b'"input_schema":{"type":"object",'
-    b'"properties":{'
-    b'"hash":{"type":"string",'
-    b'"description":"Hash key from the compression marker '
-    b"(e.g., 'abc123' from hash=abc123)\"}"
-    b'},"required":["hash"]}}'
+    b'{"name":"headroom_retrieve","description":"Retrieve original uncompres'
+    b"sed content that was compressed to save tokens. Use this when you need"
+    b" more data than what's shown in compressed tool results. The hash is p"
+    b"rovided in compression markers like [N items compressed... hash=abc123"
+    b"]. With only hash it returns the exact original; pass query (mode=sear"
+    b"ch) to get just the most relevant spans, or mode=range/metadata to pag"
+    b'e through large originals.","input_schema":{"type":"object","propertie'
+    b's":{"hash":{"type":"string","description":"Hash key from the compressi'
+    b'on marker (e.g., \'abc123\' from hash=abc123)"},"mode":{"type":"string",'
+    b'"enum":["full","search","range","metadata"],"description":"full (defau'
+    b"lt): exact original. search: top_k spans relevant to query. range: spa"
+    b'ns start..end. metadata: entry shape (types, paths, symbols)."},"query'
+    b'":{"type":"string","description":"What you are looking for (mode=searc'
+    b'h; implies search when set)."},"top_k":{"type":"integer","description"'
+    b':"Max spans to return (default 5)."},"cursor":{"type":"string","descri'
+    b'ption":"Cursor from a previous result\'s has_more page."},"start":{"typ'
+    b'e":"integer","description":"First span ordinal (mode=range)."},"end":{'
+    b'"type":"integer","description":"Span ordinal to stop before (mode=rang'
+    b'e)."}},"required":["hash"]}}'
 )
 
 _OPENAI_CCR_TOOL_SNAPSHOT_BYTES = (
-    b'{"type":"function",'
-    b'"function":{"name":"headroom_retrieve",'
-    b'"description":"Retrieve original uncompressed content that was '
-    b"compressed to save tokens. Use this when you need more data than "
-    b"what's shown in compressed tool results. The hash is provided in "
-    b'compression markers like [N items compressed... hash=abc123].",'
-    b'"parameters":{"type":"object",'
-    b'"properties":{'
-    b'"hash":{"type":"string",'
-    b'"description":"Hash key from the compression marker '
-    b"(e.g., 'abc123' from hash=abc123)\"}"
-    b'},"required":["hash"]}}}'
+    b'{"type":"function","function":{"name":"headroom_retrieve","description'
+    b'":"Retrieve original uncompressed content that was compressed to save '
+    b"tokens. Use this when you need more data than what's shown in compress"
+    b"ed tool results. The hash is provided in compression markers like [N i"
+    b"tems compressed... hash=abc123]. With only hash it returns the exact o"
+    b"riginal; pass query (mode=search) to get just the most relevant spans,"
+    b' or mode=range/metadata to page through large originals.","parameters"'
+    b':{"type":"object","properties":{"hash":{"type":"string","description":'
+    b"\"Hash key from the compression marker (e.g., 'abc123' from hash=abc123"
+    b')"},"mode":{"type":"string","enum":["full","search","range","metadata"'
+    b'],"description":"full (default): exact original. search: top_k spans r'
+    b"elevant to query. range: spans start..end. metadata: entry shape (type"
+    b's, paths, symbols)."},"query":{"type":"string","description":"What you'
+    b' are looking for (mode=search; implies search when set)."},"top_k":{"t'
+    b'ype":"integer","description":"Max spans to return (default 5)."},"curs'
+    b'or":{"type":"string","description":"Cursor from a previous result\'s ha'
+    b's_more page."},"start":{"type":"integer","description":"First span ord'
+    b'inal (mode=range)."},"end":{"type":"integer","description":"Span ordin'
+    b'al to stop before (mode=range)."}},"required":["hash"]}}}'
 )
 
 

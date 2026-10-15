@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 import time
 
+import pytest
+
 from headroom.transforms.compression_batches import (
     CompressionBatchEntry,
     build_compression_batches,
@@ -10,6 +12,11 @@ from headroom.transforms.compression_batches import (
 )
 from headroom.transforms.compression_units import CompressionUnit, RoutedCompressionUnit
 from headroom.transforms.content_router import CompressionStrategy, RouterCompressionResult
+
+# Synthetic compressors below return fabricated summaries to exercise
+# plumbing; they run under an explicit unlimited lossy budget (the
+# SafetyGate invariants still apply). See conftest.permissive_lossy_budget.
+pytestmark = pytest.mark.usefixtures("permissive_lossy_budget")
 
 
 def _entry(index: int, text: str) -> CompressionBatchEntry:
