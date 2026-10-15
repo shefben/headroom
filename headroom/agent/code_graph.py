@@ -562,6 +562,8 @@ class WorkspaceGraph:
         self.files: dict[str, FileRecord] = {}
         self.all_paths: set[str] = set()
         self.lower_paths: dict[str, str] = {}
+        self.stem_index: dict[str, set[str]] = {}
+        self.basename_index: dict[str, set[str]] = {}
         self.defs_by_name: dict[str, set[tuple[str, str]]] = {}
         self.module_index: dict[str, set[str]] = {}
         self.importers: dict[str, set[str]] = {}
@@ -643,12 +645,28 @@ class WorkspaceGraph:
             if old is not None:
                 self._unindex(old)
                 del self.files[path]
-            self.all_paths.discard(path)
-            self.lower_paths.pop(path.lower(), None)
+            if path in self.all_paths:
+                self.all_paths.discard(path)
+                self.lower_paths.pop(path.lower(), None)
+                self.stem_index.get(path.rsplit(".", 1)[0], set()).discard(path)
+                self.basename_index.get(path.rsplit("/", 1)[-1], set()).discard(path)
 
-    def _add_path(self, path: str) -> None:
+    def _add_path(self, path: str) -> bool:
+        if path in self.all_paths:
+            return False
         self.all_paths.add(path)
         self.lower_paths[path.lower()] = path
+        self.stem_index.setdefault(path.rsplit(".", 1)[0], set()).add(path)
+        self.basename_index.setdefault(path.rsplit("/", 1)[-1], set()).add(path)
+        return True
+
+    def rebuild_importers(self) -> None:
+        """Re-resolve every file's imports (after files appear or disappear)."""
+        with self.lock:
+            self.importers = {}
+            for path, record in self.files.items():
+                for target in self.resolve_imports(record):
+                    self.importers.setdefault(target, set()).add(path)
 
     def resolve_imports(self, record: FileRecord) -> set[str]:
         out: set[str] = set()
@@ -658,9 +676,8 @@ class WorkspaceGraph:
             cleaned = name.strip()
             if cleaned.startswith("."):
                 rel = os.path.normpath(os.path.join(base_dir, cleaned)).replace("\\", "/")
-                for path in self.all_paths:
-                    if path.rsplit(".", 1)[0] in (rel, rel + "/index", rel + "/__init__"):
-                        candidates.add(path)
+                for stem in (rel, rel + "/index", rel + "/__init__", rel + "/mod"):
+                    candidates |= self.stem_index.get(stem, set())
                 if not candidates:
                     dotted = cleaned.lstrip(".").replace("/", ".")
                     candidates |= self.module_index.get(dotted, set())
@@ -691,9 +708,9 @@ class WorkspaceGraph:
         if found:
             return found
         if "/" not in text and text:
-            matches = [p for p in self.all_paths if p.rsplit("/", 1)[-1] == text]
+            matches = self.basename_index.get(text, set())
             if len(matches) == 1:
-                return matches[0]
+                return next(iter(matches))
         return None
 
     # -- queries (request path; lock held briefly) -------------------------
@@ -877,9 +894,13 @@ class CodeGraphAdapter:
             self._pending.discard(future)
 
     def _guard(self, fn: Callable[..., Any], *args: Any) -> None:
+        if self._closed:
+            return
         try:
             fn(*args)
         except Exception as exc:  # noqa: BLE001 - indexing failures never surface to requests
+            if self._closed:
+                return  # the ledger closed underneath a scan during shutdown
             self.counters["errors"] += 1
             log.warning("code graph indexing failed: %s", describe_exception(exc))
 
@@ -895,9 +916,11 @@ class CodeGraphAdapter:
                 return False
             concurrent.futures.wait(pending, timeout=remaining)
 
-    def close(self) -> None:
+    def close(self, timeout: float = 2.0) -> None:
+        """Stop indexing: queued work is cancelled, a running scan stops persisting."""
         self._closed = True
         self._executor.shutdown(wait=False, cancel_futures=True)
+        self.wait_idle(timeout)
 
     # -- workspace management ----------------------------------------------
 
@@ -961,7 +984,7 @@ class CodeGraphAdapter:
     def _persist(
         self, graph: WorkspaceGraph, records: list[FileRecord], removed: list[str]
     ) -> None:
-        if self.ledger is None or (not records and not removed):
+        if self.ledger is None or self._closed or (not records and not removed):
             return
         now = time.time()
         statements: list[tuple[str, Sequence[Any]]] = [
@@ -1033,6 +1056,7 @@ class CodeGraphAdapter:
             with graph.lock:
                 for rel in paths:
                     graph._add_path(rel)
+            graph.rebuild_importers()
             self._persist(graph, changed, sorted(set(removed)))
             self.counters["full_scans" if first else "incremental_scans"] += 1
             graph.ready = True
@@ -1100,13 +1124,17 @@ class CodeGraphAdapter:
         full = os.path.join(graph.root, rel)
         if not os.path.exists(full):
             graph.remove(rel)
+            graph.rebuild_importers()
             self._persist(graph, [], [rel])
             return
         exts = _source_extensions() | set(_ext_to_lang())
         if Path(rel).suffix.lower() not in exts:
             return
+        is_new = rel not in graph.files
         record = self._refresh(graph, rel, None, _ext_to_lang())
         if record is not None:
+            if is_new:
+                graph.rebuild_importers()
             self._persist(graph, [record], [])
 
     # -- query API (request path) --------------------------------------------

@@ -253,19 +253,23 @@ def build_task_context(
     graph = services.get("code_graph")
     if graph is not None and identity.can_authorize_paths():
         graph.ensure_workspace(identity)
+        active_path = resource_id or (str(call_path) if call_path else None)
+        targets = [*entities["symbols"][:6], *entities["paths"][:6]]
+        if active_path:
+            targets.append(active_path)
+        labels: dict[str, None] = {}
+        for target in targets:
+            found = graph.neighbors(
+                identity.workspace_id, target, radius=2, limit=12, active_path=active_path
+            )
+            if any(n.relation in ("exact_symbol", "exact_path") for n in found):
+                # The user named code that exists in this worktree: a code task.
+                is_code = True
+            for neighbor in found:
+                labels.setdefault(neighbor.label, None)
+            if len(labels) >= GRAPH_NEIGHBOR_LIMIT * 2:
+                break
         if is_code:
-            active_path = resource_id or (str(call_path) if call_path else None)
-            labels: dict[str, None] = {}
-            targets = [*entities["symbols"][:6], *entities["paths"][:6]]
-            if active_path:
-                targets.append(active_path)
-            for target in targets:
-                for neighbor in graph.neighbors(
-                    identity.workspace_id, target, radius=2, limit=12, active_path=active_path
-                ):
-                    labels.setdefault(neighbor.label, None)
-                if len(labels) >= GRAPH_NEIGHBOR_LIMIT * 2:
-                    break
             neighbors = tuple(list(labels)[:GRAPH_NEIGHBOR_LIMIT])
 
     exact_entities = (

@@ -9263,9 +9263,7 @@ def _agent_runtime_mismatches(running_config: Mapping[str, Any]) -> list[str]:
     out: list[str] = []
     running_agent = running_config.get("agent_runtime")
     if isinstance(running_agent, bool):
-        from headroom.rollout import resolve_rollout
-
-        from headroom.rollout import apply_wrap_feature_defaults
+        from headroom.rollout import apply_wrap_feature_defaults, resolve_rollout
 
         try:
             requested_agent = resolve_rollout(
