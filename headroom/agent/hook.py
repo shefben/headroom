@@ -17,12 +17,15 @@ Any failure is logged once per kind and the request proceeds untouched.
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
+from collections import OrderedDict
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from headroom.agent import registry
 from headroom.agent.identity import WorkspaceIdentity, resolve_identity
-from headroom.agent.interfaces import TASK_CONTEXT_VERSION, TaskContext
+from headroom.agent.interfaces import TASK_CONTEXT_VERSION, RelevanceQuery, TaskContext
 from headroom.agent.normalize import normalize_messages
 from headroom.agent.query import build_task_context
 from headroom.log_safety import describe_exception
@@ -48,6 +51,75 @@ def identity_for(ctx: Any) -> WorkspaceIdentity | None:
     return value if isinstance(value, WorkspaceIdentity) else None
 
 
+# Request-scoped TaskContexts built ahead of compression, keyed by request id
+# and consumed by ``on_request`` (bounded; entries never outlive a request).
+_EARLY_LIMIT = 256
+_early_lock = threading.Lock()
+_early: OrderedDict[str, tuple[WorkspaceIdentity, Any, TaskContext]] = OrderedDict()
+
+
+def _active_runtime() -> AgentRuntime | None:
+    from headroom.agent.install import _installed
+
+    hook = _installed.get("hook")
+    return getattr(hook, "runtime", None) if hook is not None else None
+
+
+def compression_relevance_query(
+    provider: str,
+    model: str,
+    messages: Any,
+    *,
+    config: Any = None,
+    request_id: str | None = None,
+) -> RelevanceQuery | None:
+    """The request's task query, built BEFORE compression runs (unified-21 #1).
+
+    The agent TurnHook runs after the compression pipeline, so the handlers
+    call this first and pass the query to the compressors. It runs the same
+    identity resolution, read-only normalization and ``build_task_context`` as
+    the hook (authentic user text only, entities first, 512-token cap) and
+    parks the result for ``on_request`` under ``request_id`` so the hook does
+    not rebuild it. ``None`` when the agent runtime is not installed or the
+    build fails: callers keep the legacy latest-user-text context.
+    """
+    runtime = _active_runtime()
+    if runtime is None:
+        return None
+    from headroom.proxy.project_context import (
+        get_current_project,
+        get_registered_cwd,
+        get_registered_session,
+    )
+
+    try:
+        identity = resolve_identity(
+            session_token=get_registered_session(),
+            registered_cwd=get_registered_cwd(),
+            attribution=get_current_project(),
+        )
+        turn = normalize_messages(provider, messages, identity)
+        rid = request_id or uuid.uuid4().hex
+        shim = SimpleNamespace(provider=provider, model=model, config=config)
+        task = build_task_context(
+            ctx=shim, identity=identity, turn=turn, runtime=runtime, request_id=rid
+        )
+    except Exception as exc:  # noqa: BLE001 - compression falls back to the legacy context
+        log.warning("agent compression query build failed: %s", describe_exception(exc))
+        return None
+    if request_id:
+        with _early_lock:
+            _early[request_id] = (identity, turn, task)
+            while len(_early) > _EARLY_LIMIT:
+                _early.popitem(last=False)
+    return task.relevance_query
+
+
+def _take_early(request_id: str) -> tuple[WorkspaceIdentity, Any, TaskContext] | None:
+    with _early_lock:
+        return _early.pop(request_id, None)
+
+
 class AgentRuntimeHook:
     name = HOOK_NAME
     priority = HOOK_PRIORITY
@@ -70,6 +142,16 @@ class AgentRuntimeHook:
             get_registered_session,
         )
 
+        request_id = str(
+            getattr(ctx, "request_id", None) or ctx.tags.get("request_id") or uuid.uuid4().hex
+        )
+        early = _take_early(request_id)
+        if early is not None:
+            # Built pre-compression from the original (uncompressed) request.
+            identity, turn, task = early
+            runtime.note_request(identity)
+            self._finish(ctx, runtime, identity, turn, task)
+            return
         try:
             identity = resolve_identity(
                 session_token=get_registered_session(),
@@ -81,7 +163,6 @@ class AgentRuntimeHook:
             log.warning("agent hook normalization failed: %s", describe_exception(exc))
             return
         runtime.note_request(identity)
-        request_id = str(ctx.tags.get("request_id") or uuid.uuid4().hex)
         try:
             task = build_task_context(
                 ctx=ctx, identity=identity, turn=turn, runtime=runtime, request_id=request_id
@@ -100,6 +181,16 @@ class AgentRuntimeHook:
                 event_ids=tuple(ev.id for ev in turn.events),
                 latest_user_digest=turn.latest_user_digest,
             )
+        self._finish(ctx, runtime, identity, turn, task)
+
+    @staticmethod
+    def _finish(
+        ctx: TurnContext,
+        runtime: AgentRuntime,
+        identity: WorkspaceIdentity,
+        turn: Any,
+        task: TaskContext,
+    ) -> None:
         # Request-scoped, attached to this TurnContext only (never a global).
         ctx.agent_task_context = task  # type: ignore[attr-defined]
         ctx.agent_identity = identity  # type: ignore[attr-defined]

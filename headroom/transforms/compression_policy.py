@@ -97,13 +97,14 @@ class CompressionPolicy:
       to skip pre-cache-marker mutation.
     - ``cache_aligner_enabled`` (F2.1) — gate for the Python
       ``CacheAligner`` transform.
-    - ``volatile_token_threshold`` (F2.2) — per-mode token threshold
-      below which content is treated as cache-stable. Plumbed through
-      the struct; no current detector consumes it (intentional — the
-      detector refactor is a follow-up).
-    - ``max_lossy_ratio`` (F2.2) — per-mode upper bound on lossy
-      compression aggressiveness (fraction in ``[0.0, 1.0]``). Plumbed
-      through the struct; no current compressor consumes it.
+    - ``volatile_token_threshold`` (F2.2) — per-mode bound on volatile
+      tokens (timestamps, durations, uuids, addresses) a compression
+      candidate may introduce. Enforced by the SafetyGate (unified-21
+      #13) on every Python router and Rust live-zone candidate.
+    - ``max_lossy_ratio`` (F2.2) — per-mode upper bound on *irreversible*
+      loss (fraction of original tokens dropped with no exact retrieval
+      path). Enforced by the SafetyGate; exact CCR externalization may
+      drop more on the wire because the original stays recoverable.
     - ``toin_read_only`` (F2.2) — TOIN learning gate. ``True`` =
       serve cached patterns but never write new observations from
       this request (Subscription).
@@ -126,15 +127,16 @@ class CompressionPolicy:
     treated as cache-stable. Subscription is conservative
     (low → flag aggressively → keep prompts stable); PAYG aggressive
     (high → tolerate more volatile noise). Plumbed but unconsumed in
-    F2.2 — the volatile detector in ``cache_aligner.py`` is shape-
-    based, not token-count-based; wiring it is a follow-up."""
+    F2.2. Unified-21: the SafetyGate rejects a candidate that introduces
+    more volatile tokens than this."""
 
     max_lossy_ratio: float
     """F2.2: per-mode upper bound on lossy compression aggressiveness,
     expressed as the fraction of original tokens that may be dropped
     (``0.0`` = no lossy, ``1.0`` = unlimited). Subscription ``0.25``;
-    PAYG ``0.45``. Plumbed but unconsumed in F2.2 — distinct from the
-    caller-driven ``target_ratio`` kwarg in the Python ContentRouter."""
+    PAYG ``0.45``. Unified-21: enforced by the SafetyGate against the
+    candidate's irreversible loss (``wire_drop_ratio`` is reported
+    separately). Distinct from the caller-driven ``target_ratio`` kwarg."""
 
     toin_read_only: bool
     """F2.2: when True, TOIN serves cached recommendations but

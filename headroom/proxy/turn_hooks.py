@@ -65,6 +65,10 @@ class TurnContext:
     # a token set behind the client's own value rather than overwritten. On the
     # gateway contract the merged map is the response's ``headers`` object.
     provider_headers: dict[str, str] = field(default_factory=dict)
+    # The handler's request id, so request-scoped state built before
+    # compression (``headroom.agent.hook.compression_relevance_query``) is
+    # reused by the hook instead of rebuilt.
+    request_id: str | None = None
 
     def record_savings(
         self,

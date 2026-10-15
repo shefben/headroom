@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from .compression_units import (
     _CCR_MARKER_RE,
@@ -16,7 +17,7 @@ from .compression_units import (
     UnitCompressionResult,
     _is_structured_shell_output,
 )
-from .content_router import RouterCompressionResult
+from .content_router import RouterCompressionResult, safety_gate_admit_unit
 from .tag_protector import protect_tags, restore_tags
 
 DEFAULT_MAX_BATCH_BYTES = 2048
@@ -231,10 +232,14 @@ def compress_batch_with_router(
     tokenizer: TokenCounterLike,
     target_ratio: float | None = None,
     deadline_started_at: float | None = None,
+    policy: Any = None,
+    task: Any = None,
 ) -> list[tuple[object, UnitCompressionResult]]:
     """Compress one tagged batch and split only structurally valid output.
 
-    ``deadline_started_at`` works as in ``compress_unit_with_router``.
+    ``deadline_started_at``, ``policy`` and ``task`` work as in
+    ``compress_unit_with_router``: each split replacement passes the
+    SafetyGate on its own (a batch never bypasses the per-unit gate).
     """
 
     if deadline_started_at is not None and not router.share_request_deadline(deadline_started_at):
@@ -331,6 +336,36 @@ def compress_batch_with_router(
                 text_bytes=_text_bytes(unit.text),
                 min_bytes=unit.min_bytes,
                 reason_category="other",
+            )
+        elif tokens_after < tokens_before and (
+            safety_gate_admit_unit(
+                router,
+                unit.text,
+                replacement,
+                strategy=strategy,
+                context=unit.context or "",
+                bias=unit.bias if unit.bias is not None else 1.0,
+                tokenizer=tokenizer,
+                allow_backoff=False,
+                policy=policy,
+                task=task,
+            )[0]
+            is None
+        ):
+            result = UnitCompressionResult(
+                original=unit.text,
+                compressed=unit.text,
+                modified=False,
+                tokens_before=tokens_before,
+                tokens_after=tokens_before,
+                tokens_saved=0,
+                transforms_applied=[],
+                strategy=strategy,
+                reason="safety_gate_rejected",
+                router_result=router_result,
+                text_bytes=_text_bytes(unit.text),
+                min_bytes=unit.min_bytes,
+                reason_category="safety_gate",
             )
         elif tokens_after >= tokens_before:
             result = UnitCompressionResult(

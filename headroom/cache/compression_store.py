@@ -589,6 +589,23 @@ class CompressionStore:
             json.dumps(event, ensure_ascii=False, separators=(",", ":")),
         )
 
+    def peek_original(self, hash_key: str) -> str | None:
+        """Exact stored original for ``hash_key`` without retrieval side effects.
+
+        Used by the SafetyGate to verify a marker before it reaches the wire:
+        no access count, no retrieval event, no feedback, no payload log.
+        Returns ``None`` when the entry is missing or expired.
+        """
+        with self._lock:
+            entry = self._backend.get(hash_key)
+            if entry is None or entry.is_expired():
+                return None
+            return entry.original_content
+
+    def verify_exact(self, hash_key: str, original: str) -> bool:
+        """True when ``hash_key`` currently resolves to exactly ``original``."""
+        return self.peek_original(hash_key) == original
+
     def exists(self, hash_key: str, clean_expired: bool = False) -> bool:
         """Check if a hash key exists and is not expired.
 
@@ -745,6 +762,13 @@ class CompressionStore:
             self._expiration_heap.clear()
             self._stale_heap_entries = 0  # CRITICAL FIX: Reset stale counter
             self._stale_expiration_heap_entries = 0
+        # Spans live and die with their parent entries.
+        try:
+            from ..ccr.indexed import get_indexed_ccr
+
+            get_indexed_ccr().clear()
+        except Exception:  # noqa: BLE001 - the index is derived data
+            pass
 
     def _evict_if_needed(self) -> None:
         """Evict expired, then oldest live entries until below capacity.

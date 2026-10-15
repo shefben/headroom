@@ -1921,6 +1921,19 @@ class AnthropicHandlerMixin:
                     from headroom.transforms.compression_policy import resolve_policy
 
                     compression_policy = resolve_policy(getattr(request.state, "auth_mode", None))
+                    # Unified-21 #1: the agent task query (goal, intent, exact
+                    # entities, active error, graph neighbors) conditions the
+                    # compressors; built before compression because the agent
+                    # TurnHook runs after it. None -> legacy user-text context.
+                    from headroom.agent.hook import compression_relevance_query
+
+                    _relevance_query = compression_relevance_query(
+                        "anthropic",
+                        str(model),
+                        messages,
+                        config=self.config,
+                        request_id=request_id,
+                    )
                     if is_token_mode(self.config.mode):
                         comp_cache = self._get_compression_cache(session_id)
 
@@ -1980,6 +1993,7 @@ class AnthropicHandlerMixin:
                                     protect=protect,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
+                                    relevance_query=_relevance_query,
                                     cache_ttl_seconds=_cc_ttl,
                                     **proxy_pipeline_kwargs(self.config),
                                 ),
@@ -2027,6 +2041,7 @@ class AnthropicHandlerMixin:
                                             protect=protect,
                                             request_id=request_id,
                                             compression_policy=compression_policy,
+                                            relevance_query=_relevance_query,
                                             cache_ttl_seconds=_cc_ttl,
                                             skip_kompress=True,
                                             **proxy_pipeline_kwargs(self.config),
@@ -2080,6 +2095,7 @@ class AnthropicHandlerMixin:
                                         protect=protect,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
+                                        relevance_query=_relevance_query,
                                         cache_ttl_seconds=_cc_ttl,
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
@@ -2124,6 +2140,7 @@ class AnthropicHandlerMixin:
                                     protect=protect,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
+                                    relevance_query=_relevance_query,
                                     cache_ttl_seconds=_cc_ttl,
                                     **proxy_pipeline_kwargs(self.config),
                                 ),
@@ -2187,6 +2204,7 @@ class AnthropicHandlerMixin:
                                         protect=protect,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
+                                        relevance_query=_relevance_query,
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -2265,6 +2283,7 @@ class AnthropicHandlerMixin:
                                         protect=protect,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
+                                        relevance_query=_relevance_query,
                                         cache_ttl_seconds=_cc_ttl,
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
@@ -2755,7 +2774,9 @@ class AnthropicHandlerMixin:
                         present_hashes=ccr_present_hashes,
                     )
                     if recommendations:
-                        expansions = self.ccr_context_tracker.execute_expansions(recommendations)
+                        expansions = self.ccr_context_tracker.execute_expansions(
+                            recommendations, query=user_query
+                        )
                         if expansions:
                             # Add expanded context to the system message or as additional context.
                             # Pass workspace_label so the injected block declares its provenance
@@ -3314,6 +3335,7 @@ class AnthropicHandlerMixin:
                 _req_ctx = TurnContext(
                     provider="anthropic",
                     model=str(model),
+                    request_id=request_id,
                     messages=optimized_messages,
                     tools=body.get("tools"),
                     config=self.config,
@@ -4585,6 +4607,7 @@ class AnthropicHandlerMixin:
                                     tools,
                                     api_call_fn,
                                     provider="anthropic",
+                                    workspace=ccr_workspace_key or "",
                                 )
                                 if final_resp_json is resp_json:
                                     # The handler intentionally returns the same

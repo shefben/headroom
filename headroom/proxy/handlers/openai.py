@@ -695,7 +695,10 @@ def _openai_responses_unit_cache_key(
         "cache_zone": unit.cache_zone,
         "mutable": unit.mutable,
         "min_bytes": unit.min_bytes,
-        "context": unit.context,
+        # ``unit.context`` (the turn's task query) is deliberately NOT part of
+        # the key: a tool output keeps the form it was first forwarded in, so
+        # history bytes stay prefix-stable across turns. A cached form is
+        # re-checked by the SafetyGate against the current task before reuse.
         "question": unit.question,
         "bias": unit.bias,
         "metadata": unit.metadata,
@@ -865,6 +868,30 @@ def _shape_openai_responses_payload(
     except Exception:  # pragma: no cover - defensive; never break forwarding
         logger.warning("[%s] OutputShaper(responses) failed; skipping", request_id, exc_info=True)
         return [], False
+
+
+def _responses_policy(auth_mode: Any) -> Any:
+    """Resolved ``CompressionPolicy`` for a Responses request (SafetyGate limits)."""
+    from headroom.transforms.compression_policy import resolve_policy
+
+    return resolve_policy(auth_mode)
+
+
+def _responses_item_text(item: Any) -> str:
+    """Authentic text of a Responses ``message`` item (input_text/text parts)."""
+    if not isinstance(item, dict):
+        return ""
+    content = item.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") in ("input_text", "text")
+        ]
+        return "\n".join(p for p in parts if p).strip()
+    return ""
 
 
 def _compact_openai_responses_tools(
@@ -1981,6 +2008,7 @@ class OpenAIHandlerMixin:
         request_id: str,
         timing: dict[str, float] | None = None,
         deadline_started_at: float | None = None,
+        compression_policy: Any = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
         """Run ContentRouter on OpenAI Responses text units.
 
@@ -2333,6 +2361,26 @@ class OpenAIHandlerMixin:
         transforms: list[str] = []
         routed_units: list[RoutedCompressionUnit] = []
 
+        # Unified-21 #1/#7: task query for the compressors and task facts for
+        # the SafetyGate. The agent RelevanceQuery when the runtime is on,
+        # else the latest authentic user text (never an empty query while a
+        # user ask exists).
+        from headroom.agent.hook import compression_relevance_query
+        from headroom.transforms.content_router import safety_gate_admit_unit
+        from headroom.transforms.safety_gate import task_payload
+
+        relevance_query = compression_relevance_query(
+            "openai",
+            str(model),
+            items,
+            config=getattr(self, "config", None),
+            request_id=request_id,
+        )
+        unit_context = relevance_query.text if relevance_query is not None else ""
+        if not unit_context and 0 <= last_user_item_idx < len(items):
+            unit_context = _responses_item_text(items[last_user_item_idx])
+        unit_task = task_payload(relevance_query, fallback_text=unit_context)
+
         unit_build_started = time.perf_counter()
         for item_idx, slot_ref, original_text in candidates:
             item = items[item_idx] if item_idx < len(items) else {}
@@ -2358,6 +2406,7 @@ class OpenAIHandlerMixin:
                 mutable=True,
                 min_bytes=min_bytes,
                 metadata=metadata,
+                context=unit_context,
             )
             routed_units.append(RoutedCompressionUnit(unit=unit, slot=(item_idx, slot_ref)))
         _add_timing("compression_unit_build", unit_build_started)
@@ -2382,6 +2431,8 @@ class OpenAIHandlerMixin:
                 tokenizer=tokenizer,
                 target_ratio=unit_target_ratio,
                 deadline_started_at=deadline_started_at,
+                policy=compression_policy,
+                task=unit_task,
             )
             elapsed_ms = (time.perf_counter() - unit_started) * 1000.0
             return routed.slot, result, elapsed_ms
@@ -2419,7 +2470,22 @@ class OpenAIHandlerMixin:
                 target_ratio=unit_target_ratio,
             )
             cached = self._get_openai_responses_cached_unit(cache_key)
-            if cached is not None:
+            if cached is not None and (
+                not getattr(cached, "modified", False)
+                or safety_gate_admit_unit(
+                    router,
+                    routed.unit.text,
+                    cached.compressed,
+                    strategy=str(getattr(cached, "strategy", "") or "cached"),
+                    context=routed.unit.context or "",
+                    bias=routed.unit.bias,
+                    tokenizer=tokenizer,
+                    allow_backoff=False,
+                    policy=compression_policy,
+                    task=unit_task,
+                )[0]
+                is not None
+            ):
                 routed_results[unit_idx] = (routed.slot, cached, 0.0)
                 continue
             if cache_key in cache_miss_followers:
@@ -2488,6 +2554,8 @@ class OpenAIHandlerMixin:
                 tokenizer=tokenizer,
                 target_ratio=unit_target_ratio,
                 deadline_started_at=deadline_started_at,
+                policy=compression_policy,
+                task=unit_task,
             )
             return results, (time.perf_counter() - batch_started) * 1000.0
 
@@ -2655,6 +2723,7 @@ class OpenAIHandlerMixin:
         client: str | None = None,
         savings_tags: dict[str, Any] | None = None,
         deadline_started_at: float | None = None,
+        compression_policy: Any = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -2811,6 +2880,7 @@ class OpenAIHandlerMixin:
             _req_ctx = TurnContext(
                 provider="openai",
                 model=str(model),
+                request_id=request_id,
                 messages=_msgs_before,
                 tools=working.get("tools"),
                 config=getattr(self, "config", None),
@@ -2873,6 +2943,7 @@ class OpenAIHandlerMixin:
             request_id=request_id,
             timing=timing_sink,
             deadline_started_at=deadline_started_at,
+            compression_policy=compression_policy,
         )
         _add_timing("compression_live_units_total", live_units_started)
         if router_modified:
@@ -2936,6 +3007,7 @@ class OpenAIHandlerMixin:
         timeout: float = COMPRESSION_TIMEOUT_SECONDS,
         client: str | None = None,
         savings_tags: dict[str, Any] | None = None,
+        compression_policy: Any = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
 
@@ -2985,6 +3057,8 @@ class OpenAIHandlerMixin:
             }
             if savings_tags is not None:
                 compression_kwargs["savings_tags"] = savings_tags
+            if compression_policy is not None:
+                compression_kwargs["compression_policy"] = compression_policy
             while True:
                 try:
                     result = self._compress_openai_responses_payload(
@@ -3001,6 +3075,7 @@ class OpenAIHandlerMixin:
                                 "client",
                                 "timing",
                                 "deadline_started_at",
+                                "compression_policy",
                             )
                             if f"unexpected keyword argument '{name}'" in str(exc)
                             and name in compression_kwargs
@@ -3703,6 +3778,17 @@ class OpenAIHandlerMixin:
                 from headroom.transforms.compression_policy import resolve_policy
 
                 compression_policy = resolve_policy(getattr(request.state, "auth_mode", None))
+                # Unified-21 #1: task query for the compressors (see the
+                # anthropic handler); None keeps the legacy user-text context.
+                from headroom.agent.hook import compression_relevance_query
+
+                _relevance_query = compression_relevance_query(
+                    "openai",
+                    str(model),
+                    messages,
+                    config=self.config,
+                    request_id=request_id,
+                )
 
                 if is_token_mode(self.config.mode):
                     comp_cache = self._get_compression_cache(openai_session_id)
@@ -3765,6 +3851,7 @@ class OpenAIHandlerMixin:
                             biases=_hook_biases,
                             protect=_hook_protect,
                             compression_policy=compression_policy,
+                            relevance_query=_relevance_query,
                             cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
                             # Thread the savings-profile knobs (e.g.
                             # HEADROOM_SAVINGS_PROFILE=agent-90) onto the live
@@ -3808,6 +3895,7 @@ class OpenAIHandlerMixin:
                             biases=_hook_biases,
                             protect=_hook_protect,
                             compression_policy=compression_policy,
+                            relevance_query=_relevance_query,
                             cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
                             # Same savings-profile threading as the token-mode
                             # branch above — the non-token chat path must honor
@@ -4358,6 +4446,7 @@ class OpenAIHandlerMixin:
             _th_ctx = TurnContext(
                 provider="openai",
                 model=str(model),
+                request_id=request_id,
                 messages=body["messages"],
                 tools=_th_tools_before,
                 config=self.config,
@@ -6085,6 +6174,7 @@ class OpenAIHandlerMixin:
                     request_id=request_id,
                     client=client,
                     savings_tags=tags,
+                    compression_policy=_responses_policy(getattr(request.state, "auth_mode", None)),
                 )
                 attempted_input_tokens = int(_attempted_tokens)
                 if _transforms:
@@ -8047,6 +8137,7 @@ class OpenAIHandlerMixin:
                                 if client == "codex"
                                 else COMPRESSION_TIMEOUT_SECONDS,
                                 client=client,
+                                compression_policy=_responses_policy(_ws_auth_mode),
                             )
                             for _timing_name, _timing_ms in _ws_compression_timing.items():
                                 _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -8440,6 +8531,7 @@ class OpenAIHandlerMixin:
                                     if client == "codex"
                                     else COMPRESSION_TIMEOUT_SECONDS,
                                     client=client,
+                                    compression_policy=_responses_policy(_frame_auth_mode),
                                 )
                                 for _timing_name, _timing_ms in frame_compression_timing.items():
                                     _record_ws_compression_timing(_timing_name, _timing_ms)

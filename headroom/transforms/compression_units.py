@@ -11,12 +11,13 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
-from typing import Protocol
+from typing import Any, Protocol
 
 from .content_router import (
     CompressionStrategy,
     ContentRouter,
     RouterCompressionResult,
+    safety_gate_admit_unit,
 )
 
 
@@ -58,6 +59,8 @@ class CompressionUnit:
 #                      here — no code path produces this category today
 # - deadline:          the request's compression deadline had passed before
 #                      this unit started, so it was left unchanged
+# - safety_gate:       every SafetyGate ladder rung was rejected (invariant,
+#                      lossy-policy, marker or cache reasons); original kept
 UNIT_REASON_CATEGORIES = {
     None: "applied",
     "protected_user_message": "protected_role",
@@ -69,6 +72,7 @@ UNIT_REASON_CATEGORIES = {
     "already_compressed": "already_compressed",
     "rejected_not_smaller": "rejected_not_smaller",
     "deadline_exceeded": "deadline",
+    "safety_gate_rejected": "safety_gate",
 }
 
 
@@ -225,8 +229,15 @@ def compress_unit_with_router(
     tokenizer: TokenCounterLike,
     target_ratio: float | None = None,
     deadline_started_at: float | None = None,
+    policy: Any = None,
+    task: Any = None,
 ) -> UnitCompressionResult:
     """Compress one safe text unit through ContentRouter.
+
+    Every accepted replacement passes the SafetyGate (unified-21 #7/#13)
+    with the request's ``policy`` (``CompressionPolicy``; PAYG when absent)
+    and ``task`` facts (agent ``RelevanceQuery`` or its dict); a rejected
+    candidate backs off along the central ladder or leaves the unit as is.
 
     The final accept/reject gate uses the provider/model tokenizer, not the
     router's internal word-count estimates.
@@ -304,6 +315,23 @@ def compress_unit_with_router(
                 router_result=router_result,
                 reason="rejected_not_smaller",
             )
+        gated, gate_label = safety_gate_admit_unit(
+            router,
+            unit.text,
+            replacement,
+            strategy="ccr_marker_preserving",
+            context=unit.context or "",
+            bias=unit.bias if unit.bias is not None else 1.0,
+            tokenizer=tokenizer,
+            policy=policy,
+            task=task,
+        )
+        if gated is None:
+            return _with_reason(router_result=router_result, reason="safety_gate_rejected")
+        if gated is not replacement:
+            replacement = gated
+            tokens_after = tokenizer.count_text(replacement)
+            marker_transforms = [*marker_transforms, gate_label]
 
         return UnitCompressionResult(
             original=unit.text,
@@ -363,6 +391,27 @@ def compress_unit_with_router(
                 reason="lossy_unrecoverable_tool_output",
             )
 
+    gated, gate_label = safety_gate_admit_unit(
+        router,
+        unit.text,
+        replacement,
+        strategy=strategy,
+        context=unit.context or "",
+        bias=unit.bias if unit.bias is not None else 1.0,
+        tokenizer=tokenizer,
+        policy=policy,
+        task=task,
+    )
+    if gated is None:
+        return _with_reason(
+            strategy=strategy, router_result=router_result, reason="safety_gate_rejected"
+        )
+    gate_transforms: list[str] = []
+    if gated is not replacement:
+        replacement = gated
+        tokens_after = tokenizer.count_text(replacement)
+        gate_transforms = [gate_label]
+
     return UnitCompressionResult(
         original=unit.text,
         compressed=replacement,
@@ -373,6 +422,7 @@ def compress_unit_with_router(
         transforms_applied=[
             f"router:{unit.provider}:{unit.endpoint}:{unit.item_type}:{strategy}",
             strategy,
+            *gate_transforms,
         ],
         strategy=strategy,
         reason=None,

@@ -1551,6 +1551,81 @@ def _netcost_message_tokens(message: dict[str, Any], tokenizer: Tokenizer) -> in
     return count_content_blocks(content, tokenizer.count_text)
 
 
+def default_gate_policy() -> Any:
+    """Policy the SafetyGate enforces when the caller resolved none.
+
+    PAYG-equivalent, the same defensive default as ``resolve_policy(None)``.
+    """
+    from .compression_policy import policy_default_payg
+
+    return policy_default_payg()
+
+
+def safety_gate_admit_unit(
+    router: Any,
+    original: str,
+    candidate: str,
+    *,
+    strategy: str,
+    context: str,
+    bias: float,
+    tokenizer: Any = None,
+    allow_backoff: bool = True,
+    policy: Any = None,
+    task: Any = None,
+) -> tuple[str | None, str]:
+    """Gate a unit replacement through ``router`` (or directly, for routers
+    that only implement ``compress``). Never bypasses the gate."""
+    admit = getattr(router, "_safety_gate_admit", None)
+    if callable(admit):
+        text, label, _ = admit(
+            original,
+            candidate,
+            strategy=strategy,
+            context=context,
+            bias=bias,
+            content_type=None,
+            tokenizer=tokenizer,
+            allow_backoff=allow_backoff,
+            policy=policy,
+            task=task,
+        )
+        return text, label
+    from .safety_gate import Provenance, SafetyGate, task_payload
+
+    try:
+        decision = SafetyGate.check(
+            original,
+            candidate,
+            task=task_payload(task, fallback_text=context),
+            policy=policy if policy is not None else default_gate_policy(),
+            provenance=Provenance(
+                strategy=strategy,
+                original_tokens=tokenizer.count_text(original) if tokenizer else None,
+                candidate_tokens=tokenizer.count_text(candidate) if tokenizer else None,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed to the original
+        logger.warning("safety gate unavailable (%s); forwarding original", exc)
+        return None, "safety_gate:error"
+    return (candidate, strategy) if decision.allow else (None, "safety_gate:original")
+
+
+def _with_compressed(result: Any, text: str) -> Any:
+    """Copy of a router result with ``compressed`` swapped (SafetyGate backoff).
+
+    Works for the ``RouterCompressionResult`` dataclass and for duck-typed
+    results (extension compressors and test doubles)."""
+    try:
+        return replace(result, compressed=text)
+    except TypeError:
+        import copy
+
+        clone = copy.copy(result)
+        clone.compressed = text
+        return clone
+
+
 class CompressionCache:
     """Two-tier compression cache with TTL.  Thread-safe.
 
@@ -2192,6 +2267,11 @@ class _PerRequestRuntimeState:
     # spend a dozen budgets. Set once per ``apply()``; see
     # ``_try_ml_compressor``.
     kompress_deadline_started_at: float | None = None
+    # SafetyGate task facts for THIS request (unified-21 #7): the agent
+    # ``RelevanceQuery.to_dict()`` or exact entities extracted from the
+    # request context. ``None`` on the direct-``compress()`` default, where
+    # the gate derives them from the call's own ``context``.
+    safety_task: dict[str, Any] | None = None
 
 
 # Monotonic counter so each ContentRouter instance gets a uniquely named
@@ -2547,6 +2627,14 @@ class ContentRouter(Transform):
     @_runtime_compression_policy.setter
     def _runtime_compression_policy(self, value: Any) -> None:
         self._get_local_runtime_state().compression_policy = value
+
+    @property
+    def _runtime_safety_task(self) -> dict[str, Any] | None:
+        return self._runtime_state_var.get().safety_task
+
+    @_runtime_safety_task.setter
+    def _runtime_safety_task(self, value: dict[str, Any] | None) -> None:
+        self._get_local_runtime_state().safety_task = value
 
     @property
     def _runtime_target_ratio(self) -> float | None:
@@ -5814,7 +5902,18 @@ class ContentRouter(Transform):
         dedup_pointers_recoverable = bool(kwargs.get("cross_turn_dedup_recoverable", True))
 
         tokens_before = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
-        context = kwargs.get("context", "")
+        # Unified-21 #1: the agent RelevanceQuery (goal, intent, exact
+        # entities, active error, graph neighbors) conditions every compressor
+        # when the caller has one; the legacy latest-user-text ``context``
+        # remains the fallback. The same facts feed the SafetyGate.
+        relevance_query = kwargs.get("relevance_query")
+        query_text = getattr(relevance_query, "text", None)
+        if query_text is None and isinstance(relevance_query, dict):
+            query_text = relevance_query.get("text")
+        context = query_text or kwargs.get("context", "") or ""
+        from .safety_gate import task_payload
+
+        self._runtime_safety_task = task_payload(relevance_query, fallback_text=context)
         hook_biases: dict[int, float] = kwargs.get("biases") or {}
         # Per-message veto from a compression hook (``CompressionHooks.
         # protect_messages``). Distinct from ``biases``, which is a soft
@@ -6494,6 +6593,27 @@ class ContentRouter(Transform):
                         result_slots[i] = message
                         if collect_diagnostics:
                             _diag[i] = "passthrough:netcost_blocked"
+                    elif (
+                        self._safety_gate_admit(
+                            content,
+                            cached_compressed,
+                            strategy=cached_strategy,
+                            context=context,
+                            bias=msg_bias,
+                            content_type=detection.content_type.value,
+                            tokenizer=tokenizer,
+                            allow_backoff=False,
+                        )[0]
+                        is None
+                    ):
+                        # Cached form no longer passes the gate for THIS task
+                        # (e.g. the user now names an entity it omitted).
+                        result_slots[i] = message
+                        route_counts["safety_gate_original"] = (
+                            route_counts.get("safety_gate_original", 0) + 1
+                        )
+                        if collect_diagnostics:
+                            _diag[i] = "passthrough:safety_gate:original"
                     else:
                         result_slots[i] = {**message, "content": cached_compressed}
                         transforms_applied.append(f"router:{cached_strategy}:{cached_ratio:.2f}")
@@ -6545,6 +6665,12 @@ class ContentRouter(Transform):
                     None if force_kompress else detection,
                 )
             )
+
+        # Detected content type per pending slot, for the SafetyGate's
+        # content-shape rules (search hits / JSON / diff / other).
+        pending_tasks_detection: dict[int, str | None] = {
+            t[0]: (t[6].content_type.value if t[6] is not None else None) for t in pending_tasks
+        }
 
         # --- Pass 2: Parallel compression of all cache-miss messages ---
         if pending_tasks:
@@ -6700,6 +6826,40 @@ class ContentRouter(Transform):
                         if collect_diagnostics:
                             _diag[slot_idx] = "passthrough:lossy_unrecoverable"
                         continue
+                    # SafetyGate (unified-21 #7/#13): invariants + enforced
+                    # lossy policy, with the central backoff ladder. A
+                    # rejection is task-dependent, so it never poisons the
+                    # skip cache.
+                    _task_detection = pending_tasks_detection.get(slot_idx)
+                    gated_text, gate_label, _sel = self._safety_gate_admit(
+                        task_content,
+                        result.compressed,
+                        strategy=result.strategy_used.value,
+                        context=context,
+                        bias=bias if message.get("role") == "tool" else 1.0,
+                        content_type=_task_detection,
+                        reversible=is_lossless,
+                        tokenizer=tokenizer,
+                    )
+                    if gated_text is None:
+                        result_slots[slot_idx] = message
+                        route_counts["safety_gate_original"] = (
+                            route_counts.get("safety_gate_original", 0) + 1
+                        )
+                        transforms_applied.append(gate_label)
+                        if collect_diagnostics:
+                            _diag[slot_idx] = f"passthrough:{gate_label}"
+                        continue
+                    if gated_text is not result.compressed:
+                        route_counts["safety_gate_backoff"] = (
+                            route_counts.get("safety_gate_backoff", 0) + 1
+                        )
+                        transforms_applied.append(gate_label)
+                        result = _with_compressed(result, gated_text)
+                        orig_tok = tokenizer.count_text(task_content)
+                        accept_ratio = (
+                            tokenizer.count_text(gated_text) / orig_tok if orig_tok else 1.0
+                        )
                     # Compressed — store in result cache. The cache is still
                     # warmed when the net-cost gate blocks the slot: the
                     # gate's verdict is contextual (suffix size), the
@@ -7699,6 +7859,24 @@ class ContentRouter(Transform):
             else:
                 # Pre-freeze / unfrozen: same live gate as flag-off (pure pin).
                 accept_threshold = min_ratio
+            if cached_ratio < accept_threshold and (
+                self._safety_gate_admit(
+                    content,
+                    cached_compressed,
+                    strategy=str(cached_strategy),
+                    context=context,
+                    bias=bias,
+                    content_type=None,
+                    allow_backoff=False,
+                )[0]
+                is None
+            ):
+                # Cached form fails the gate for this request's task facts.
+                if route_counts is not None:
+                    route_counts["safety_gate_original"] = (
+                        route_counts.get("safety_gate_original", 0) + 1
+                    )
+                return None, False
             if cached_ratio < accept_threshold:
                 transforms_applied.append(f"router:{strategy_label}:{cached_strategy}")
                 if compressed_details is not None:
@@ -7751,6 +7929,24 @@ class ContentRouter(Transform):
         _is_pure_lossless = _starts_lossless and all(s.startswith("lossless_") for s in _chain)
         _byte_accept = _starts_lossless and (_is_pure_lossless or not self.config.ccr_inject_marker)
         if _byte_accept and len(result.compressed) < len(content):
+            gated, _gl, _ = self._safety_gate_admit(
+                content,
+                result.compressed,
+                strategy=_chain[0],
+                context=context,
+                bias=bias,
+                content_type=None,
+                reversible=_is_pure_lossless,
+            )
+            if gated is None:
+                if route_counts is not None:
+                    route_counts["safety_gate_original"] = (
+                        route_counts.get("safety_gate_original", 0) + 1
+                    )
+                return None, False
+            if gated is not result.compressed:
+                transforms_applied.append(_gl)
+                result = _with_compressed(result, gated)
             _ll_ratio = len(result.compressed) / max(1, len(content))
             _ll_label = _chain[0] if _is_pure_lossless else "+".join(_chain)
             self._cache.put(content_key, result.compressed, _ll_ratio, _ll_label)
@@ -7789,11 +7985,34 @@ class ContentRouter(Transform):
                         route_counts.get("lossy_unrecoverable_skipped", 0) + 1
                     )
                 return None, False
+            gated, _gl, _ = self._safety_gate_admit(
+                content,
+                result.compressed,
+                strategy=result.strategy_used.value,
+                context=context,
+                bias=bias,
+                content_type=None,
+            )
+            if gated is None:
+                if route_counts is not None:
+                    route_counts["safety_gate_original"] = (
+                        route_counts.get("safety_gate_original", 0) + 1
+                    )
+                return None, False
+            _block_ratio = result.compression_ratio
+            if gated is not result.compressed:
+                transforms_applied.append(_gl)
+                if route_counts is not None:
+                    route_counts["safety_gate_backoff"] = (
+                        route_counts.get("safety_gate_backoff", 0) + 1
+                    )
+                _block_ratio = len(gated) / max(1, len(content))
+                result = _with_compressed(result, gated)
             # Compressed — store in result cache
             self._cache.put(
                 content_key,
                 result.compressed,
-                result.compression_ratio,
+                _block_ratio,
                 result.strategy_used.value,
             )
             # Freeze "compress" so the cache-hit path above never re-applies a
@@ -7805,7 +8024,7 @@ class ContentRouter(Transform):
             transforms_applied.append(f"router:{strategy_label}:{result.strategy_used.value}")
             if compressed_details is not None:
                 compressed_details.append(
-                    f"{details_prefix}:{result.strategy_used.value}:{result.compression_ratio:.2f}"
+                    f"{details_prefix}:{result.strategy_used.value}:{_block_ratio:.2f}"
                 )
             return result.compressed, True
         # Didn't compress enough — add to skip set. In lossless-only mode this is
@@ -7820,6 +8039,168 @@ class ContentRouter(Transform):
         if freeze_decision and model_ready:
             self._record_frozen_verdict(content_key, False)
         return None, False
+
+    def _gate_policy(self) -> Any:
+        policy = self._runtime_compression_policy
+        return policy if policy is not None else default_gate_policy()
+
+    def _gate_store(self) -> Any:
+        try:
+            from ..cache.compression_store import get_compression_store
+
+            return get_compression_store()
+        except Exception:  # noqa: BLE001 - no store means no verified markers
+            return None
+
+    def _safety_gate_admit(
+        self,
+        original: str,
+        candidate: str,
+        *,
+        strategy: str,
+        context: str,
+        bias: float,
+        content_type: str | None,
+        reversible: bool = False,
+        tokenizer: Any = None,
+        allow_backoff: bool = True,
+        policy: Any = None,
+        task: Any = None,
+    ) -> tuple[str | None, str, Any]:
+        """Run a compression candidate through the SafetyGate (unified-21 #7/#13).
+
+        Returns ``(text, label, selection)``; ``text is None`` means the
+        original bytes win. On rejection the central ladder evaluates, in
+        order: a conservative re-run (``bias`` x2), the policy-fit candidate,
+        a structural/lossless form, and CCR exact externalization (original
+        stored and verified before its marker is emitted). Any gate failure
+        fails closed to the original.
+        """
+        from .safety_gate import (
+            GateCandidate,
+            Provenance,
+            SafetyGate,
+            task_payload,
+            verified_payloads,
+        )
+
+        policy = policy if policy is not None else self._gate_policy()
+        if task is not None:
+            task = task_payload(task, fallback_text=context)
+        else:
+            task = self._runtime_safety_task or task_payload(None, fallback_text=context)
+        retrieval = bool(self.config.ccr_inject_marker)
+        store = self._gate_store() if retrieval else None
+
+        def count(text: str) -> int | None:
+            return tokenizer.count_text(text) if tokenizer is not None else None
+
+        original_tokens = count(original)
+
+        def prov(text: str, label: str, rev: bool = False) -> Provenance:
+            return Provenance(
+                content_type=content_type,
+                strategy=label,
+                reversible=rev,
+                retrieval_available=retrieval,
+                ccr_payloads=verified_payloads(original, text, store),
+                original_tokens=original_tokens,
+                candidate_tokens=count(text),
+            )
+
+        def backoff() -> list[GateCandidate]:
+            rungs: list[GateCandidate] = []
+            try:
+                conservative = self.compress(original, context=context, bias=max(bias, 1.0) * 2.0)
+                if conservative.compressed not in (candidate, original):
+                    label = conservative.strategy_used.value
+                    rungs.append(
+                        GateCandidate(
+                            "conservative",
+                            conservative.compressed,
+                            prov(conservative.compressed, label),
+                            label=label,
+                        )
+                    )
+            except Exception:  # noqa: BLE001 - a failed rung is simply absent
+                logger.debug("safety gate: conservative rung failed", exc_info=True)
+            fit = SafetyGate.fit(
+                original,
+                candidate,
+                task=task,
+                policy=policy,
+                content_type=content_type or "plain_text",
+            )
+            if fit:
+                rungs.append(
+                    GateCandidate("conservative", fit, prov(fit, "policy_fit"), label="policy_fit")
+                )
+            lossless: tuple[str, str] | None = None
+            try:
+                folded, fold_label = self._lossless_first(
+                    original, self._determine_strategy(original, mixed=False, detection=None)
+                )
+                if fold_label is not None and folded != original:
+                    lossless = (folded, fold_label)
+            except Exception:  # noqa: BLE001 - no fold available
+                lossless = None
+            if lossless is None:
+                lossless = self._lossless_provider_result(original)
+            if lossless is None:
+                try:
+                    minified = self._minify_json_data_lossless(original)
+                except (ValueError, TypeError):
+                    minified = None
+                if minified is not None:
+                    lossless = (minified, "json_minify")
+            if lossless is not None:
+                rungs.append(
+                    GateCandidate(
+                        "lossless",
+                        lossless[0],
+                        prov(lossless[0], lossless[1], rev=True),
+                        label=lossless[1],
+                    )
+                )
+            if retrieval and store is not None:
+                try:
+                    key = store.store(
+                        original,
+                        "",
+                        original_tokens=original_tokens or 0,
+                        compression_strategy="ccr_exact",
+                        query_context=context[:500] or None,
+                    )
+                    if store.verify_exact(key, original):
+                        stub = SafetyGate.ccr_stub(original, key)
+                        rungs.append(
+                            GateCandidate(
+                                "ccr_exact", stub, prov(stub, "ccr_exact"), label="ccr_exact"
+                            )
+                        )
+                except Exception:  # noqa: BLE001 - no exact externalization this time
+                    logger.debug("safety gate: ccr_exact rung failed", exc_info=True)
+            return rungs
+
+        try:
+            selection = SafetyGate.admit(
+                original,
+                GateCandidate(
+                    "aggressive", candidate, prov(candidate, strategy, reversible), label=strategy
+                ),
+                task=task,
+                policy=policy,
+                backoff=backoff if allow_backoff else None,
+            )
+        except Exception as exc:  # noqa: BLE001 - fail closed to the original
+            logger.warning("safety gate unavailable (%s); forwarding original", exc)
+            return None, "safety_gate:error", None
+        chosen = selection.candidate
+        if chosen is None:
+            return None, "safety_gate:original", selection
+        if selection.tier == "aggressive":
+            return chosen.text, strategy, selection
+        return chosen.text, f"safety_gate:{selection.tier}:{chosen.label}", selection
 
     def _detect_analysis_intent(self, messages: list[dict[str, Any]]) -> bool:
         """Detect if user wants to analyze/review code.
