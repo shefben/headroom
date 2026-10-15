@@ -3048,6 +3048,19 @@ class OpenAIHandlerMixin:
                 request_id=request_id,
                 output_shaper_enabled=(shaper_enabled_for(getattr(self, "config", None))),
             )
+            # Unified-21 #10: complexity-aware effort/verbosity routing.
+            from headroom.agent.complexity import route_request
+
+            _route = route_request(
+                payload,
+                shape="responses",
+                config=getattr(self, "config", None),
+                model=str(model),
+                request_id=request_id,
+            )
+            if _route is not None and _route.changed:
+                shape_labels = [*shape_labels, *_route.labels]
+                shape_mutated = True
             compression_kwargs: dict[str, Any] = {
                 "model": model,
                 "request_id": request_id,
@@ -3789,6 +3802,18 @@ class OpenAIHandlerMixin:
                     config=self.config,
                     request_id=request_id,
                 )
+                # Unified-21 #8: live-zone budget for the tool-admission arbiter.
+                from headroom.agent.budget import request_budget_inputs
+
+                _budget_inputs = request_budget_inputs(
+                    body,
+                    model=str(model),
+                    model_limit=context_limit,
+                    effective_limit=context_limit,
+                    tokenizer=tokenizer,
+                    keep_last_turns=request.headers.get("x-headroom-keep-last-turns", "").strip(),
+                    system_key="__none__",
+                )
 
                 if is_token_mode(self.config.mode):
                     comp_cache = self._get_compression_cache(openai_session_id)
@@ -3852,6 +3877,7 @@ class OpenAIHandlerMixin:
                             protect=_hook_protect,
                             compression_policy=compression_policy,
                             relevance_query=_relevance_query,
+                            live_zone_budget=_budget_inputs,
                             cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
                             # Thread the savings-profile knobs (e.g.
                             # HEADROOM_SAVINGS_PROFILE=agent-90) onto the live
@@ -3896,6 +3922,7 @@ class OpenAIHandlerMixin:
                             protect=_hook_protect,
                             compression_policy=compression_policy,
                             relevance_query=_relevance_query,
+                            live_zone_budget=_budget_inputs,
                             cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
                             # Same savings-profile threading as the token-mode
                             # branch above — the non-token chat path must honor
@@ -4315,6 +4342,34 @@ class OpenAIHandlerMixin:
             except Exception as e:
                 logger.debug(f"[{request_id}] tool desc compaction failed: {e}")
 
+            # Unified-21 #9: progressive tool catalog (chat completions has no
+            # native tool search); sticky per session, never on tool-free calls.
+            from headroom.agent.tool_catalog import apply_request_catalog
+
+            _catalog = apply_request_catalog(
+                config=self.config,
+                tools=tools,
+                messages=optimized_messages,
+                session_key=openai_session_id,
+                tool_choice=body.get("tool_choice"),
+                prefix_hot=openai_frozen_count > 0,
+                model=str(model),
+                request_id=request_id,
+            )
+            if _catalog is not None and _catalog.changed:
+                _cat_before = tokenizer.count_text(_json_debug_dumps(tools))
+                _cat_after = tokenizer.count_text(_json_debug_dumps(_catalog.tools))
+                if 0 < _cat_after < _cat_before:
+                    if not tool_tokens_before_compaction:
+                        tool_tokens_before_compaction = _cat_before
+                    tools = _catalog.tools
+                    transforms_applied.append(
+                        f"agent:tool_catalog:{len(_catalog.stubbed)}stubbed"
+                    )
+                    from headroom.proxy.savings_attribution import record_savings
+
+                    record_savings(tags, "tool_catalog", tokens=_cat_before - _cat_after)
+
         body["messages"] = optimized_messages
         if tools or _original_tools is not None:
             body["tools"] = tools
@@ -4579,6 +4634,20 @@ class OpenAIHandlerMixin:
                             f"[{request_id}] OutputShaper(chat, L{_level}/{_src}): "
                             f"{_shape_result.labels}"
                         )
+
+            # Unified-21 #10: complexity-aware effort/verbosity routing.
+            from headroom.agent.complexity import route_request
+
+            _route = route_request(
+                body,
+                shape="chat",
+                config=getattr(self, "config", None),
+                model=str(model),
+                request_id=request_id,
+                session_key=openai_session_id,
+            )
+            if _route is not None and _route.changed:
+                transforms_applied.extend(_route.labels)
 
         # Route through LiteLLM/any-llm backend if configured -- or through a
         # per-request one an extension asked for (see proxy/route_advice.py).

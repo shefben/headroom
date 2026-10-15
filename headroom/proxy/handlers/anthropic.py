@@ -1934,6 +1934,22 @@ class AnthropicHandlerMixin:
                         config=self.config,
                         request_id=request_id,
                     )
+                    # Unified-21 #8: what the live zone may spend (effective
+                    # limit minus frozen prefix, system/tools, reserved output
+                    # and a margin), computed by the tool-admission arbiter.
+                    from headroom.agent.budget import request_budget_inputs
+
+                    _budget_inputs = request_budget_inputs(
+                        body,
+                        model=str(model),
+                        model_limit=self.anthropic_provider.get_context_limit(model),
+                        effective_limit=context_limit,
+                        tokenizer=tokenizer,
+                        beta_header=headers.get("anthropic-beta"),
+                        credential_scope=credential_scope_from_headers(headers),
+                        keep_last_turns=_klt_raw,
+                        cache_ttl_seconds=_cc_ttl,
+                    )
                     if is_token_mode(self.config.mode):
                         comp_cache = self._get_compression_cache(session_id)
 
@@ -1994,6 +2010,7 @@ class AnthropicHandlerMixin:
                                     request_id=request_id,
                                     compression_policy=compression_policy,
                                     relevance_query=_relevance_query,
+                                    live_zone_budget=_budget_inputs,
                                     cache_ttl_seconds=_cc_ttl,
                                     **proxy_pipeline_kwargs(self.config),
                                 ),
@@ -2042,6 +2059,7 @@ class AnthropicHandlerMixin:
                                             request_id=request_id,
                                             compression_policy=compression_policy,
                                             relevance_query=_relevance_query,
+                                            live_zone_budget=_budget_inputs,
                                             cache_ttl_seconds=_cc_ttl,
                                             skip_kompress=True,
                                             **proxy_pipeline_kwargs(self.config),
@@ -2096,6 +2114,7 @@ class AnthropicHandlerMixin:
                                         request_id=request_id,
                                         compression_policy=compression_policy,
                                         relevance_query=_relevance_query,
+                                        live_zone_budget=_budget_inputs,
                                         cache_ttl_seconds=_cc_ttl,
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
@@ -2141,6 +2160,7 @@ class AnthropicHandlerMixin:
                                     request_id=request_id,
                                     compression_policy=compression_policy,
                                     relevance_query=_relevance_query,
+                                    live_zone_budget=_budget_inputs,
                                     cache_ttl_seconds=_cc_ttl,
                                     **proxy_pipeline_kwargs(self.config),
                                 ),
@@ -2205,6 +2225,7 @@ class AnthropicHandlerMixin:
                                         request_id=request_id,
                                         compression_policy=compression_policy,
                                         relevance_query=_relevance_query,
+                                        live_zone_budget=_budget_inputs,
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -2284,6 +2305,7 @@ class AnthropicHandlerMixin:
                                         request_id=request_id,
                                         compression_policy=compression_policy,
                                         relevance_query=_relevance_query,
+                                        live_zone_budget=_budget_inputs,
                                         cache_ttl_seconds=_cc_ttl,
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
@@ -3319,6 +3341,44 @@ class AnthropicHandlerMixin:
                         f"{_ts_saved_tokens}tok"
                     )
 
+            # Unified-21 #9: progressive tool catalog, only where no native or
+            # Headroom tool search is active (a deferring tools array is left
+            # untouched) and never on a tool-free request. Sticky per session:
+            # a cache-hot prefix keeps its materialized set byte-identical.
+            if _decision.should_compress and not _bypass and not preserve_tool_order:
+                from headroom.agent.tool_catalog import apply_request_catalog
+
+                _catalog = apply_request_catalog(
+                    config=self.config,
+                    tools=body.get("tools"),
+                    messages=optimized_messages,
+                    session_key=session_id,
+                    tool_choice=body.get("tool_choice"),
+                    prefix_hot=frozen_message_count > 0,
+                    model=str(model),
+                    request_id=request_id,
+                )
+                if _catalog is not None and _catalog.changed:
+                    _cat_before = _count_tool_tokens(body.get("tools"))
+                    _cat_after = _count_tool_tokens(_catalog.tools)
+                    if 0 < _cat_after < _cat_before:
+                        body["tools"] = _catalog.tools
+                        tools = _catalog.tools
+                        if not _tool_tokens_before:
+                            _tool_tokens_before = _cat_before
+                        _tool_tokens_after = _cat_after
+                        tags["tool_catalog"] = {
+                            "materialized": len(_catalog.materialized),
+                            "stubbed": len(_catalog.stubbed),
+                            "reused": _catalog.reused,
+                        }
+                        from headroom.proxy.savings_attribution import record_savings
+
+                        record_savings(tags, "tool_catalog", tokens=_cat_before - _cat_after)
+                        transforms_applied.append(
+                            f"agent:tool_catalog:{len(_catalog.stubbed)}stubbed"
+                        )
+
             # Turn hooks (opt-in extensions): a registered hook may inspect or
             # rewrite the outbound tools/messages before we send upstream — the
             # extensible counterpart to the built-in deferral above. A single
@@ -3586,6 +3646,26 @@ class AnthropicHandlerMixin:
                                 f"[{request_id}] OutputShaper(L{_level}/{_src}): "
                                 f"{shape_result.labels}"
                             )
+
+            # Unified-21 #10: complexity-aware routing. Independently lowers a
+            # client-sent effort on simple mechanical turns (never for new asks,
+            # errors, contradictions, retries or open completion gates) and may
+            # relax verbosity for one complex reply via a trailing turn block;
+            # treatment arm of HEADROOM_OUTPUT_HOLDOUT only.
+            if not _bypass:
+                from headroom.agent.complexity import route_request
+
+                _route = route_request(
+                    body,
+                    shape="anthropic",
+                    config=getattr(self, "config", None),
+                    model=str(model),
+                    request_id=request_id,
+                    session_key=session_id,
+                )
+                if _route is not None and _route.changed:
+                    body_mutation_tracker.mark_mutated("complexity_routing")
+                    transforms_applied.extend(_route.labels)
 
             # Params stage: the last chance to change what the model WRITES.
             # Emitted here, after every message mutation and after the built-in
