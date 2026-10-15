@@ -13,12 +13,27 @@ from headroom.log_safety import describe_exception
 log = logging.getLogger(__name__)
 
 
-def feature_enabled(config: Any) -> bool:
+def feature_enabled(config: Any, name: str = FEATURE_TOOL_ADMISSION) -> bool:
     rollout = getattr(config, "rollout", None)
     try:
-        return bool(rollout is not None and rollout.is_enabled(FEATURE_TOOL_ADMISSION))
+        return bool(rollout is not None and rollout.is_enabled(name))
     except KeyError:
         return False
+
+
+def phase5_request_parts(config: Any) -> dict[str, Any]:
+    """Arbiter / feedback objects for a single (host-hook) admission."""
+    parts: dict[str, Any] = {}
+    if feature_enabled(config, "agent_arbiter"):
+        from headroom.agent.arbiter import RequestLimits, get_arbiter
+
+        parts["arbiter"] = get_arbiter()
+        parts["limits"] = RequestLimits()
+    if feature_enabled(config, "agent_feedback"):
+        from headroom.agent.feedback import get_feedback
+
+        parts["feedback"] = get_feedback()
+    return parts
 
 
 def handle_host_hook_request(data: dict[str, Any], config: Any) -> dict[str, Any]:
@@ -61,6 +76,7 @@ def handle_host_hook_request(data: dict[str, Any], config: Any) -> dict[str, Any
                 getattr(config, "ccr_inject_tool", True)
                 or getattr(config, "ccr_handle_responses", True)
             ),
+            **phase5_request_parts(config),
         )
     except Exception as exc:  # noqa: BLE001 - the host must never see an error from us
         log.warning("host hook admission failed: %s", describe_exception(exc))
@@ -97,4 +113,18 @@ def tool_admission_health(config: Any) -> dict[str, Any]:
     block: dict[str, Any] = {"enabled": enabled, "host": host_adapter.status()}
     if enabled:
         block["dispatcher"] = get_dispatcher().status()
+    # Unified-21 Phase 5: realized savings are reported apart from estimated
+    # avoided turns/time; every block is counts only (no payloads).
+    if feature_enabled(config, "agent_arbiter"):
+        from headroom.agent.arbiter import get_arbiter
+
+        block["arbiter"] = get_arbiter().status()
+    if feature_enabled(config, "agent_feedback"):
+        from headroom.agent.feedback import get_feedback
+
+        block["feedback"] = get_feedback().status()
+    if feature_enabled(config, "agent_speculation"):
+        from headroom.agent.speculation import speculation_status
+
+        block["speculation"] = speculation_status()
     return block

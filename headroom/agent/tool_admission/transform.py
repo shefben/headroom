@@ -17,14 +17,19 @@ import copy
 import logging
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
+from headroom.agent.budget import BudgetInputs
 from headroom.agent.interfaces import content_version_hash
 from headroom.agent.tool_admission.dispatcher import (
     ADMITTED_TAG,
+    AdmissionOutcome,
     AdmissionRequest,
+    PreparedAdmission,
     ToolAdmissionDispatcher,
     get_dispatcher,
+    unit_key,
 )
 from headroom.agent.tool_admission.families import (
     EDIT_TOOLS,
@@ -139,9 +144,17 @@ class ToolAdmissionTransform(Transform):
         *,
         retrieval_available: bool = True,
         dispatcher: ToolAdmissionDispatcher | None = None,
+        arbiter_enabled: bool = False,
+        feedback_enabled: bool = False,
+        speculation_enabled: bool = False,
     ) -> None:
         self.retrieval_available = retrieval_available
         self._dispatcher = dispatcher
+        #: Unified-21 Phase 5: global budget + multi-candidate arbiter (#8/#6),
+        #: retention feedback (#12) and speculative preparation (#15).
+        self.arbiter_enabled = arbiter_enabled
+        self.feedback_enabled = feedback_enabled
+        self.speculation_enabled = speculation_enabled
 
     @property
     def dispatcher(self) -> ToolAdmissionDispatcher:
@@ -209,59 +222,173 @@ class ToolAdmissionTransform(Transform):
 
         store = get_compression_store()
         dispatcher = self.dispatcher
-        applied: list[str] = []
-        out = list(messages[:frozen])
-        for msg in messages[frozen:]:
-            replacement = self._admit_message(
-                msg,
-                calls=calls,
-                dispatcher=dispatcher,
-                base=AdmissionRequest(
-                    scope=scope,
-                    context=ViewContext(query=query, entities=entities, working_set=ws, root=root, cwd=root),
-                    task=task,
-                    policy=policy,
-                    store=store,
-                    tokenizer=tokenizer,
-                    model=str(kwargs.get("model") or ""),
-                    retrieval_available=self.retrieval_available,
-                    source="proxy",
-                    base_visible=lambda record, _v=visible: _v.get(record.call_id)
-                    == record.version_hash,
-                ),
-                applyable=bool(_APPLYABLE.search(query or "")),
-                applied=applied,
+        model = str(kwargs.get("model") or "")
+        budget_inputs = self._budget_inputs(messages, kwargs, model)
+        feedback = self._feedback()
+        if feedback is not None:
+            feedback.tick(scope)
+            self._correction_signal(feedback, scope, messages)
+        arbiter = None
+        limits = None
+        advisor = advisor_budget = None
+        if self.arbiter_enabled:
+            from headroom.agent.arbiter import RequestLimits, get_arbiter
+
+            arbiter = get_arbiter()
+            limits = RequestLimits()
+            advisor = _advisor()
+            advisor_budget = advisor.request_budget() if advisor is not None else None
+        speculation = None
+        if self.speculation_enabled:
+            from headroom.agent.speculation import RequestSpeculation
+
+            speculation = RequestSpeculation()
+        base = AdmissionRequest(
+            scope=scope,
+            context=ViewContext(query=query, entities=entities, working_set=ws, root=root, cwd=root),
+            task=task,
+            policy=policy,
+            store=store,
+            tokenizer=tokenizer,
+            model=model,
+            retrieval_available=self.retrieval_available,
+            source="proxy",
+            base_visible=lambda record, _v=visible: _v.get(record.call_id) == record.version_hash,
+            arbiter=arbiter,
+            feedback=feedback,
+            speculation=speculation,
+            limits=limits,
+            advisor=advisor,
+            advisor_budget=advisor_budget,
+            cache_mode=budget_inputs.cache_mode,
+            cache_ttl_seconds=budget_inputs.cache_ttl_seconds,
+        )
+        applyable = bool(_APPLYABLE.search(query or ""))
+        replacements: dict[tuple[int, int | None], tuple[str, str]] = {}
+        try:
+            units = self._collect_units(messages, frozen, calls, base, applyable)
+            replacements = self._admit_units(
+                units, dispatcher, tokenizer, messages, frozen, budget_inputs, feedback
             )
-            out.append(replacement)
-        if not applied:
+        finally:
+            if speculation is not None:
+                self._prepare_indexes(speculation, store, _admitted_hashes(replacements))
+        if not replacements:
             return messages, []
+        out = list(messages[:frozen])
+        applied: list[str] = []
+        for idx in range(frozen, len(messages)):
+            msg = messages[idx]
+            mine = {b: r for (m, b), r in replacements.items() if m == idx}
+            if not mine:
+                out.append(msg)
+                continue
+            if msg.get("role") == "tool":
+                text, label = mine[None]
+                clone = dict(msg)
+                clone["content"] = (
+                    text if isinstance(msg.get("content"), str) else [{"type": "text", "text": text}]
+                )
+                out.append(clone)
+                applied.append(label)
+                continue
+            clone = copy.deepcopy(msg)
+            for block_idx in sorted(b for b in mine if b is not None):
+                text, label = mine[block_idx]
+                _set_block_text(clone["content"][block_idx], text)
+                applied.append(label)
+            out.append(clone)
         return out, applied
 
+    # -- Phase 5 request plumbing ---------------------------------------------------
+
     @staticmethod
-    def _has_tool_result(msg: Mapping[str, Any]) -> bool:
-        if msg.get("role") == "tool":
-            return True
-        content = msg.get("content")
-        return isinstance(content, list) and any(
-            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+    def _budget_inputs(
+        messages: list[dict[str, Any]], kwargs: Mapping[str, Any], model: str
+    ) -> BudgetInputs:
+        given = kwargs.get("live_zone_budget")
+        if isinstance(given, BudgetInputs):
+            return given
+        from headroom.models.registry import ModelRegistry
+
+        ttl = kwargs.get("cache_ttl_seconds")
+        return BudgetInputs(
+            model=model,
+            model_limit=ModelRegistry.get_context_limit(model or "", default=128_000),
+            effective_limit=int(kwargs.get("model_limit") or 0),
+            cache_mode=cache_mode_of(messages),
+            cache_ttl_seconds=int(ttl) if isinstance(ttl, int | float) else None,
         )
 
-    def _admit_one(
+    def _feedback(self) -> Any:
+        if not self.feedback_enabled:
+            return None
+        from headroom.agent.feedback import get_feedback
+
+        return get_feedback()
+
+    @staticmethod
+    def _correction_signal(feedback: Any, scope: str, messages: list[dict[str, Any]]) -> None:
+        text = _latest_user_text(messages)
+        if not text:
+            return
+        from headroom.agent.task_state import classify_user_turn
+
+        if classify_user_turn(text) == "correction":
+            feedback.signal_correction(scope, content_version_hash(text))
+
+    def _collect_units(
         self,
+        messages: list[dict[str, Any]],
+        frozen: int,
+        calls: Mapping[str, tuple[str, Mapping[str, Any]]],
+        base: AdmissionRequest,
+        applyable: bool,
+    ) -> list[_Unit]:
+        units: list[_Unit] = []
+        for idx in range(frozen, len(messages)):
+            msg = messages[idx]
+            if msg.get("role") == "tool":
+                text = _block_text(msg.get("content"))
+                call_id = msg.get("tool_call_id")
+                if text is not None and isinstance(call_id, str):
+                    unit = self._unit(idx, None, text, call_id, calls, base, False, applyable)
+                    if unit is not None:
+                        units.append(unit)
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for b_idx, block in enumerate(content):
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                text = _block_text(block.get("content"))
+                call_id = block.get("tool_use_id")
+                if text is None or not isinstance(call_id, str):
+                    continue
+                unit = self._unit(
+                    idx, b_idx, text, call_id, calls, base, bool(block.get("is_error")), applyable
+                )
+                if unit is not None:
+                    units.append(unit)
+        return units
+
+    @staticmethod
+    def _unit(
+        msg_idx: int,
+        block_idx: int | None,
         text: str,
         call_id: str,
         calls: Mapping[str, tuple[str, Mapping[str, Any]]],
-        dispatcher: ToolAdmissionDispatcher,
         base: AdmissionRequest,
-        *,
         is_error: bool,
         applyable: bool,
-    ) -> tuple[str | None, str]:
+    ) -> _Unit | None:
         if not text or is_admitted(text):
-            return None, ""
+            return None
         name, args = calls.get(call_id, ("", {}))
         if not name:
-            return None, ""  # orphaned result: no tool identity, never guessed
+            return None  # orphaned result: no tool identity, never guessed
         envelope = build_envelope(
             tool_name=name,
             tool_input=args,
@@ -282,61 +409,226 @@ class ToolAdmissionTransform(Transform):
             applyable_patch=applyable,
         )
         request = AdmissionRequest(**{**base.__dict__, "context": ctx})
-        outcome = dispatcher.admit(envelope, request)
-        if outcome.text is None:
-            return None, ""
-        return outcome.text, f"tool_admission:{outcome.family}:{outcome.label}"
+        return _Unit(msg_idx, block_idx, envelope, request)
 
-    def _admit_message(
+    def _admit_units(
         self,
-        msg: dict[str, Any],
-        *,
-        calls: Mapping[str, tuple[str, Mapping[str, Any]]],
+        units: list[_Unit],
         dispatcher: ToolAdmissionDispatcher,
-        base: AdmissionRequest,
-        applyable: bool,
-        applied: list[str],
-    ) -> dict[str, Any]:
+        tokenizer: Tokenizer,
+        messages: list[dict[str, Any]],
+        frozen: int,
+        budget_inputs: BudgetInputs,
+        feedback: Any,
+    ) -> dict[tuple[int, int | None], tuple[str, str]]:
+        """Prepare every unit, allocate the live-zone budget, then decide.
+
+        Memoized units are fixed (their rendered bytes are committed in the
+        client's history and must not change). A unit whose resource already
+        occurred earlier in this request is decided after it, in order, so a
+        same-request reread still sees its base.
+        """
+        replacements: dict[tuple[int, int | None], tuple[str, str]] = {}
+        fixed: list[tuple[_Unit, AdmissionOutcome]] = []
+        fresh: list[_Unit] = []
+        deferred: list[_Unit] = []
+        seen_resources: set[str] = set()
+        for unit in units:
+            memo = dispatcher.memo_lookup(unit.envelope, unit.request)
+            if memo is not None:
+                fixed.append((unit, memo))
+                continue
+            rid = str(unit.envelope.resource_id or "")
+            if rid and rid in seen_resources:
+                deferred.append(unit)
+            else:
+                fresh.append(unit)
+            if rid:
+                seen_resources.add(rid)
+        if feedback is not None:
+            for unit in fresh + deferred:
+                _signal_new_result(feedback, unit)
+        # Speculation (#15): view previews for the next units run on this
+        # request's single lane while the current unit is prepared inline.
+        for unit in fresh[1:]:
+            dispatcher.speculate_view(unit.envelope, unit.request)
+        prepared = [dispatcher.prepare(u.envelope, u.request) for u in fresh]
+        allocation = None
+        if self.arbiter_enabled:
+            allocation = self._allocate(
+                prepared, fixed, dispatcher, tokenizer, messages, frozen, budget_inputs
+            )
+        for unit, prep in zip(fresh, prepared):
+            kw: dict[str, Any] = {}
+            if allocation is not None:
+                key = unit_key(unit.envelope)
+                kw = {
+                    "allowance": allocation.allowance(key),
+                    "pressure": allocation.pressure.get(key, 0.0),
+                    "insufficient": allocation.insufficient,
+                }
+            outcome = dispatcher.decide(prep, **kw)
+            if outcome.text is not None:
+                replacements[(unit.msg_idx, unit.block_idx)] = (
+                    outcome.text,
+                    f"tool_admission:{outcome.family}:{outcome.label}",
+                )
+        for unit in deferred:
+            outcome = dispatcher.admit(unit.envelope, unit.request)
+            if outcome.text is not None:
+                replacements[(unit.msg_idx, unit.block_idx)] = (
+                    outcome.text,
+                    f"tool_admission:{outcome.family}:{outcome.label}",
+                )
+        for unit, memo in fixed:
+            if memo.text is not None:
+                replacements[(unit.msg_idx, unit.block_idx)] = (
+                    memo.text,
+                    f"tool_admission:{memo.family}:{memo.label}",
+                )
+        return replacements
+
+    def _allocate(
+        self,
+        prepared: list[PreparedAdmission],
+        fixed: list[tuple[_Unit, AdmissionOutcome]],
+        dispatcher: ToolAdmissionDispatcher,
+        tokenizer: Tokenizer,
+        messages: list[dict[str, Any]],
+        frozen: int,
+        budget_inputs: BudgetInputs,
+    ) -> Any:
+        from headroom.agent.arbiter import get_arbiter
+        from headroom.agent.budget import BudgetUnit, allocate, compute_budget
+
+        frozen_tokens = tokenizer.count_messages(messages[:frozen]) if frozen else 0
+        budget = compute_budget(budget_inputs, frozen_tokens=frozen_tokens)
+        units: list[BudgetUnit] = []
+        unit_tokens = 0
+        for prep in prepared:
+            bu = dispatcher.budget_unit(prep)
+            if bu is not None:
+                units.append(bu)
+                unit_tokens += bu.original_tokens
+            else:
+                tokens = tokenizer.count_text(prep.envelope.content)
+                units.append(
+                    BudgetUnit(
+                        key=unit_key(prep.envelope),
+                        source=prep.family.value,
+                        original_tokens=tokens,
+                        min_tokens=tokens,
+                        fixed=True,
+                    )
+                )
+                unit_tokens += tokens
+        for unit, memo in fixed:
+            text = memo.text if memo.text is not None else unit.envelope.content
+            tokens = tokenizer.count_text(text)
+            units.append(
+                BudgetUnit(unit_key(unit.envelope), memo.family, tokens, tokens, fixed=True)
+            )
+            unit_tokens += tokenizer.count_text(unit.envelope.content)
+        live_tokens = tokenizer.count_messages(messages[frozen:])
+        other = max(0, live_tokens - unit_tokens)
+        allocation = allocate(units, budget, other_live_tokens=other)
+        get_arbiter().note_allocation(allocation)
+        return allocation
+
+    @staticmethod
+    def _prepare_indexes(speculation: Any, store: Any, keys: list[str]) -> None:
+        """While the request awaits the model, build CCR span indexes for the
+        originals stored this turn (derived data; nothing waits for it)."""
+        from headroom.ccr.indexed import get_indexed_ccr
+
+        index = get_indexed_ccr()
+        for key in keys[:8]:
+            speculation.submit(("index", key), lambda k=key: index.ensure(store, k))
+        speculation.detach()
+
+    @staticmethod
+    def _has_tool_result(msg: Mapping[str, Any]) -> bool:
         if msg.get("role") == "tool":
-            text = _block_text(msg.get("content"))
-            call_id = msg.get("tool_call_id")
-            if text is None or not isinstance(call_id, str):
-                return msg
-            new, label = self._admit_one(
-                text, call_id, calls, dispatcher, base, is_error=False, applyable=applyable
-            )
-            if new is None:
-                return msg
-            applied.append(label)
-            clone = dict(msg)
-            clone["content"] = new if isinstance(msg.get("content"), str) else [
-                {"type": "text", "text": new}
-            ]
-            return clone
+            return True
         content = msg.get("content")
-        if not isinstance(content, list):
-            return msg
-        clone: dict[str, Any] | None = None
-        for idx, block in enumerate(content):
-            if not isinstance(block, dict) or block.get("type") != "tool_result":
-                continue
-            text = _block_text(block.get("content"))
-            call_id = block.get("tool_use_id")
-            if text is None or not isinstance(call_id, str):
-                continue
-            new, label = self._admit_one(
-                text,
-                call_id,
-                calls,
-                dispatcher,
-                base,
-                is_error=bool(block.get("is_error")),
-                applyable=applyable,
+        return isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+        )
+
+
+@dataclass
+class _Unit:
+    msg_idx: int
+    block_idx: int | None
+    envelope: Any
+    request: AdmissionRequest
+
+
+_HASH_IN_TEXT = re.compile(r"hash=([a-f0-9]{12,24})\b")
+_TEST_FAILED = re.compile(r"(?m)^(?:FAILED |ERROR |E\s)|\b\d+ failed\b")
+
+
+def _admitted_hashes(reps: Mapping[Any, tuple[str, str]]) -> list[str]:
+    """CCR hashes in this request's admitted replacements (for index prep)."""
+    keys: list[str] = []
+    for text, _label in reps.values():
+        for match in _HASH_IN_TEXT.findall(text):
+            if match not in keys:
+                keys.append(match)
+    return keys
+
+
+def cache_mode_of(messages: list[dict[str, Any]]) -> str:
+    """``write`` when the client set any prompt-cache breakpoint in messages."""
+    for msg in messages:
+        if isinstance(msg.get("cache_control"), dict):
+            return "write"
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and isinstance(block.get("cache_control"), dict):
+                    return "write"
+    return "none"
+
+
+def _latest_user_text(messages: list[dict[str, Any]]) -> str:
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = [
+                str(b.get("text") or "")
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            ]
+            if texts:
+                return "\n".join(texts)
+            return ""  # a tool-result turn: no new user text
+    return ""
+
+
+def _signal_new_result(feedback: Any, unit: _Unit) -> None:
+    """Retention feedback from a newly observed result (#12)."""
+    env = unit.envelope
+    scope = unit.request.scope
+    family = env.tool_family
+    if (env.tool_name or "").lower() in EDIT_TOOLS and env.is_error:
+        raw = path_of(unit.request.context.tool_input or {})
+        if raw:
+            feedback.signal_repair(
+                scope,
+                workspace_relative(raw, root=unit.request.context.root, cwd=unit.request.context.cwd),
             )
-            if new is None:
-                continue
-            if clone is None:
-                clone = copy.deepcopy(msg)
-            _set_block_text(clone["content"][idx], new)
-            applied.append(label)
-        return clone if clone is not None else msg
+        return
+    if family == "test" and (env.is_error or env.exit_code not in (None, 0) or _TEST_FAILED.search(env.content)):
+        feedback.signal_test_failure(scope)
+
+
+def _advisor() -> Any:
+    from headroom.agent.hook import _active_runtime
+
+    runtime = _active_runtime()
+    return getattr(runtime, "advisor", None) if runtime is not None else None

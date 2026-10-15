@@ -202,6 +202,9 @@ def handle_hook(
     policy: Any = None,
     store: Any = None,
     retrieval_available: bool = True,
+    arbiter: Any = None,
+    limits: Any = None,
+    feedback: Any = None,
 ) -> dict[str, Any]:
     """Process one Claude Code hook payload; returns ``{"output": ..., ...}``.
 
@@ -277,6 +280,9 @@ def handle_hook(
             store=store,
             retrieval_available=retrieval_available,
             source="host",
+            arbiter=arbiter,
+            limits=limits,
+            feedback=feedback,
         ),
     )
     _count(f"stage:{outcome.stage}")

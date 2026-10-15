@@ -35,6 +35,7 @@ FEATURE_TASK_STATE = "agent_task_state"
 FEATURE_EVIDENCE = "agent_evidence"
 FEATURE_CODE_GRAPH = "agent_code_graph"
 FEATURE_TOOL_ADMISSION = "agent_tool_admission"
+FEATURE_FEEDBACK = "agent_feedback"
 
 STAGE_TASK_STATE = "task_state"
 LISTENER_SNAPSHOTS = "task_state_snapshots"
@@ -111,7 +112,8 @@ def install_builtin_components(runtime: Any, config: Any) -> Callable[[], None]:
     evidence_on = _enabled(config, FEATURE_EVIDENCE)
     graph_on = _enabled(config, FEATURE_CODE_GRAPH)
     admission_on = _enabled(config, FEATURE_TOOL_ADMISSION)
-    if not (task_on or evidence_on or graph_on or admission_on):
+    feedback_on = _enabled(config, FEATURE_FEEDBACK)
+    if not (task_on or evidence_on or graph_on or admission_on or feedback_on):
         return lambda: None
 
     ledger = open_ledger(runtime.store)
@@ -177,7 +179,25 @@ def install_builtin_components(runtime: Any, config: Any) -> Callable[[], None]:
 
         bind_persistence(runtime)
 
+    if feedback_on:
+        # Retention-feedback priors (#12): generalized keys only, persisted
+        # through the same ledger on the runtime worker.
+        from headroom.agent.feedback import get_feedback
+
+        feedback = get_feedback()
+        feedback.enabled = True
+        try:
+            feedback.bind(ledger, runtime.submit_task)
+        except Exception as exc:  # noqa: BLE001 - memory-only priors still work
+            log.warning("feedback persistence unavailable: %s", describe_exception(exc))
+        runtime.services["feedback"] = feedback
+
     def teardown() -> None:
+        if feedback_on:
+            from headroom.agent.feedback import get_feedback
+
+            get_feedback().unbind()
+            runtime.services.pop("feedback", None)
         if admission_on:
             from headroom.agent.tool_admission.service import unbind_persistence
 

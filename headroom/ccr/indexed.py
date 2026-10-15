@@ -694,6 +694,12 @@ class IndexedCCR:
         state = self.ensure(store, entry_hash)
         if state is None:
             return {"hash": entry_hash, "error": "entry_not_found_or_expired", "status": "missing"}
+        if mode != "metadata":
+            # Unified-21 #12: a model re-retrieving content it was shown in a
+            # lossy form is retention feedback for that decision.
+            from headroom.agent.feedback import note_ccr_retrieval
+
+            note_ccr_retrieval(entry_hash)
         generation, original = state
         if mode == "full":
             return {

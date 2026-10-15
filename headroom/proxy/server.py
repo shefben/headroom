@@ -1151,7 +1151,11 @@ class HeadroomProxy(
 
             _intercept_prefix.append(
                 ToolAdmissionTransform(
-                    retrieval_available=bool(config.ccr_inject_tool or config.ccr_handle_responses)
+                    retrieval_available=bool(config.ccr_inject_tool or config.ccr_handle_responses),
+                    # Unified-21 Phase 5 (#8/#6, #12, #15).
+                    arbiter_enabled=config.rollout.is_enabled("agent_arbiter"),
+                    feedback_enabled=config.rollout.is_enabled("agent_feedback"),
+                    speculation_enabled=config.rollout.is_enabled("agent_speculation"),
                 )
             )
         if config.rollout.is_enabled("tool_result_interceptors"):

@@ -515,6 +515,10 @@ class CompressionStore:
         # Process feedback immediately to ensure TOIN learns in real-time
         if self._enable_feedback:
             self.process_pending_feedback()
+        # Unified-21 #12: retention feedback for an arbiter decision on this hash.
+        from ..agent.feedback import note_ccr_retrieval
+
+        note_ccr_retrieval(hash_key)
 
         return result_entry
 

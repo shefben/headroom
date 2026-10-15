@@ -180,6 +180,48 @@ FEATURES: dict[str, FeatureSpec] = {
             "structured deltas and tool-family views with exact CCR recovery."
         ),
     ),
+    # Phase-5 adaptive stack. Each is additive and never weakens a SafetyGate
+    # invariant; default-on for `wrap` only, opt-in for a bare proxy.
+    "agent_arbiter": FeatureSpec(
+        name="agent_arbiter",
+        available_in=RolloutChannel.STABLE,
+        description=(
+            "Global live-zone token budget and multi-candidate Transform Arbiter "
+            "for admitted tool results (needs agent_tool_admission)."
+        ),
+    ),
+    "agent_tool_catalog": FeatureSpec(
+        name="agent_tool_catalog",
+        available_in=RolloutChannel.STABLE,
+        description=(
+            "Progressive tool catalog where native tool search is unavailable: "
+            "compact signatures, top-ranked full schemas, cache-stable per session."
+        ),
+    ),
+    "agent_complexity_routing": FeatureSpec(
+        name="agent_complexity_routing",
+        available_in=RolloutChannel.STABLE,
+        description=(
+            "Complexity-aware routing of client-sent reasoning effort (lower only) "
+            "and visible-answer verbosity, honouring HEADROOM_OUTPUT_HOLDOUT."
+        ),
+    ),
+    "agent_feedback": FeatureSpec(
+        name="agent_feedback",
+        available_in=RolloutChannel.STABLE,
+        description=(
+            "Bounded, reversible retention feedback (CCR re-retrieval, rereads, "
+            "repairs, corrections) for arbiter and catalog preference."
+        ),
+    ),
+    "agent_speculation": FeatureSpec(
+        name="agent_speculation",
+        available_in=RolloutChannel.STABLE,
+        description=(
+            "Bounded speculative preparation of candidate previews and CCR span "
+            "indexes (one worker per request, discarded when late)."
+        ),
+    ),
 }
 
 #: Safe, non-destructive features `headroom wrap` turns on for the proxy it
@@ -190,6 +232,11 @@ WRAP_DEFAULT_FEATURES: tuple[str, ...] = (
     "agent_evidence",
     "agent_code_graph",
     "agent_tool_admission",
+    "agent_arbiter",
+    "agent_tool_catalog",
+    "agent_complexity_routing",
+    "agent_feedback",
+    "agent_speculation",
 )
 
 
