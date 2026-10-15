@@ -221,6 +221,7 @@ def test_wrap_feature_defaults_respect_disable():
         "agent_task_state",
         "agent_evidence",
         "agent_code_graph",
+        "agent_tool_admission",
     ]
     env = apply_wrap_feature_defaults({"HEADROOM_DISABLE_FEATURES": "agent_runtime,agent_evidence"})
     snapshot = resolve_rollout(env)
@@ -230,5 +231,6 @@ def test_wrap_feature_defaults_respect_disable():
     # A bare proxy (no wrap defaults) keeps every agent feature opt-in.
     bare = resolve_rollout({})
     assert not any(
-        bare.is_enabled(n) for n in ("agent_task_state", "agent_evidence", "agent_code_graph")
+        bare.is_enabled(n)
+        for n in ("agent_task_state", "agent_evidence", "agent_code_graph", "agent_tool_admission")
     )

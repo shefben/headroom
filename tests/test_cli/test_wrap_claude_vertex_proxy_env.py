@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +96,13 @@ def _invoke_wrap_claude(
         return None, args[0] if args else 8787
 
     def fake_run(cmd: list[str], *, env: dict[str, str]) -> _Completed:
+        # Unified-21 #4: wrap prepends `--settings <json>` carrying the
+        # tool-admission hooks; record it separately so these assertions
+        # stay about the user's own pass-through args.
+        cmd = list(cmd)
+        if len(cmd) >= 3 and cmd[1] == "--settings" and "headroom.host_hook" in cmd[2]:
+            captured["tool_hook_settings"] = json.loads(cmd[2])
+            cmd = [cmd[0], *cmd[3:]]
         captured["child_cmd"] = cmd
         captured["child_env"] = env
         return _Completed()
@@ -134,6 +143,9 @@ def test_wrap_claude_plain_mode_warns_about_remote_control_gate(
     captured, output = _invoke_wrap_claude(runner, monkeypatch, env={}, extra_args=("-v",))
 
     assert captured["child_cmd"] == ["/usr/bin/claude"]
+    hooks = captured["tool_hook_settings"]["hooks"]
+    assert set(hooks) == {"PreToolUse", "PostToolUse"}
+    assert "Tool admission: host pre-context hook" in output
     assert "Remote Control" in output
     assert "wrapped Claude session's ANTHROPIC_BASE_URL" in output
     # Issue #1779: the warning is accurate (deterministic, names /rc) and
