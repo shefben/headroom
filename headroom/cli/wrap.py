@@ -874,6 +874,12 @@ def _start_proxy(
     # is detached (setsid / breakaway flags), so without this a crashed or
     # killed wrapper leaks the proxy forever and later wraps silently reuse it.
     proxy_env["HEADROOM_WRAP_OWNED"] = "1"
+    # Safe, non-destructive agent intelligence (task state, evidence, code
+    # graph) is on by default for wrapped sessions; HEADROOM_DISABLE_FEATURES
+    # still turns any of it off.
+    from headroom.rollout import apply_wrap_feature_defaults
+
+    apply_wrap_feature_defaults(proxy_env)
     savings_profile = _wrap_agent_savings_profile(agent_type)
     if savings_profile is not None:
         apply_agent_savings_env_defaults(proxy_env, savings_profile)
@@ -9259,8 +9265,12 @@ def _agent_runtime_mismatches(running_config: Mapping[str, Any]) -> list[str]:
     if isinstance(running_agent, bool):
         from headroom.rollout import resolve_rollout
 
+        from headroom.rollout import apply_wrap_feature_defaults
+
         try:
-            requested_agent = resolve_rollout(os.environ).is_enabled("agent_runtime")
+            requested_agent = resolve_rollout(
+                apply_wrap_feature_defaults(dict(os.environ))
+            ).is_enabled("agent_runtime")
         except Exception:  # noqa: BLE001 - an invalid local env must not break reuse
             requested_agent = running_agent
         if requested_agent != running_agent:

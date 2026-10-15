@@ -234,6 +234,7 @@ class _Builder:
             "assistant",
             text,
             index=self._occurrence("assistant", digest),
+            content=text,
             metadata={"chars": len(text)},
         )
 
@@ -244,6 +245,9 @@ class _Builder:
         command = _command_of(name, parsed)
         if command:
             meta["command_head"] = command.strip().split("\n", 1)[0][:120]
+        path = _path_of(parsed)
+        if path:
+            meta["path"] = path[-160:]
         self._add(
             EventKind.TOOL_CALL,
             Origin.MODEL,
@@ -259,13 +263,25 @@ class _Builder:
         envelope = ToolResultEnvelope.from_text(
             tool_call_id=call_id, tool_name=name, text=text, is_error=is_error
         )
+        meta = envelope.to_metadata()
+        resource_id = None
+        if call is not None:
+            command = _command_of(call.name, call.args)
+            if command:
+                meta["command_head"] = command.strip().split("\n", 1)[0][:120]
+            path = _path_of(call.args)
+            if path:
+                meta["path"] = path[-160:]
+                resource_id = self._resource(path)
         self._add(
             EventKind.TOOL_RESULT,
             Origin.TOOL,
             call_id,
             text,
             content=text,
-            metadata=envelope.to_metadata(),
+            resource_id=resource_id,
+            resource_hash=content_digest(text) if resource_id else None,
+            metadata=meta,
         )
         if call is not None:
             self._derived(call, envelope, text)
@@ -281,6 +297,7 @@ class _Builder:
                     call.call_id,
                     {"path": path, "args": _json_text(call.args)},
                     index=ordinal,
+                    content=path,
                     resource_id=resource,
                     resource_hash=content_digest(_json_text(call.args)),
                     metadata={"tool_name": call.name, "path": path[-160:]},
@@ -295,11 +312,13 @@ class _Builder:
                 Origin.TOOL,
                 call.call_id,
                 {"command": command, "result": text},
+                content=command,
                 metadata={"operation": git.group(1).split()[0], "tool_name": call.name},
             )
         test = _TEST_COMMAND.search(command)
         if test:
             meta: dict[str, Any] = {
+                "command_head": command.strip().split("\n", 1)[0][:120],
                 "runner": test.group(1).split()[0],
                 "exit_code": envelope.exit_code,
                 "is_error": envelope.is_error,
@@ -341,6 +360,14 @@ def _command_of(name: str, args: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _path_of(args: Mapping[str, Any]) -> str | None:
+    for key in (*_PATH_KEYS, "filePath"):
+        value = args.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _edited_paths(lname: str, args: Mapping[str, Any]) -> list[str]:
     if lname == "apply_patch":
         patch = args.get("input") or args.get("patch") or ""
@@ -374,6 +401,8 @@ def _walk_anthropic(builder: _Builder, messages: Iterable[Any]) -> None:
         if not isinstance(message, Mapping):
             continue
         role = message.get("role")
+        if role in ("system", "developer"):
+            continue  # mid-conversation system sections are harness/Headroom content
         content = message.get("content")
         if isinstance(content, str):
             (builder.user_text if role == "user" else builder.model_text)(content)

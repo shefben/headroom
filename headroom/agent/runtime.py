@@ -20,7 +20,7 @@ import queue
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +45,13 @@ DEFAULT_AUTHORIZATION_TTL_S = 60.0
 _STOP = object()
 
 
+class _Task:
+    __slots__ = ("fn",)
+
+    def __init__(self, fn: Callable[[], Any]) -> None:
+        self.fn = fn
+
+
 class AgentRuntime:
     """Session-safe event runtime (see module docstring)."""
 
@@ -58,6 +65,9 @@ class AgentRuntime:
     ) -> None:
         self.store = store
         self.advisor = advisor
+        # Long-lived services later phases attach by name (task_state,
+        # evidence, code_graph, ...). Request stages look them up here.
+        self.services: dict[str, Any] = {}
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, int(queue_size)))
         self._recent: OrderedDict[str, None] = OrderedDict()
         self._recent_cap = max(1, int(recent_ids))
@@ -155,6 +165,27 @@ class AgentRuntime:
         self.counters["submitted_events"] += len(fresh)
         return True
 
+    def submit_task(self, fn: Callable[[], Any]) -> bool:
+        """Run ``fn`` on the worker thread (e.g. a store read). Never blocks.
+
+        Used by request stages that must not touch SQLite on the event loop.
+        Returns False when the queue is full or the runtime stopped.
+        """
+        if self._stopped:
+            return False
+        self.start()
+        with self._idle:
+            self._pending += 1
+        try:
+            self._queue.put_nowait(_Task(fn))
+        except queue.Full:
+            with self._idle:
+                self._pending -= 1
+                self._idle.notify_all()
+            self.counters["dropped_batches"] += 1
+            return False
+        return True
+
     def note_request(self, identity: WorkspaceIdentity) -> None:
         key = "trusted_requests" if identity.trusted else "untrusted_requests"
         self.counters[key] += 1
@@ -171,6 +202,16 @@ class AgentRuntime:
             item = self._queue.get()
             if item is _STOP:
                 break
+            if isinstance(item, _Task):
+                try:
+                    item.fn()
+                except Exception as exc:  # noqa: BLE001 - a task must not kill the worker
+                    log.warning("agent runtime task failed: %s", describe_exception(exc))
+                finally:
+                    with self._idle:
+                        self._pending -= 1
+                        self._idle.notify_all()
+                continue
             try:
                 committed = self.store.commit(item, registry.projectors())
                 self.counters["committed_events"] += len(committed)
@@ -250,6 +291,11 @@ class AgentRuntime:
             "counters": dict(self.counters),
             "last_error": self.last_error,
             "extensions": registry.snapshot(),
+            "services": {
+                name: service.status()
+                for name, service in sorted(self.services.items())
+                if callable(getattr(service, "status", None))
+            },
         }
 
 

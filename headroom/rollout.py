@@ -12,7 +12,7 @@ import hashlib
 import json
 import logging
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, MutableMapping
 from dataclasses import dataclass
 from enum import Enum
 
@@ -142,7 +142,65 @@ FEATURES: dict[str, FeatureSpec] = {
             "the JevK5 decision advisor (opt-in)."
         ),
     ),
+    # Phase-2 agent intelligence. Opt-in for a bare `headroom proxy`;
+    # `headroom wrap` enables them by default (WRAP_DEFAULT_FEATURES) because
+    # they are additive and non-destructive: observation, local state, and one
+    # bounded advisory state block appended after the live turn.
+    "agent_task_state": FeatureSpec(
+        name="agent_task_state",
+        available_in=RolloutChannel.STABLE,
+        description=(
+            "Task State Compiler: provenance-carrying task state and a bounded "
+            "state block folded into wrapped requests (needs agent_runtime)."
+        ),
+    ),
+    "agent_evidence": FeatureSpec(
+        name="agent_evidence",
+        available_in=RolloutChannel.STABLE,
+        description=(
+            "Provenance-aware evidence ledger of tool/test/file/git observations "
+            "(needs agent_runtime)."
+        ),
+    ),
+    "agent_code_graph": FeatureSpec(
+        name="agent_code_graph",
+        available_in=RolloutChannel.STABLE,
+        description=(
+            "Incremental graph/symbol-scoped code context for trusted wrap "
+            "workspaces (needs agent_runtime)."
+        ),
+    ),
 }
+
+#: Safe, non-destructive features `headroom wrap` turns on for the proxy it
+#: launches. ``HEADROOM_DISABLE_FEATURES`` still disables any of them.
+WRAP_DEFAULT_FEATURES: tuple[str, ...] = (
+    "agent_runtime",
+    "agent_task_state",
+    "agent_evidence",
+    "agent_code_graph",
+)
+
+
+def apply_wrap_feature_defaults(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
+    """Add :data:`WRAP_DEFAULT_FEATURES` to ``HEADROOM_FEATURES`` in ``env``.
+
+    Names the user disabled (``HEADROOM_DISABLE_FEATURES``) are not added, and
+    existing requested names are preserved in order. Returns ``env``.
+    """
+    disabled = _split_names(env.get("HEADROOM_DISABLE_FEATURES"))
+    current = [
+        part.strip()
+        for part in (env.get("HEADROOM_FEATURES") or "").replace(";", ",").split(",")
+        if part.strip()
+    ]
+    normalized = {name.lower().replace("-", "_") for name in current}
+    for name in WRAP_DEFAULT_FEATURES:
+        if name not in disabled and name not in normalized:
+            current.append(name)
+    if current:
+        env["HEADROOM_FEATURES"] = ",".join(current)
+    return env
 
 
 def _split_names(raw: str | None) -> set[str]:

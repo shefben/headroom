@@ -24,6 +24,7 @@ from headroom.agent import registry
 from headroom.agent.identity import WorkspaceIdentity, resolve_identity
 from headroom.agent.interfaces import TASK_CONTEXT_VERSION, TaskContext
 from headroom.agent.normalize import normalize_messages
+from headroom.agent.query import build_task_context
 from headroom.log_safety import describe_exception
 
 if TYPE_CHECKING:
@@ -81,18 +82,24 @@ class AgentRuntimeHook:
             return
         runtime.note_request(identity)
         request_id = str(ctx.tags.get("request_id") or uuid.uuid4().hex)
-        task = TaskContext(
-            v=TASK_CONTEXT_VERSION,
-            request_id=request_id,
-            workspace_id=identity.workspace_id,
-            session_id=identity.session_id,
-            trusted=identity.trusted,
-            provider=ctx.provider,
-            model=ctx.model,
-            tool_names=turn.tool_names,
-            event_ids=tuple(ev.id for ev in turn.events),
-            latest_user_digest=turn.latest_user_digest,
-        )
+        try:
+            task = build_task_context(
+                ctx=ctx, identity=identity, turn=turn, runtime=runtime, request_id=request_id
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back to the minimal context
+            log.warning("agent task context build failed: %s", describe_exception(exc))
+            task = TaskContext(
+                v=TASK_CONTEXT_VERSION,
+                request_id=request_id,
+                workspace_id=identity.workspace_id,
+                session_id=identity.session_id,
+                trusted=identity.trusted,
+                provider=ctx.provider,
+                model=ctx.model,
+                tool_names=turn.tool_names,
+                event_ids=tuple(ev.id for ev in turn.events),
+                latest_user_digest=turn.latest_user_digest,
+            )
         # Request-scoped, attached to this TurnContext only (never a global).
         ctx.agent_task_context = task  # type: ignore[attr-defined]
         ctx.agent_identity = identity  # type: ignore[attr-defined]

@@ -1065,6 +1065,22 @@ def _system_message_to_blocks(message: dict[str, Any]) -> list[Any]:
     return []
 
 
+_MID_CONVERSATION_SYSTEM_FAMILIES = (
+    "claude-fable-5",
+    "claude-haiku-5",
+    "claude-mythos-5",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-sonnet-5",
+)
+
+
+def anthropic_supports_mid_conversation_system(model: str | None) -> bool:
+    """Whether an Anthropic model accepts ``role="system"`` sections mid-conversation."""
+    model_id = str(model or "").lower()
+    return any(family in model_id for family in _MID_CONVERSATION_SYSTEM_FAMILIES)
+
+
 def relocate_system_messages_to_top_level(
     messages: list[dict[str, Any]],
     system: Any,
@@ -1090,18 +1106,7 @@ def relocate_system_messages_to_top_level(
     message is present the inputs pass through unchanged (``changed=False``) so
     the common path is untouched.
     """
-    model_id = str(model or "").lower()
-    supports_mid_conversation = any(
-        family in model_id
-        for family in (
-            "claude-fable-5",
-            "claude-haiku-5",
-            "claude-mythos-5",
-            "claude-opus-4-8",
-            "claude-opus-5",
-            "claude-sonnet-5",
-        )
-    )
+    supports_mid_conversation = anthropic_supports_mid_conversation_system(model)
 
     def _assistant_ends_in_server_tool_result(message: object) -> bool:
         if not isinstance(message, dict) or message.get("role") != "assistant":

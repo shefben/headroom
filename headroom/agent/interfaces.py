@@ -24,6 +24,8 @@ from enum import Enum
 from typing import Any
 
 TASK_CONTEXT_VERSION = 1
+RELEVANCE_QUERY_VERSION = 1
+RELEVANCE_QUERY_MAX_TOKENS = 512
 DECISION_HINTS_VERSION = 1
 TOOL_RESULT_ENVELOPE_VERSION = 1
 ACTION_AUTHORIZATION_VERSION = 1
@@ -38,9 +40,123 @@ def _check_version(value: Mapping[str, Any], expected: int, what: str) -> None:
         raise InterfaceVersionError(f"unsupported {what} version {value.get('v')!r}")
 
 
+def estimate_query_tokens(text: str) -> int:
+    """Conservative token estimate (~3 UTF-8 bytes per token) for hard query caps."""
+    return (len(text.encode("utf-8")) + 2) // 3
+
+
+def _fit_terms(values: tuple[str, ...], budget: int) -> str:
+    joined = ""
+    for value in values:
+        trial = f"{joined} {value}".strip()
+        if estimate_query_tokens(trial) + 1 > budget:
+            break
+        joined = trial
+    return joined
+
+
+@dataclass(frozen=True)
+class RelevanceQuery:
+    """The compact, typed relevance query every downstream consumer shares.
+
+    ``explicit_user_goal + tool_intent + exact_entities + active_error +
+    top_graph_neighbors`` (graph only for code tasks). Exact user-named ids
+    and paths are budgeted before prose; :attr:`text` never exceeds
+    :data:`RELEVANCE_QUERY_MAX_TOKENS`. No conversation dump and no generated
+    "thoughts" — only the latest authentic user goal and observed facts.
+    """
+
+    v: int = RELEVANCE_QUERY_VERSION
+    explicit_user_goal: str = ""
+    tool_intent: str = ""
+    exact_entities: tuple[str, ...] = ()
+    active_error: str = ""
+    graph_neighbors: tuple[str, ...] = ()
+    is_code: bool = False
+    max_tokens: int = RELEVANCE_QUERY_MAX_TOKENS
+
+    @property
+    def text(self) -> str:
+        """Query text in spec order, with the budget spent by priority."""
+        budget = self.max_tokens
+        chosen: dict[str, str] = {}
+
+        def take(name: str, value: str) -> None:
+            nonlocal budget
+            if not value or budget <= 1:
+                return
+            cost = estimate_query_tokens(value) + 1
+            if cost > budget:
+                raw = value.encode("utf-8")[: max(0, (budget - 1) * 3)]
+                value = raw.decode("utf-8", "ignore")
+                if " " in value:
+                    value = value.rsplit(" ", 1)[0]
+                cost = estimate_query_tokens(value) + 1
+            if value and cost <= budget:
+                chosen[name] = value
+                budget -= cost
+
+        # Priority: exact entities > active error > goal prose > intent > graph.
+        take("entities", _fit_terms(self.exact_entities, budget))
+        take("error", self.active_error)
+        take("goal", self.explicit_user_goal)
+        take("intent", self.tool_intent)
+        if self.is_code and self.graph_neighbors:
+            take("graph", _fit_terms(self.graph_neighbors, budget))
+        order = ("goal", "intent", "entities", "error", "graph")
+        return "\n".join(chosen[name] for name in order if name in chosen)
+
+    @property
+    def terms(self) -> tuple[str, ...]:
+        """Distinct query terms, exact entities first (for lexical/BM25 consumers)."""
+        out: dict[str, None] = {}
+        for entity in self.exact_entities:
+            out[entity] = None
+        for word in re.findall(r"[A-Za-z_][A-Za-z0-9_./-]{2,}", self.text):
+            out.setdefault(word, None)
+        return tuple(list(out)[:64])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "v": self.v,
+            "explicit_user_goal": self.explicit_user_goal,
+            "tool_intent": self.tool_intent,
+            "exact_entities": list(self.exact_entities),
+            "active_error": self.active_error,
+            "graph_neighbors": list(self.graph_neighbors),
+            "is_code": self.is_code,
+            "max_tokens": self.max_tokens,
+            "text": self.text,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> RelevanceQuery:
+        _check_version(value, RELEVANCE_QUERY_VERSION, "RelevanceQuery")
+        return cls(
+            explicit_user_goal=str(value.get("explicit_user_goal") or ""),
+            tool_intent=str(value.get("tool_intent") or ""),
+            exact_entities=tuple(str(e) for e in value.get("exact_entities") or ()),
+            active_error=str(value.get("active_error") or ""),
+            graph_neighbors=tuple(str(n) for n in value.get("graph_neighbors") or ()),
+            is_code=bool(value.get("is_code")),
+            max_tokens=int(value.get("max_tokens") or RELEVANCE_QUERY_MAX_TOKENS),
+        )
+
+
+_TUPLE_FIELDS = (
+    "tool_names",
+    "event_ids",
+    "exact_paths",
+    "exact_symbols",
+    "exact_errors",
+    "exact_identifiers",
+    "graph_neighbors",
+)
+
+
 @dataclass(frozen=True)
 class TaskContext:
-    """Request-scoped facts for one wrapped turn."""
+    """Request-scoped facts for one wrapped turn (shared by every consumer)."""
 
     v: int
     request_id: str
@@ -53,12 +169,32 @@ class TaskContext:
     event_ids: tuple[str, ...] = ()
     latest_user_digest: str | None = None
     hints: DecisionHints | None = None
+    # -- Phase 2 query model (optional, request-scoped, never persisted) -----
+    latest_user_goal: str | None = None
+    tool_intent: str | None = None
+    tool_name: str | None = None
+    tool_call_id: str | None = None
+    exact_paths: tuple[str, ...] = ()
+    exact_symbols: tuple[str, ...] = ()
+    exact_errors: tuple[str, ...] = ()
+    exact_identifiers: tuple[str, ...] = ()
+    content_type: str | None = None
+    result_complete: bool | None = None
+    result_truncated: bool = False
+    resource_id: str | None = None
+    resource_hash: str | None = None
+    cache_policy: str | None = None
+    graph_neighbors: tuple[str, ...] = ()
+    task_id: str | None = None
+    task_revision: int = 0
+    relevance_query: RelevanceQuery | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
-        data["tool_names"] = list(self.tool_names)
-        data["event_ids"] = list(self.event_ids)
+        for name in _TUPLE_FIELDS:
+            data[name] = list(getattr(self, name))
         data["hints"] = self.hints.to_dict() if self.hints else None
+        data["relevance_query"] = self.relevance_query.to_dict() if self.relevance_query else None
         return data
 
     @classmethod
@@ -77,6 +213,28 @@ class TaskContext:
             event_ids=tuple(value.get("event_ids") or ()),
             latest_user_digest=value.get("latest_user_digest"),
             hints=DecisionHints.from_dict(hints) if hints else None,
+            latest_user_goal=value.get("latest_user_goal"),
+            tool_intent=value.get("tool_intent"),
+            tool_name=value.get("tool_name"),
+            tool_call_id=value.get("tool_call_id"),
+            exact_paths=tuple(value.get("exact_paths") or ()),
+            exact_symbols=tuple(value.get("exact_symbols") or ()),
+            exact_errors=tuple(value.get("exact_errors") or ()),
+            exact_identifiers=tuple(value.get("exact_identifiers") or ()),
+            content_type=value.get("content_type"),
+            result_complete=value.get("result_complete"),
+            result_truncated=bool(value.get("result_truncated")),
+            resource_id=value.get("resource_id"),
+            resource_hash=value.get("resource_hash"),
+            cache_policy=value.get("cache_policy"),
+            graph_neighbors=tuple(value.get("graph_neighbors") or ()),
+            task_id=value.get("task_id"),
+            task_revision=int(value.get("task_revision") or 0),
+            relevance_query=(
+                RelevanceQuery.from_dict(value["relevance_query"])
+                if value.get("relevance_query")
+                else None
+            ),
         )
 
 
