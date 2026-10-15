@@ -2065,6 +2065,172 @@ def _remove_claude_wrap_selfheal_hook(settings_path: Path) -> bool:
     return True
 
 
+# Unified-21 #4: Claude Code PreToolUse/PostToolUse tool-admission hooks. The
+# command runs ``python -m headroom.host_hook``; that module path is the marker
+# used to find (idempotent install) and remove (session end / unwrap) them.
+_CLAUDE_TOOL_HOOK_MARKER = "headroom.host_hook"
+_CLAUDE_TOOL_HOOK_CLAIM = "hooks:headroom_tool_admission"
+_CLAUDE_TOOL_HOOK_PROXY_ENV = "HEADROOM_HOOK_PROXY_URL"
+_CLAUDE_TOOL_HOOK_EVENTS: dict[str, tuple[str, int]] = {
+    # Observation only (edit targets); never a permission decision.
+    "PreToolUse": ("Edit|Write|MultiEdit|NotebookEdit", 5),
+    # Shape-safe result rewrites (Read stays with the proxy fallback).
+    "PostToolUse": ("Bash|PowerShell|Grep|Glob|mcp__.*", 30),
+}
+
+
+def _tool_admission_enabled_for_wrap() -> bool:
+    """Whether the proxy wrap launches would run tool admission (rollout)."""
+    from headroom.rollout import apply_wrap_feature_defaults, resolve_rollout
+
+    try:
+        snapshot = resolve_rollout(apply_wrap_feature_defaults(dict(os.environ)))
+        return bool(snapshot.is_enabled("agent_tool_admission"))
+    except Exception:  # pragma: no cover - a bad rollout env never blocks a launch
+        return False
+
+
+def _claude_tool_hook_command(proxy_url: str | None = None) -> str:
+    from headroom.cli.init import _command_string
+
+    parts = [sys.executable, "-m", _CLAUDE_TOOL_HOOK_MARKER, "claude"]
+    if proxy_url:
+        parts += ["--proxy", proxy_url]
+    return _command_string(parts)
+
+
+def _claude_tool_hooks_config(command: str) -> dict[str, list[dict[str, Any]]]:
+    return {
+        event: [
+            {
+                "matcher": matcher,
+                "hooks": [{"type": "command", "command": command, "timeout": timeout}],
+            }
+        ]
+        for event, (matcher, timeout) in _CLAUDE_TOOL_HOOK_EVENTS.items()
+    }
+
+
+def _is_claude_tool_hook(item: Any) -> bool:
+    return isinstance(item, dict) and _CLAUDE_TOOL_HOOK_MARKER in str(item.get("command", ""))
+
+
+def _claude_args_with_tool_hooks(claude_args: tuple, command: str) -> tuple[tuple, bool]:
+    """Prepend ``--settings <json>`` carrying the hooks (no file is touched).
+
+    A user who passes their own ``--settings`` keeps it untouched: Claude
+    Code takes one flag-settings source, and theirs wins. The hooks are then
+    not installed (the caller reports observational/proxy-only).
+    """
+    if any(a == "--settings" or str(a).startswith("--settings=") for a in claude_args):
+        return claude_args, False
+    flag = json.dumps({"hooks": _claude_tool_hooks_config(command)}, separators=(",", ":"))
+    return ("--settings", flag, *claude_args), True
+
+
+def _ensure_claude_tool_hooks(settings_path: Path, command: str) -> None:
+    """Install the tool-admission hooks into project-local settings (idempotent).
+
+    Read-modify-write under the wrap settings lock; user-authored hooks and
+    every other key are preserved, a drifted Headroom command is rewritten in
+    place, and this session registers as a holder so concurrent wrap
+    sessions keep the hooks until the last one exits.
+    """
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    with _wrap_settings_lock(settings_path):
+        payload = _read_settings_for_write(settings_path)
+        hooks = dict(payload.get("hooks") or {}) if isinstance(payload.get("hooks"), dict) else {}
+        for event, (matcher, timeout) in _CLAUDE_TOOL_HOOK_EVENTS.items():
+            entries = list(hooks.get(event) or []) if isinstance(hooks.get(event), list) else []
+            marked = [
+                item
+                for entry in entries
+                if isinstance(entry, dict) and isinstance(entry.get("hooks"), list)
+                for item in entry["hooks"]
+                if _is_claude_tool_hook(item)
+            ]
+            if marked:
+                for item in marked:
+                    item["command"] = command
+                    item["timeout"] = timeout
+            else:
+                entries.append(
+                    {
+                        "matcher": matcher,
+                        "hooks": [{"type": "command", "command": command, "timeout": timeout}],
+                    }
+                )
+            hooks[event] = entries
+        payload["hooks"] = hooks
+        _claim_wrap_key(settings_path, _CLAUDE_TOOL_HOOK_CLAIM, None)
+        _write_text(settings_path, json.dumps(payload, indent=2) + "\n")
+
+
+def _remove_claude_tool_hooks(settings_path: Path, *, force: bool = False) -> bool:
+    """Remove the tool-admission hooks this wrap installed (True if removed).
+
+    While another live wrap session still holds them, nothing is removed
+    unless ``force`` (``unwrap``). Unrelated hooks are left untouched.
+    """
+    with _wrap_settings_lock(settings_path):
+        release = _release_wrap_key(settings_path, _CLAUDE_TOOL_HOOK_CLAIM, force=force)
+        if not release.should_restore or not settings_path.exists():
+            return False
+        try:
+            payload = json.loads(_read_text(settings_path))
+        except (OSError, json.JSONDecodeError):
+            return False
+        hooks = payload.get("hooks") if isinstance(payload, dict) else None
+        if not isinstance(hooks, dict):
+            return False
+        changed = False
+        for event, entries in list(hooks.items()):
+            if not isinstance(entries, list):
+                continue
+            retained: list[Any] = []
+            for entry in entries:
+                if isinstance(entry, dict) and isinstance(entry.get("hooks"), list):
+                    kept = [item for item in entry["hooks"] if not _is_claude_tool_hook(item)]
+                    if len(kept) != len(entry["hooks"]):
+                        changed = True
+                        if kept:
+                            retained.append({**entry, "hooks": kept})
+                        continue
+                retained.append(entry)
+            if retained:
+                hooks[event] = retained
+            else:
+                del hooks[event]
+        if not changed:
+            return False
+        if hooks:
+            payload["hooks"] = hooks
+        else:
+            payload.pop("hooks", None)
+        if payload:
+            _write_text(settings_path, json.dumps(payload, indent=2) + "\n")
+        else:
+            settings_path.unlink(missing_ok=True)
+        return True
+
+
+def _report_tool_admission(client: str, *, hook_installed: bool, reason: str = "") -> None:
+    """One honest line: what this client's tool results actually get."""
+    from headroom.agent.tool_admission.host import HOST_PRE_CONTEXT, host_capability
+
+    capability = host_capability(client, hook_installed=hook_installed)
+    if capability == HOST_PRE_CONTEXT:
+        click.echo(
+            "  Tool admission: host pre-context hook (PostToolUse) + proxy live-zone fallback"
+        )
+    else:
+        detail = f"; {reason}" if reason else ""
+        click.echo(
+            f"  Tool admission: {capability} (tool results are compressed only in the "
+            f"proxy live zone; they still enter the client's own history{detail})"
+        )
+
+
 def _write_claude_wrap_base_url(
     proxy_url: str,
     *,
@@ -5691,6 +5857,8 @@ def _launch_tool(
             )
         if args:
             click.echo(f"  Extra args: {' '.join(args)}")
+        if _tool_admission_enabled_for_wrap():
+            _report_tool_admission(agent_type, hook_installed=False)
         _print_telemetry_notice()
         click.echo()
 
@@ -6157,6 +6325,7 @@ def claude(
     _saved_tool_search: list[object | str | None] = [_tool_search_not_written]
     _settings_foundry: list[bool] = [False]
     _wrote_project_settings: list[bool] = [False]
+    _wrote_tool_hooks: list[bool] = [False]
     port_holder: list[int] = [port]
     _settings_vertex: list[bool] = [False]
     # Bind before the try so the finally can always reference it. It is otherwise
@@ -6427,6 +6596,28 @@ def claude(
         # Same token written into the marker above.
         _apply_session_token_header_env(env, _session_token)
 
+        # Unified-21 #4: genuine pre-context tool admission through Claude
+        # Code's own PreToolUse/PostToolUse hook protocol. Project-settings
+        # mode writes them (locked, marker-tagged, removed by the last
+        # session / unwrap) so daemon-spawned workers get them too; otherwise
+        # they ride on this launch's --settings flag and no file is touched.
+        if _tool_admission_enabled_for_wrap():
+            env[_CLAUDE_TOOL_HOOK_PROXY_ENV] = proxy_url
+            _tool_hooks_reason = ""
+            if _wrote_project_settings[0]:
+                _ensure_claude_tool_hooks(_wrap_settings_path, _claude_tool_hook_command())
+                _wrote_tool_hooks[0] = True
+                _tool_hooks_installed = True
+            else:
+                claude_args, _tool_hooks_installed = _claude_args_with_tool_hooks(
+                    claude_args, _claude_tool_hook_command(proxy_url)
+                )
+                if not _tool_hooks_installed:
+                    _tool_hooks_reason = "your own --settings flag is kept, so no hook is added"
+            _report_tool_admission(
+                "claude", hook_installed=_tool_hooks_installed, reason=_tool_hooks_reason
+            )
+
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
         _tool_search_value = _configure_tool_search_env(env, tool_search)
@@ -6490,6 +6681,11 @@ def claude(
         click.echo(f"  Error: {e}")
         raise SystemExit(1) from e
     finally:
+        if _wrote_tool_hooks[0]:
+            try:
+                _remove_claude_tool_hooks(_wrap_settings_path)
+            except Exception as exc:  # pragma: no cover - cleanup must not mask exit
+                click.echo(f"  Warning: could not remove tool-admission hooks: {exc}", err=True)
         if _saved_tool_search[0] is not _tool_search_not_written:
             _restore_claude_wrap_tool_search(
                 cast(str | None, _saved_tool_search[0]),
@@ -6598,6 +6794,8 @@ def unwrap_claude(
     _unwrap_settings_path = Path.cwd() / ".claude" / "settings.local.json"
     if _remove_claude_wrap_selfheal_hook(_unwrap_settings_path):
         click.echo("  Removed Headroom wrap self-heal SessionStart hook (issue #2221).")
+    if _remove_claude_tool_hooks(_unwrap_settings_path, force=True):
+        click.echo("  Removed Headroom tool-admission hooks (PreToolUse/PostToolUse).")
     for _foundry, _vertex in ((False, False), (True, False), (False, True)):
         _key = _claude_wrap_base_url_env_key(foundry_mode=_foundry, vertex_mode=_vertex)
         _marker = _read_wrap_marker(_unwrap_settings_path)
