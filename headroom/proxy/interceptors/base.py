@@ -257,6 +257,11 @@ def apply_to_messages(
         if not isinstance(original, str) or not original:
             new_messages.append(msg)
             continue
+        if "[headroom" in original and "Retrieve more: hash=" in original:
+            # Already admitted by the tool-admission dispatcher (unified-21
+            # #4): its exact original is in CCR; never rewrite it again.
+            new_messages.append(msg)
+            continue
 
         tuid = _tool_use_id_for_message(msg)
         tool_name: str | None = None

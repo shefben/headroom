@@ -112,7 +112,32 @@ def compression_relevance_query(
             _early[request_id] = (identity, turn, task)
             while len(_early) > _EARLY_LIMIT:
                 _early.popitem(last=False)
+    _remember_session_query(identity.session_id, task.relevance_query)
     return task.relevance_query
+
+
+_SESSION_QUERY_LIMIT = 512
+_session_queries: OrderedDict[str, RelevanceQuery] = OrderedDict()
+
+
+def _remember_session_query(session_id: str, query: RelevanceQuery | None) -> None:
+    if query is None or not session_id:
+        return
+    with _early_lock:
+        _session_queries[session_id] = query
+        _session_queries.move_to_end(session_id)
+        while len(_session_queries) > _SESSION_QUERY_LIMIT:
+            _session_queries.popitem(last=False)
+
+
+def latest_session_query(session_id: str) -> RelevanceQuery | None:
+    """The most recent request's RelevanceQuery for a session (host-hook admission).
+
+    A host tool hook runs between model requests and has no request of its
+    own; it conditions on the task the session's latest request carried.
+    """
+    with _early_lock:
+        return _session_queries.get(session_id)
 
 
 def _take_early(request_id: str) -> tuple[WorkspaceIdentity, Any, TaskContext] | None:
@@ -194,6 +219,7 @@ class AgentRuntimeHook:
         # Request-scoped, attached to this TurnContext only (never a global).
         ctx.agent_task_context = task  # type: ignore[attr-defined]
         ctx.agent_identity = identity  # type: ignore[attr-defined]
+        _remember_session_query(identity.session_id, task.relevance_query)
         for name, stage in registry.request_stages():
             try:
                 stage(ctx, task, runtime)

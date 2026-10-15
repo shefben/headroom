@@ -16,6 +16,7 @@ Every type carries ``v`` and refuses to deserialize an unknown major version.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from collections.abc import Mapping
@@ -27,7 +28,9 @@ TASK_CONTEXT_VERSION = 1
 RELEVANCE_QUERY_VERSION = 1
 RELEVANCE_QUERY_MAX_TOKENS = 512
 DECISION_HINTS_VERSION = 1
-TOOL_RESULT_ENVELOPE_VERSION = 1
+TOOL_RESULT_ENVELOPE_VERSION = 2
+#: v1 envelopes (no admission fields) still deserialize; their new fields default.
+_ENVELOPE_READABLE_VERSIONS = (1, 2)
 ACTION_AUTHORIZATION_VERSION = 1
 
 
@@ -293,9 +296,25 @@ _TRUNCATION_MARKERS = (
 _EXIT_CODE = re.compile(r"(?:exit(?:ed)?(?: with)?(?: code| status)?[:= ]+|Exit code:? )(-?\d{1,3})\b")
 
 
+def content_version_hash(text: str, stderr: str = "") -> str:
+    """Version hash of a tool result's content (stdout and stderr kept distinct)."""
+    raw = text.encode("utf-8", "replace")
+    return hashlib.sha256(
+        len(raw).to_bytes(8, "big") + raw + stderr.encode("utf-8", "replace")
+    ).hexdigest()[:24]
+
+
 @dataclass(frozen=True)
 class ToolResultEnvelope:
-    """Structural description of one tool result (no content)."""
+    """One observed tool result, normalized (unified-21 #4).
+
+    The structural fields (sizes, partiality, exit code) are always present.
+    Phase 4 added the admission fields: ``tool_family``, ``session``,
+    ``workspace``, a stable ``resource_id`` (what was read/run/searched, never
+    the tool-call id), the content ``version_hash`` and the result ``content``
+    / ``stderr`` themselves. :meth:`to_metadata` never includes content, so
+    events and logs stay digest-only.
+    """
 
     v: int
     tool_call_id: str
@@ -308,6 +327,27 @@ class ToolResultEnvelope:
     source_truncated: bool
     source_byte_length: int | None
     exit_code: int | None
+    tool_family: str = "other"
+    session: str = ""
+    workspace: str = ""
+    resource_id: str | None = None
+    version_hash: str = ""
+    content: str = ""
+    stderr: str = ""
+    source_metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def call_id(self) -> str:
+        return self.tool_call_id
+
+    @property
+    def truncation_reason(self) -> str | None:
+        return self.partial_reason
+
+    @property
+    def is_complete(self) -> bool:
+        """True only for a result known to be whole (never inferred for partials)."""
+        return not self.is_partial and not self.source_truncated
 
     @classmethod
     def from_text(
@@ -318,39 +358,67 @@ class ToolResultEnvelope:
         text: str,
         is_error: bool = False,
         source_byte_length: int | None = None,
+        stderr: str = "",
+        exit_code: int | None = None,
+        partial_reason: str | None = None,
+        tool_family: str = "other",
+        session: str = "",
+        workspace: str = "",
+        resource_id: str | None = None,
+        source_metadata: Mapping[str, Any] | None = None,
+        keep_content: bool = False,
     ) -> ToolResultEnvelope:
-        """Derive the envelope deterministically from the result text."""
+        """Derive the envelope deterministically from the result text.
+
+        ``partial_reason`` / ``exit_code`` given by the caller (e.g. a host
+        hook that knows the client truncated the output) win over the
+        heuristics; a heuristic never clears an explicit partial flag.
+        ``keep_content`` stores ``text``/``stderr`` on the envelope (the
+        admission path needs them; event normalization does not).
+        """
         raw = text.encode("utf-8", "replace")
-        partial_reason = None
-        for marker in _TRUNCATION_MARKERS:
-            if marker.search(text):
-                partial_reason = "truncation_marker"
-                break
+        reason = partial_reason
+        if reason is None:
+            for marker in _TRUNCATION_MARKERS:
+                if marker.search(text):
+                    reason = "truncation_marker"
+                    break
         source_truncated = source_byte_length is not None and source_byte_length > len(raw)
-        if source_truncated and partial_reason is None:
-            partial_reason = "source_larger_than_result"
-        exit_code = None
-        match = _EXIT_CODE.search(text[-4000:])
-        if match:
-            try:
-                exit_code = int(match.group(1))
-            except ValueError:
-                exit_code = None
+        if source_truncated and reason is None:
+            reason = "source_larger_than_result"
+        code = exit_code
+        if code is None:
+            match = _EXIT_CODE.search(text[-4000:])
+            if match:
+                try:
+                    code = int(match.group(1))
+                except ValueError:
+                    code = None
+        version = content_version_hash(text, stderr)
         return cls(
             v=TOOL_RESULT_ENVELOPE_VERSION,
             tool_call_id=tool_call_id,
             tool_name=tool_name,
             byte_length=len(raw),
             line_count=text.count("\n") + (1 if text else 0),
-            is_error=bool(is_error) or (exit_code is not None and exit_code != 0),
-            is_partial=partial_reason is not None,
-            partial_reason=partial_reason,
+            is_error=bool(is_error) or (code is not None and code != 0),
+            is_partial=reason is not None,
+            partial_reason=reason,
             source_truncated=source_truncated,
             source_byte_length=source_byte_length,
-            exit_code=exit_code,
+            exit_code=code,
+            tool_family=tool_family,
+            session=session,
+            workspace=workspace,
+            resource_id=resource_id,
+            version_hash=version,
+            content=text if keep_content else "",
+            stderr=stderr if keep_content else "",
+            source_metadata=dict(source_metadata or {}),
         )
 
     def to_metadata(self) -> dict[str, Any]:
+        """Structural metadata only (no content, no stderr)."""
         return {
             "envelope_v": self.v,
             "tool_name": self.tool_name,
@@ -365,12 +433,20 @@ class ToolResultEnvelope:
         }
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data["source_metadata"] = dict(self.source_metadata)
+        return data
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ToolResultEnvelope:
-        _check_version(value, TOOL_RESULT_ENVELOPE_VERSION, "ToolResultEnvelope")
-        return cls(**{k: value[k] for k in cls.__dataclass_fields__})
+        version = int(value.get("v", -1))
+        if version not in _ENVELOPE_READABLE_VERSIONS:
+            raise InterfaceVersionError(f"unsupported ToolResultEnvelope version {version!r}")
+        fields = cls.__dataclass_fields__
+        data = {k: value[k] for k in fields if k in value}
+        data["v"] = TOOL_RESULT_ENVELOPE_VERSION
+        data["source_metadata"] = dict(value.get("source_metadata") or {})
+        return cls(**data)
 
 
 class AuthorizationDecision(str, Enum):

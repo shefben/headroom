@@ -1143,10 +1143,21 @@ class HeadroomProxy(
 
         _intercept_prefix: list = []
         assert config.rollout is not None
+        if config.rollout.is_enabled("agent_tool_admission"):
+            # Unified-21 #4/#14: the tool-admission dispatcher runs first, so the
+            # legacy interceptors and the router see admitted (marked) results
+            # and leave them alone.
+            from headroom.agent.tool_admission.transform import ToolAdmissionTransform
+
+            _intercept_prefix.append(
+                ToolAdmissionTransform(
+                    retrieval_available=bool(config.ccr_inject_tool or config.ccr_handle_responses)
+                )
+            )
         if config.rollout.is_enabled("tool_result_interceptors"):
             from headroom.proxy.interceptors import ToolResultInterceptorTransform
 
-            _intercept_prefix = [ToolResultInterceptorTransform()]
+            _intercept_prefix.append(ToolResultInterceptorTransform())
 
         self.anthropic_pipeline = TransformPipeline(
             transforms=[*_intercept_prefix, cache_aligner, anthropic_router],
@@ -3857,6 +3868,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             from headroom.agent.install import agent_runtime_health
 
             payload["agent_runtime"] = agent_runtime_health(app, proxy.config)
+            from headroom.agent.tool_admission.service import tool_admission_health
+
+            payload["tool_admission"] = tool_admission_health(proxy.config)
         return payload
 
     # ---------------------------------------------------------------------------
@@ -5692,6 +5706,25 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             await proxy.cache.clear()
             return {"status": "cleared"}
         return {"status": "cache disabled"}
+
+    # Unified-21 #4: host pre-/post-tool hook adapter (Claude Code hook JSON
+    # forwarded by `python -m headroom.host_hook`). Loopback + same-origin
+    # only; identity comes from the wrap session token like every request.
+    @app.post(
+        "/v1/agent/host-hook",
+        dependencies=[Depends(_require_loopback), Depends(_require_same_origin)],
+    )
+    async def agent_host_hook(request: Request):
+        from headroom.agent.tool_admission.service import handle_host_hook_request
+
+        try:
+            data = await request.json()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="JSON body required") from None
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="JSON object required")
+        # to_thread copies the request context (trusted cwd/session vars).
+        return await asyncio.to_thread(handle_host_hook_request, data, proxy.config)
 
     # CCR (Compress-Cache-Retrieve) endpoints
     @app.post(

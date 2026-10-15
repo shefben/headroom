@@ -34,6 +34,7 @@ log = logging.getLogger(__name__)
 FEATURE_TASK_STATE = "agent_task_state"
 FEATURE_EVIDENCE = "agent_evidence"
 FEATURE_CODE_GRAPH = "agent_code_graph"
+FEATURE_TOOL_ADMISSION = "agent_tool_admission"
 
 STAGE_TASK_STATE = "task_state"
 LISTENER_SNAPSHOTS = "task_state_snapshots"
@@ -109,7 +110,8 @@ def install_builtin_components(runtime: Any, config: Any) -> Callable[[], None]:
     task_on = _enabled(config, FEATURE_TASK_STATE)
     evidence_on = _enabled(config, FEATURE_EVIDENCE)
     graph_on = _enabled(config, FEATURE_CODE_GRAPH)
-    if not (task_on or evidence_on or graph_on):
+    admission_on = _enabled(config, FEATURE_TOOL_ADMISSION)
+    if not (task_on or evidence_on or graph_on or admission_on):
         return lambda: None
 
     ledger = open_ledger(runtime.store)
@@ -168,7 +170,18 @@ def install_builtin_components(runtime: Any, config: Any) -> Callable[[], None]:
 
         registry.register_commit_listener(LISTENER_GRAPH, invalidate)
 
+    if admission_on:
+        # Tool-admission resource versions persist through the same ledger,
+        # written and cold-loaded on the runtime worker only.
+        from headroom.agent.tool_admission.service import bind_persistence
+
+        bind_persistence(runtime)
+
     def teardown() -> None:
+        if admission_on:
+            from headroom.agent.tool_admission.service import unbind_persistence
+
+            unbind_persistence(runtime)
         for name in _REGISTERED_NAMES:
             registry.unregister(name)
         for key in ("task_state", "evidence", "code_graph", "ledger"):

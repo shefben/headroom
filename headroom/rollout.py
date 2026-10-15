@@ -170,6 +170,16 @@ FEATURES: dict[str, FeatureSpec] = {
             "workspaces (needs agent_runtime)."
         ),
     ),
+    # Phase-4 tool admission: recoverable (exact CCR original first, then a
+    # SafetyGate-admitted view/delta). Default-on for `wrap` only.
+    "agent_tool_admission": FeatureSpec(
+        name="agent_tool_admission",
+        available_in=RolloutChannel.STABLE,
+        description=(
+            "Tool-result admission: host pre-context hook where supported, "
+            "structured deltas and tool-family views with exact CCR recovery."
+        ),
+    ),
 }
 
 #: Safe, non-destructive features `headroom wrap` turns on for the proxy it
@@ -179,6 +189,7 @@ WRAP_DEFAULT_FEATURES: tuple[str, ...] = (
     "agent_task_state",
     "agent_evidence",
     "agent_code_graph",
+    "agent_tool_admission",
 )
 
 
