@@ -80,3 +80,25 @@ Spec: `HEADROOM_WRAP_UNIFIED_21_FEATURE_IMPLEMENTATION_PLAN_OPUS_5_5.md`. One sh
 - The Python path saves nothing on file reads, pytest output, tool errors, conflicting reads or the cache-hot delta. Large search output is excluded, by tool type, from compression. The service log drops 97%, JSON 70% and the same-output reread 49%.
 - Rust leaves pytest output and file reads unchanged. It cuts search and log output by about 98% and the diff by 50%.
 - No `headroom_retrieve` turns were needed.
+
+## Phase 1: runtime foundation and JevK5 (commits f8db3eed, 6d2e75a2, this entry)
+
+**1A runtime (`headroom/agent/`).** The plan's v1 kinds are reserved as `AgentEvent`s. Events store only digests, and the idempotency key is (session, source, kind, index, digest). Normalization is read-only and covers Anthropic, OpenAI chat, OpenAI Responses and Google. A message counts as authentic USER input only after harness wrappers are stripped. Identity: a session is trusted only when its wrap token matches a live marker and the registered cwd still exists. `workspace_id` hashes the principal plus the worktree root, so linked worktrees are distinct scopes. `session_id` is a hash of the token. The SQLite store runs in WAL mode under `paths.agent_state_db_path()`. It has a schema version, inserts events and their projection in one transaction, uses CAS on revisions, rebuilds by replay and salvages corrupt files read-only. In stateless mode an equivalent bounded in-memory store is used and nothing is written to disk. A background worker with a bounded queue keeps SQLite off the event loop. One stream-safe TurnHook at priority 80 is installed once from `create_app`, gated by the new opt-in rollout feature `agent_runtime`. With the feature off, no hook is registered. `/health` reports the effective rollout, whether the hook is installed, the trusted-marker count, runtime counters and advisor state. When wrap reuses a proxy, it reports mismatches in `agent_runtime` and `HEADROOM_JEVK5`.
+
+**Phase 2+ extension APIs.** In `headroom.agent.registry`: `register_request_stage`, `register_projector`, `register_commit_listener`, `register_component`. In `headroom.agent.events`: `register_event_kind`, `make_event`. In `headroom.agent.interfaces`: `TaskContext`, `DecisionHints`, `ToolResultEnvelope`, `ActionAuthorization`. On the runtime: `AgentRuntime.authorize_action`, which returns an authorization only for trusted identities. From a TurnContext: `headroom.agent.hook.task_context_for(ctx)` and `identity_for(ctx)`. For JevK5: `IntelligenceManager.advisor`, i.e. `DecisionAdvisor.choose|noul|score|adecide` plus `request_budget()`.
+
+**1B JevK5 (`headroom/intelligence/`).**
+- Typed settings: policy `HEADROOM_JEVK5=auto|on|off`; calibration T=1.22, knockout T=0.93; ctx 8192; deadline 1200 ms; 4 calls per request; cache 30 s; minimum confidence 0.60; weight 0.25 capped at 0.40; circuit breaker opens after 3 failures for 60 s.
+- Setup checks GGUF metadata and SHA-256 and resumes downloads from `.part` files. A custom model must supply its own hash or be marked operator-managed.
+- llama-server is discovered in this order: override, manifest, PATH, `LLAMA_CPP_HOME`. If none is found, setup builds a managed one with CMake.
+- The managed service starts or is reused on 127.0.0.1 (port 8091 preferred). Before any stop, Headroom checks PID, executable and start time, and it never kills a foreign process.
+- Every request in a decision shares one monotonic deadline. A fresh adapter is created per decision. If answer letters are missing, it retries once with n_probs=128. A separate typed client handles `/v1/systemone`.
+- CLI: `headroom intelligence setup|status|doctor|stop`. The JevK5 transport has an operator-endpoint entry in the egress allowlist.
+
+**Tests.**
+- New: 62 passed in `tests/agent` and `tests/intelligence`, using a fake llama-server.
+- Live run (`HEADROOM_JEVK5_LIVE_TEST=1`, RTX A4000, cached verified 4B Q8_0 model, WinGet llama-server b44da65e): setup OK and conformance passed. Refund gave noul 0.06, i.e. no. Parcel gave misdelivered at 0.95. Decisions took about 140–156 ms. An 8-way concurrency isolation run passed, and the service stopped cleanly.
+- Existing targeted suites: wrap/CLI/rollout 749 passed; paths/stateless/workspace 265 passed; hooks/health/CCR slice 416 passed.
+- Pre-existing failures, which also fail on the clean Phase 0 worktree: `test_turn_hook_usage` (4), `test_anthropic_buffered_ccr_usage` (6) and 2 `TestHeadroomCloudCompressionOffline` cases, all from an unmocked litellm price fetch.
+
+**Eval** (`benchmarks/results/phase1.json`): identical to baseline. Python is 29.39%, Rust 70.68%, recall 1.0, 0 errors. Warm wall time is 2900 ms against 2888 ms in the baseline.
