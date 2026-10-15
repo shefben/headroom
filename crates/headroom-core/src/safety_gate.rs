@@ -814,17 +814,56 @@ pub fn select(
     let mut order: Vec<usize> = (0..candidates.len()).collect();
     order.sort_by_key(|&i| candidates[i].tier);
     let mut decisions = Vec::with_capacity(order.len());
+    // Dominance: a lossy rung that is no smaller than an admissible
+    // structural/lossless rung can only add loss, so it is skipped. Lossless
+    // rungs are evaluated up front (there are at most a couple).
+    let mut lossless_floor: Option<usize> = None;
+    let mut lossless_decisions: Vec<(usize, Decision)> = Vec::new();
+    for &i in &order {
+        let c = &candidates[i];
+        if c.tier == Tier::Lossless {
+            let d = check(
+                original,
+                &c.text,
+                task,
+                policy,
+                &c.provenance,
+                c.tier,
+                tokenizer,
+            );
+            if d.allow {
+                lossless_floor =
+                    Some(lossless_floor.map_or(d.candidate_tokens, |f| f.min(d.candidate_tokens)));
+            }
+            lossless_decisions.push((i, d));
+        }
+    }
     for i in order {
         let c = &candidates[i];
-        let d = check(
-            original,
-            &c.text,
-            task,
-            policy,
-            &c.provenance,
-            c.tier,
-            tokenizer,
-        );
+        let d = if c.tier == Tier::Lossless {
+            match lossless_decisions.iter().position(|(j, _)| *j == i) {
+                Some(pos) => lossless_decisions.swap_remove(pos).1,
+                None => continue,
+            }
+        } else {
+            let mut d = check(
+                original,
+                &c.text,
+                task,
+                policy,
+                &c.provenance,
+                c.tier,
+                tokenizer,
+            );
+            if matches!(c.tier, Tier::Aggressive | Tier::Conservative)
+                && d.allow
+                && lossless_floor.is_some_and(|floor| d.candidate_tokens >= floor)
+            {
+                d.allow = false;
+                d.reasons.push("dominated_by_lossless".to_string());
+            }
+            d
+        };
         let allow = d.allow;
         decisions.push((i, d));
         if allow {
@@ -1285,6 +1324,67 @@ mod tests {
         let none = select(&orig, &cands[1..], &task, Some(&payg()), tok().as_ref());
         assert_eq!(none.tier, "original");
         assert!(none.chosen.is_none());
+    }
+
+    #[test]
+    fn lossy_rung_dominated_by_smaller_lossless_rung_is_skipped() {
+        let pad = " ".repeat(40);
+        let item = |id: u32, ok: bool| {
+            format!(
+                "{pad}{{
+{pad}{pad}\"id\": {id},
+{pad}{pad}\"ok\": {ok}
+{pad}}}"
+            )
+        };
+        let orig = format!(
+            "[
+{},
+{},
+{}
+]",
+            item(1, true),
+            item(2, false),
+            item(3, true)
+        );
+        let lossy = format!(
+            "[
+{},
+{}
+]",
+            item(1, true),
+            item(2, false)
+        );
+        let min = minify_json(&orig).unwrap();
+        let cands = vec![
+            Candidate {
+                tier: Tier::Conservative,
+                text: lossy,
+                provenance: Provenance::default(),
+            },
+            Candidate {
+                tier: Tier::Lossless,
+                text: min,
+                provenance: Provenance::default(),
+            },
+        ];
+        let loose = GatePolicy {
+            max_lossy_ratio: 1.0,
+            volatile_token_threshold: 128,
+        };
+        let sel = select(
+            &orig,
+            &cands,
+            &TaskQuery::default(),
+            Some(&loose),
+            tok().as_ref(),
+        );
+        assert_eq!(sel.tier, "lossless");
+        let lossy_decision = sel.decisions.iter().find(|(i, _)| *i == 0).unwrap();
+        assert!(lossy_decision
+            .1
+            .reasons
+            .contains(&"dominated_by_lossless".to_string()));
     }
 
     #[test]
