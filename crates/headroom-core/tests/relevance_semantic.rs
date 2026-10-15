@@ -30,7 +30,11 @@ fn semantic_service_initializes_once_and_falls_back_or_ranks_paraphrases() {
         let _ = scorer.score_batch(&items(), "vehicle engine failure");
     }
     let ready = semantic::wait_ready(std::time::Duration::from_secs(120));
-    assert_eq!(semantic::init_runs(), 1, "exactly one init attempt per process");
+    assert_eq!(
+        semantic::init_runs(),
+        1,
+        "exactly one init attempt per process"
+    );
     for _ in 0..20 {
         let _ = scorer.score_batch(&items(), "auth problem");
     }

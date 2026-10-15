@@ -1611,6 +1611,20 @@ def safety_gate_admit_unit(
     return (candidate, strategy) if decision.allow else (None, "safety_gate:original")
 
 
+def _compaction_roundtrips(original: str, candidate: str) -> bool:
+    """True when ``candidate`` is a SmartCrusher ``[N]{schema}`` densification
+    that decodes back to exactly the original JSON array (a reversible
+    re-encoding, not loss)."""
+    from .compaction_codec import expand_compacted, is_compacted
+
+    if not is_compacted(candidate):
+        return False
+    try:
+        return expand_compacted(candidate) == json.loads(original)
+    except (ValueError, TypeError):
+        return False
+
+
 def _with_compressed(result: Any, text: str) -> Any:
     """Copy of a router result with ``compressed`` swapped (SafetyGate backoff).
 
@@ -8101,7 +8115,7 @@ class ContentRouter(Transform):
             return Provenance(
                 content_type=content_type,
                 strategy=label,
-                reversible=rev,
+                reversible=rev or _compaction_roundtrips(original, text),
                 retrieval_available=retrieval,
                 ccr_payloads=verified_payloads(original, text, store),
                 original_tokens=original_tokens,

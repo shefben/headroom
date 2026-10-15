@@ -752,6 +752,7 @@ fn kompress_or_noop(text: &str, content_type: ContentType) -> DispatchResult {
             return DispatchResult::Compressed {
                 strategy: STRATEGY_KOMPRESS,
                 compressed: result.compressed,
+                reversible: false,
             };
         }
     }
@@ -1338,7 +1339,7 @@ fn compress_one_block(
         };
     }
 
-    let (strategy, compressed) = match dispatch_compressor(
+    let (strategy, compressed, reversible) = match dispatch_compressor(
         content_text,
         content_type,
         &ctx.compressor_query,
@@ -1365,7 +1366,8 @@ fn compress_one_block(
         DispatchResult::Compressed {
             strategy,
             compressed,
-        } => (strategy, compressed),
+            reversible,
+        } => (strategy, compressed, reversible),
     };
 
     // 2. Exact originals first: when a CCR store is wired, persist the
@@ -1414,7 +1416,10 @@ fn compress_one_block(
     let aggressive = vec![Candidate {
         tier: Tier::Aggressive,
         text: aggressive_text,
-        provenance: prov_with(strategy),
+        provenance: Provenance {
+            reversible,
+            ..prov_with(strategy)
+        },
     }];
     let first = safety_gate::select(
         content_text,
@@ -1448,6 +1453,7 @@ fn compress_one_block(
         if let DispatchResult::Compressed {
             strategy: s2,
             compressed: c2,
+            reversible: rev2,
         } = dispatch_compressor(
             content_text,
             content_type,
@@ -1459,7 +1465,10 @@ fn compress_one_block(
                     Candidate {
                         tier: Tier::Conservative,
                         text: with_marker(&c2),
-                        provenance: prov_with(s2),
+                        provenance: Provenance {
+                            reversible: rev2,
+                            ..prov_with(s2)
+                        },
                     },
                     s2,
                 ));
@@ -1900,6 +1909,9 @@ enum DispatchResult {
     Compressed {
         strategy: &'static str,
         compressed: String,
+        /// The compressor's own lossless path (e.g. SmartCrusher's
+        /// `lossless:table` compaction): a reversible re-encoding.
+        reversible: bool,
     },
     /// A compressor ran and failed loudly. The error string is
     /// surfaced via the manifest; the proxy logs it.
@@ -1962,6 +1974,9 @@ fn dispatch_compressor(
             }
             DispatchResult::Compressed {
                 strategy: STRATEGY_SMART_CRUSHER,
+                reversible: result.strategy.starts_with("lossless")
+                    && !result.strategy.contains("lossy")
+                    && !result.compressed.contains("<<ccr:"),
                 compressed: result.compressed,
             }
         }
@@ -1975,6 +1990,7 @@ fn dispatch_compressor(
             DispatchResult::Compressed {
                 strategy: STRATEGY_LOG_COMPRESSOR,
                 compressed: result.compressed,
+                reversible: false,
             }
         }
         ContentType::SearchResults => {
@@ -1987,6 +2003,7 @@ fn dispatch_compressor(
             DispatchResult::Compressed {
                 strategy: STRATEGY_SEARCH_COMPRESSOR,
                 compressed: result.compressed,
+                reversible: false,
             }
         }
         ContentType::GitDiff => {
@@ -1999,6 +2016,7 @@ fn dispatch_compressor(
             DispatchResult::Compressed {
                 strategy: STRATEGY_DIFF_COMPRESSOR,
                 compressed: result.compressed,
+                reversible: false,
             }
         }
         // Routes to the tree-sitter-backed CodeAwareCompressor (PR-B4).
@@ -2025,6 +2043,7 @@ fn dispatch_compressor(
             DispatchResult::Compressed {
                 strategy: STRATEGY_CODE_COMPRESSOR,
                 compressed: result.compressed,
+                reversible: false,
             }
         }
         // Cache-only EXTRACTIVE prose compressor (PR-B4): Kompress drops

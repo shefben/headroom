@@ -228,6 +228,14 @@ static VOLATILE: LazyLock<Regex> = LazyLock::new(|| {
     )
     .expect("volatile regex")
 });
+/// A grep/search hit line: `path:line:` with a path-like (dotted or
+/// slashed) prefix. Timestamps (`2026-10-14T09:03:53`) do not match.
+static SEARCH_HIT_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:[A-Za-z]:)?[^\s:]*[./\\][^\s:]*:\d+[:\-]").expect("search hit regex")
+});
+/// SmartCrusher compaction block header: `[200]{id:int,name:string}`.
+static COMPACTION_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\[\d+\]\{[^}\n]*\}").expect("compaction header regex"));
 static WS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").expect("ws regex"));
 
 const SIGNATURE_KEYWORDS: &str = r"(?:pub(?:\([a-z]+\))?\s+)?(?:async\s+)?(?:def|fn|func|function|class|struct|enum|trait|interface|impl|type)\s+";
@@ -426,7 +434,21 @@ fn extract_facts(
                     );
                 }
             }
-            Shape::Search | Shape::Json => {}
+            Shape::Search => {
+                // A grep for `Error` makes every hit a "failure line", so only
+                // lines that are NOT search hits (a mis-detected log, a tool's
+                // own error footer) are protected as failures.
+                if FAILURE_LINE.is_match(line) && !SEARCH_HIT_LINE.is_match(trimmed) {
+                    add(
+                        &mut facts,
+                        FactKind::FailureLine,
+                        trimmed.to_string(),
+                        true,
+                        idx,
+                    );
+                }
+            }
+            Shape::Json => {}
             Shape::Other => {
                 if trimmed.starts_with("Traceback") {
                     in_traceback = true;
@@ -701,11 +723,14 @@ pub fn check(
 
     // JSON invariants.
     let mut json_equal = false;
-    if shape == Shape::Json {
+    // A producer-verified reversible re-encoding (e.g. SmartCrusher's
+    // `[N]{schema}` CSV compaction, verified by round-trip) is a different
+    // documented format, not broken JSON.
+    if shape == Shape::Json && !prov.reversible {
         if let Ok(orig_v) = serde_json::from_str::<Value>(original.trim()) {
             let body = strip_marker_lines(candidate);
             let t = body.trim();
-            if t.starts_with('{') || t.starts_with('[') {
+            if (t.starts_with('{') || t.starts_with('[')) && !COMPACTION_HEADER.is_match(t) {
                 match serde_json::from_str::<Value>(t) {
                     Ok(cand_v) => {
                         json_equal = cand_v == orig_v;
@@ -1385,6 +1410,98 @@ mod tests {
             .1
             .reasons
             .contains(&"dominated_by_lossless".to_string()));
+    }
+
+    #[test]
+    fn search_shape_protects_non_hit_failures_but_not_grep_hits() {
+        let loose = GatePolicy {
+            max_lossy_ratio: 1.0,
+            volatile_token_threshold: 128,
+        };
+        let prov = Provenance {
+            content_type: Some("search".into()),
+            ..Default::default()
+        };
+        let mut hits = String::new();
+        for i in 0..60 {
+            hits.push_str(&format!(
+                "src/m{i}.py:{i}:    raise ValueError(\"bad {i}\")\n"
+            ));
+        }
+        let cand: String = hits.lines().take(10).map(|l| format!("{l}\n")).collect();
+        let d = check(
+            &hits,
+            &cand,
+            &TaskQuery::default(),
+            Some(&loose),
+            &prov,
+            Tier::Aggressive,
+            tok().as_ref(),
+        );
+        assert!(d.allow, "grep hits are not failure facts: {:?}", d.reasons);
+
+        // A log mis-detected as search output keeps its error lines.
+        let mut log = String::new();
+        for i in 0..60 {
+            log.push_str(&format!(
+                "2026-10-14T09:00:{:02}Z INFO ok 10.0.3.{i}:5432\n",
+                i % 60
+            ));
+        }
+        log.push_str("2026-10-14T09:03:53Z ERROR [db.pool] connection refused: 10.0.3.17:5432\n");
+        let cand: String = log.lines().take(10).map(|l| format!("{l}\n")).collect();
+        let d = check(
+            &log,
+            &cand,
+            &TaskQuery::default(),
+            Some(&loose),
+            &prov,
+            Tier::Aggressive,
+            tok().as_ref(),
+        );
+        assert!(d.reasons.contains(&"fact_omitted:failure_line".to_string()));
+    }
+
+    #[test]
+    fn compaction_block_is_a_format_not_broken_json() {
+        let orig = "[\n  {\"id\": 1, \"ok\": true},\n  {\"id\": 2, \"ok\": false}\n]";
+        let cand = "[2]{id:int,ok:bool}\n1,true\n2,false\n";
+        let loose = GatePolicy {
+            max_lossy_ratio: 1.0,
+            volatile_token_threshold: 128,
+        };
+        let d = check(
+            orig,
+            cand,
+            &TaskQuery::default(),
+            Some(&loose),
+            &Provenance::default(),
+            Tier::Aggressive,
+            tok().as_ref(),
+        );
+        assert!(
+            !d.reasons.contains(&"syntax_broken:json".to_string()),
+            "{:?}",
+            d.reasons
+        );
+        let rev = Provenance {
+            reversible: true,
+            ..Default::default()
+        };
+        let strict = GatePolicy {
+            max_lossy_ratio: 0.0,
+            volatile_token_threshold: 128,
+        };
+        let d = check(
+            orig,
+            cand,
+            &TaskQuery::default(),
+            Some(&strict),
+            &rev,
+            Tier::Aggressive,
+            tok().as_ref(),
+        );
+        assert_eq!(d.irreversible_loss_ratio, 0.0);
     }
 
     #[test]
