@@ -35,9 +35,18 @@ fn body_with_tool_result(text: &str) -> Vec<u8> {
     }))
 }
 
+/// CCR store wired (retrieval path present): the gate admits recoverable
+/// drops, so these tests exercise the byte threshold / token gate alone.
 fn dispatch(body: &[u8]) -> LiveZoneOutcome {
-    compress_anthropic_live_zone(body, 0, AuthMode::Payg, DEFAULT_MODEL)
-        .expect("dispatcher returns Ok on valid bodies")
+    let store = headroom_core::ccr::InMemoryCcrStore::new();
+    headroom_core::transforms::live_zone::compress_anthropic_live_zone_with_ccr(
+        body,
+        0,
+        AuthMode::Payg,
+        DEFAULT_MODEL,
+        Some(&store),
+    )
+    .expect("dispatcher returns Ok on valid bodies")
 }
 
 fn first_tool_result_action(out: &LiveZoneOutcome) -> BlockAction {

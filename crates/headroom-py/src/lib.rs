@@ -15,6 +15,8 @@
 
 use std::collections::BTreeMap;
 
+mod unified21;
+
 use headroom_core::signals::{
     ImportanceCategory, ImportanceContext, KeywordDetector, KeywordRegistry, LineImportanceDetector,
 };
@@ -30,12 +32,12 @@ use headroom_core::transforms::tag_protector::{
     protect_tags as rust_protect_tags, restore_tags as rust_restore_tags,
 };
 use headroom_core::transforms::{
-    compress_openai_responses_live_zone as rust_compress_openai_responses_live_zone,
+    compress_openai_responses_live_zone_with_options as rust_compress_openai_responses_live_zone_with_options,
     detect as rust_detect_chain, is_json_array_of_dicts as rust_is_json_array_of_dicts,
     summarize_openai_responses_no_change_reason as rust_summarize_openai_responses_no_change_reason,
     AuthMode as RustLiveZoneAuthMode, ContentType as RustContentType,
     DetectionResult as RustDetectionResult, DiffCompressionResult, DiffCompressor,
-    DiffCompressorConfig, DiffCompressorStats, LiveZoneOutcome,
+    DiffCompressorConfig, DiffCompressorStats, LiveZoneOptions, LiveZoneOutcome,
     LogCompressionResult as RustLogResult, LogCompressor as RustLogCompressor,
     LogCompressorConfig as RustLogConfig, LogCompressorStats as RustLogStats,
     LogFormat as RustLogFormat, LogLevel as RustLogLevel,
@@ -1592,14 +1594,29 @@ fn known_html_tag_names() -> Vec<&'static str> {
 /// JSON, no `messages`/`input` array) are passthrough conditions, not
 /// failures — matching the Rust proxy's
 /// `compress_openai_responses_request` contract.
+///
+/// Unified-21: `query` is the agent `RelevanceQuery.to_dict()` as JSON
+/// (`None` derives the query from the body's latest user text) and
+/// `policy` the resolved `CompressionPolicy` limits as JSON (`None`
+/// resolves from `auth_mode`). Malformed JSON raises `ValueError`.
 #[pyfunction]
-#[pyo3(signature = (body, auth_mode = "payg", model = ""))]
+#[pyo3(signature = (body, auth_mode = "payg", model = "", query = None, policy = None))]
 fn compress_openai_responses_live_zone(
     py: Python<'_>,
     body: &[u8],
     auth_mode: &str,
     model: &str,
-) -> (Py<PyBytes>, bool, u64, Vec<String>, Option<String>) {
+    query: Option<&str>,
+    policy: Option<&str>,
+) -> PyResult<(Py<PyBytes>, bool, u64, Vec<String>, Option<String>)> {
+    let options = LiveZoneOptions {
+        query: match query {
+            Some(_) => Some(unified21::task_from_json(query)?),
+            None => None,
+        },
+        policy: unified21::compression_policy_from_json(policy)?,
+        ccr_store: None,
+    };
     let mode = match auth_mode.to_ascii_lowercase().as_str() {
         "payg" => RustLiveZoneAuthMode::Payg,
         "oauth" => RustLiveZoneAuthMode::OAuth,
@@ -1612,53 +1629,57 @@ fn compress_openai_responses_live_zone(
         model
     };
 
-    match rust_compress_openai_responses_live_zone(body, mode, model_str) {
-        Ok(LiveZoneOutcome::NoChange { manifest }) => {
-            let saved = manifest.tokens_saved() as u64;
-            let transforms: Vec<String> = manifest
-                .transforms_applied()
-                .into_iter()
-                .map(String::from)
-                .collect();
-            let reason = rust_summarize_openai_responses_no_change_reason(&manifest).to_string();
-            (
-                PyBytes::new(py, body).unbind(),
-                false,
-                saved,
-                transforms,
-                Some(reason),
-            )
-        }
-        Ok(LiveZoneOutcome::Modified { new_body, manifest }) => {
-            // `RawValue::get` returns the underlying serialized JSON
-            // as `&str`; bytes are valid UTF-8 by construction.
-            let bytes = new_body.get().as_bytes();
-            let saved = manifest.tokens_saved() as u64;
-            let transforms: Vec<String> = manifest
-                .transforms_applied()
-                .into_iter()
-                .map(String::from)
-                .collect();
-            (
-                PyBytes::new(py, bytes).unbind(),
-                true,
-                saved,
-                transforms,
-                None,
-            )
-        }
-        Err(_) => {
-            // BodyNotJson / NoMessagesArray are non-fatal: nothing to
-            // compress, fall through to passthrough byte-for-byte.
-            (
-                PyBytes::new(py, body).unbind(),
-                false,
-                0,
-                Vec::new(),
-                Some("dispatch_error".to_string()),
-            )
-        }
-    }
+    Ok(
+        match rust_compress_openai_responses_live_zone_with_options(body, mode, model_str, &options)
+        {
+            Ok(LiveZoneOutcome::NoChange { manifest }) => {
+                let saved = manifest.tokens_saved() as u64;
+                let transforms: Vec<String> = manifest
+                    .transforms_applied()
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                let reason =
+                    rust_summarize_openai_responses_no_change_reason(&manifest).to_string();
+                (
+                    PyBytes::new(py, body).unbind(),
+                    false,
+                    saved,
+                    transforms,
+                    Some(reason),
+                )
+            }
+            Ok(LiveZoneOutcome::Modified { new_body, manifest }) => {
+                // `RawValue::get` returns the underlying serialized JSON
+                // as `&str`; bytes are valid UTF-8 by construction.
+                let bytes = new_body.get().as_bytes();
+                let saved = manifest.tokens_saved() as u64;
+                let transforms: Vec<String> = manifest
+                    .transforms_applied()
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                (
+                    PyBytes::new(py, bytes).unbind(),
+                    true,
+                    saved,
+                    transforms,
+                    None,
+                )
+            }
+            Err(_) => {
+                // BodyNotJson / NoMessagesArray are non-fatal: nothing to
+                // compress, fall through to passthrough byte-for-byte.
+                (
+                    PyBytes::new(py, body).unbind(),
+                    false,
+                    0,
+                    Vec::new(),
+                    Some("dispatch_error".to_string()),
+                )
+            }
+        },
+    )
 }
 
 // --- TextCrusher (Phase 2, #1171): fast extractive prose compressor ---
@@ -1843,5 +1864,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(content_has_error_indicators, m)?)?;
     m.add_function(wrap_pyfunction!(keyword_registry_snapshot, m)?)?;
     m.add_function(wrap_pyfunction!(compress_openai_responses_live_zone, m)?)?;
+    unified21::register(m)?;
     Ok(())
 }

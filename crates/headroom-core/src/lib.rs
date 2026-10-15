@@ -13,6 +13,7 @@ pub mod offline;
 mod onnx_cpu;
 pub mod relevance;
 pub mod rollout;
+pub mod safety_gate;
 pub mod signals;
 pub mod tokenizer;
 pub mod transforms;

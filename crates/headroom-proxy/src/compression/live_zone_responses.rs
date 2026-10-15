@@ -33,10 +33,11 @@
 
 use bytes::Bytes;
 use headroom_core::auth_mode::AuthMode as RequestAuthMode;
+use headroom_core::compression_policy::CompressionPolicy;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{
-    compress_openai_responses_live_zone, summarize_openai_responses_no_change_reason, BlockAction,
-    LiveZoneError, LiveZoneOutcome,
+    compress_openai_responses_live_zone_with_options, summarize_openai_responses_no_change_reason,
+    BlockAction, LiveZoneError, LiveZoneOptions, LiveZoneOutcome,
 };
 use serde_json::Value;
 
@@ -60,6 +61,23 @@ pub fn compress_openai_responses_request(
     body: &Bytes,
     mode: CompressionMode,
     auth_mode: RequestAuthMode,
+    request_id: &str,
+) -> Outcome {
+    compress_openai_responses_request_with_policy(
+        body,
+        mode,
+        auth_mode,
+        CompressionPolicy::for_mode(auth_mode),
+        request_id,
+    )
+}
+
+/// [`compress_openai_responses_request`] with the request's resolved policy.
+pub fn compress_openai_responses_request_with_policy(
+    body: &Bytes,
+    mode: CompressionMode,
+    auth_mode: RequestAuthMode,
+    policy: CompressionPolicy,
     request_id: &str,
 ) -> Outcome {
     if matches!(mode, CompressionMode::Off) {
@@ -145,7 +163,16 @@ pub fn compress_openai_responses_request(
     // F2.1 c2/6: forward F1's classified auth_mode into the dispatcher
     // instead of the hard-coded `Payg`. See live_zone_anthropic.rs for
     // the rationale — same wiring on the OpenAI Responses path.
-    match compress_openai_responses_live_zone(&dispatch_body, auth_mode.into(), model) {
+    let options = LiveZoneOptions {
+        policy: Some(policy),
+        ..LiveZoneOptions::default()
+    };
+    match compress_openai_responses_live_zone_with_options(
+        &dispatch_body,
+        auth_mode.into(),
+        model,
+        &options,
+    ) {
         Ok(LiveZoneOutcome::NoChange { manifest }) => {
             let reason = summarize_openai_responses_no_change_reason(&manifest);
             tracing::info!(

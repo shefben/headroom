@@ -53,10 +53,11 @@ pub use kompress::{
     DEFAULT_TOKENIZER_REPO,
 };
 pub use live_zone::{
-    compress_anthropic_live_zone, compress_openai_chat_live_zone,
-    compress_openai_responses_live_zone, summarize_openai_responses_no_change_reason, AuthMode,
-    BlockAction, BlockOutcome, CompressionManifest, ExclusionReason, LiveZoneError,
-    LiveZoneOutcome,
+    compress_anthropic_live_zone, compress_anthropic_live_zone_with_options,
+    compress_openai_chat_live_zone, compress_openai_chat_live_zone_with_options,
+    compress_openai_responses_live_zone, compress_openai_responses_live_zone_with_options,
+    summarize_openai_responses_no_change_reason, AuthMode, BlockAction, BlockOutcome,
+    CompressionManifest, ExclusionReason, LiveZoneError, LiveZoneOptions, LiveZoneOutcome,
 };
 pub use log_compressor::{
     LogCompressionResult, LogCompressor, LogCompressorConfig, LogCompressorStats, LogFormat,

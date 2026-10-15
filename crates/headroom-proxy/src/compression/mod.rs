@@ -45,12 +45,16 @@ pub mod model_limits;
 // `compress_anthropic_request` is sourced from the live-zone module.
 pub use anthropic::resolve_frozen_count;
 pub use live_zone_anthropic::{
-    compress_anthropic_request, Outcome, PassthroughReason, PerStrategyTokens,
+    compress_anthropic_request, compress_anthropic_request_with_policy, Outcome, PassthroughReason,
+    PerStrategyTokens,
 };
 pub use live_zone_openai::{
-    compress_openai_chat_request, should_skip_compression, SkipCompressionReason,
+    compress_openai_chat_request, compress_openai_chat_request_with_policy,
+    should_skip_compression, SkipCompressionReason,
 };
-pub use live_zone_responses::compress_openai_responses_request;
+pub use live_zone_responses::{
+    compress_openai_responses_request, compress_openai_responses_request_with_policy,
+};
 
 /// Which provider's compression dispatcher should run for a request
 /// path. PR-C2 wired `/v1/chat/completions`; PR-C3 adds

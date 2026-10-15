@@ -66,6 +66,35 @@ static EMAIL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
         .expect("email regex compiles")
 });
 
+/// Minimum fused score for an item containing an exact query identifier.
+pub const EXACT_IDENTIFIER_FLOOR: f64 = 0.75;
+
+static EXACT_TERM: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[A-Za-z0-9_][A-Za-z0-9_./:\\-]{3,}").expect("exact term regex"));
+
+/// Query terms that are identifiers rather than prose: contain a digit,
+/// `_`, `.`, `/`, `:` or an inner capital (CamelCase).
+pub fn exact_identifier_terms(context: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in EXACT_TERM.find_iter(context) {
+        let t = m.as_str().trim_end_matches(['.', ':', '/']);
+        if t.len() < 4 {
+            continue;
+        }
+        let identifier = t
+            .chars()
+            .any(|c| c.is_ascii_digit() || "_./:\\".contains(c))
+            || t.chars().skip(1).any(|c| c.is_ascii_uppercase());
+        if identifier && !out.iter().any(|x| x == t) {
+            out.push(t.to_string());
+        }
+        if out.len() >= 32 {
+            break;
+        }
+    }
+    out
+}
+
 pub struct HybridScorer {
     pub base_alpha: f64,
     pub adaptive: bool,
@@ -151,6 +180,44 @@ impl HybridScorer {
         alpha.clamp(0.3, 0.9)
     }
 
+    /// Fuse BM25 with the shared semantic similarities, then apply the
+    /// exact-identifier floor: an item that carries an identifier the
+    /// query names verbatim (path, id, hash, `snake_case`/`CamelCase`
+    /// symbol) never ranks below [`EXACT_IDENTIFIER_FLOOR`], so semantic
+    /// similarity can add paraphrase matches but cannot dilute exact ones.
+    fn fuse_shared(
+        &self,
+        bm25: Vec<RelevanceScore>,
+        sims: &[f64],
+        items: &[&str],
+        context: &str,
+    ) -> Vec<RelevanceScore> {
+        let alpha = self.compute_alpha(context);
+        let exact = exact_identifier_terms(context);
+        bm25.into_iter()
+            .zip(sims)
+            .zip(items)
+            .map(|((b, sim), item)| {
+                let mut combined = alpha * b.score + (1.0 - alpha) * sim;
+                let exact_hit = exact.iter().any(|t| item.contains(t.as_str()));
+                if exact_hit {
+                    combined = combined.max(EXACT_IDENTIFIER_FLOOR);
+                }
+                RelevanceScore::new(
+                    combined,
+                    format!(
+                        "Hybrid (\u{3b1}={:.2}): BM25={:.2}, Semantic={:.2}{}",
+                        alpha,
+                        b.score,
+                        sim,
+                        if exact_hit { ", exact" } else { "" }
+                    ),
+                    b.matched_terms,
+                )
+            })
+            .collect()
+    }
+
     /// BM25-only fallback boost. Mirrors Python `score`/`score_batch`
     /// boost rules (`hybrid.py:171-181` and `225-238`).
     fn boost_bm25_only(&self, bm25_result: &RelevanceScore) -> RelevanceScore {
@@ -174,6 +241,14 @@ impl RelevanceScorer for HybridScorer {
         let bm25_result = self.bm25.score(item, context);
 
         if !self.embedding_available {
+            // Process-owned semantic service (lazy, cache-only, BM25 until
+            // ready). See `relevance::semantic`.
+            if let Some(sims) = super::semantic::similarity_batch(&[item], context) {
+                return self
+                    .fuse_shared(vec![bm25_result], &sims, &[item], context)
+                    .pop()
+                    .unwrap_or_default();
+            }
             return self.boost_bm25_only(&bm25_result);
         }
 
@@ -199,6 +274,9 @@ impl RelevanceScorer for HybridScorer {
         let bm25_results = self.bm25.score_batch(items, context);
 
         if !self.embedding_available {
+            if let Some(sims) = super::semantic::similarity_batch(items, context) {
+                return self.fuse_shared(bm25_results, &sims, items, context);
+            }
             return bm25_results
                 .iter()
                 .map(|r| self.boost_bm25_only(r))
@@ -242,6 +320,17 @@ mod tests {
     #[test]
     fn hybrid_always_available() {
         assert!(scorer().is_available());
+    }
+
+    #[test]
+    fn exact_identifier_terms_skip_prose() {
+        let t = exact_identifier_terms(
+            "why does parse_config in src/app.py fail for HR-123 and RetryPolicy",
+        );
+        assert!(t.contains(&"parse_config".to_string()));
+        assert!(t.contains(&"src/app.py".to_string()));
+        assert!(t.contains(&"RetryPolicy".to_string()));
+        assert!(!t.iter().any(|x| x == "does" || x == "fail"));
     }
 
     #[test]

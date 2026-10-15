@@ -905,11 +905,12 @@ pub(crate) async fn forward_http(
                 // dispatcher so cache_control auto-placement gates on
                 // PAYG only. Pulled from request extensions where it
                 // was stashed at request entry (line ~325 above).
-                compression::compress_anthropic_request(
+                compression::compress_anthropic_request_with_policy(
                     &buffered,
                     state.config.compression_mode,
                     state.config.cache_control_auto_frozen,
                     auth_mode,
+                    policy,
                     &request_id,
                 )
             }
@@ -929,10 +930,11 @@ pub(crate) async fn forward_http(
                     );
                     compression::Outcome::NoCompression
                 } else {
-                    compression::compress_openai_chat_request(
+                    compression::compress_openai_chat_request_with_policy(
                         &buffered,
                         state.config.compression_mode,
                         auth_mode,
+                        policy,
                         &request_id,
                     )
                 }
@@ -943,10 +945,11 @@ pub(crate) async fn forward_http(
             // kind plus the latest `message` text. Cache hot zone is
             // every other item type (passthrough verbatim).
             compression::CompressibleEndpoint::OpenAiResponses => {
-                compression::compress_openai_responses_request(
+                compression::compress_openai_responses_request_with_policy(
                     &buffered,
                     state.config.compression_mode,
                     auth_mode,
+                    policy,
                     &request_id,
                 )
             }

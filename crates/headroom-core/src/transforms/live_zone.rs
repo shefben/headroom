@@ -118,6 +118,9 @@ use super::log_compressor::{LogCompressor, LogCompressorConfig};
 use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
 use crate::ccr::{compute_key, marker_for, CcrStore};
+use crate::compression_policy::CompressionPolicy;
+use crate::relevance::TaskQuery;
+use crate::safety_gate::{self, Candidate, GatePolicy, Provenance, Tier};
 use crate::tokenizer::get_tokenizer;
 
 // ─── Tunable constants (no magic numbers in the dispatch logic) ────────
@@ -139,13 +142,18 @@ const STRATEGY_CODE_COMPRESSOR: &str = "code_compressor";
 #[cfg(feature = "ml")]
 const STRATEGY_KOMPRESS: &str = "kompress";
 
-/// Empty query context passed to compressors that take a relevance
-/// query string. PR-B3 dispatcher does not yet plumb the user's last
-/// prompt through; PR-F3 will.
-const EMPTY_QUERY: &str = "";
-/// Default relevance bias passed to scoring-aware compressors. Mirrors
-/// the OSS-default behaviour ("no bias").
+/// Default relevance bias passed to scoring-aware compressors: the
+/// aggressive rung of the backoff ladder (keep the adaptive-sizer floor).
 const DEFAULT_BIAS: f64 = 0.0;
+/// Conservative rung: keep the information-saturation knee itself
+/// (`bias = 1.0`, the Python OSS default) instead of its floor.
+const CONSERVATIVE_BIAS: f64 = 1.0;
+/// Strategy label for the policy-fit conservative candidate.
+const STRATEGY_POLICY_FIT: &str = "policy_fit";
+/// Strategy label for the structural/lossless JSON candidate.
+const STRATEGY_JSON_MINIFY: &str = "json_minify";
+/// Strategy label for the CCR exact-externalization candidate.
+const STRATEGY_CCR_EXACT: &str = "ccr_exact";
 
 /// Default model name handed to the tokenizer registry when the proxy
 /// could not extract `body["model"]`. Matches the most-common
@@ -374,6 +382,17 @@ pub enum BlockAction {
     /// Block type is intentionally outside the live zone (e.g.
     /// `tool_use` → cache hot zone) and is excluded from dispatch.
     Excluded { reason: ExclusionReason },
+    /// Every rung of the backoff ladder was rejected by the SafetyGate
+    /// (invariant, lossy-policy, marker or cache reasons); the original
+    /// bytes are forwarded.
+    RejectedBySafetyGate {
+        /// Compressor that produced the aggressive candidate.
+        strategy: &'static str,
+        /// Gate reason codes of the aggressive candidate.
+        reasons: Vec<String>,
+        /// Original block-content size, tokens.
+        original_tokens: usize,
+    },
 }
 
 /// Why a block was not eligible for compression.
@@ -387,6 +406,9 @@ pub enum ExclusionReason {
     /// Block type is on the cache-hot list (e.g. `tool_use`,
     /// `thinking`, `redacted_thinking`).
     HotZoneBlockType,
+    /// Prose the user wrote in the newest turn: the explicit ask is never
+    /// compressed (pasted tool output in the same turn still is).
+    LatestUserAsk,
 }
 
 /// Aggregated per-request manifest. Always populated, regardless of
@@ -480,10 +502,12 @@ pub fn summarize_openai_responses_no_change_reason(manifest: &CompressionManifes
     let mut saw_below_plain_text_floor = false;
     let mut saw_rejected_not_smaller = false;
     let mut saw_compressor_error = false;
+    let mut saw_safety_gate = false;
 
     for outcome in &manifest.block_outcomes {
         match &outcome.action {
             BlockAction::CompressorError { .. } => saw_compressor_error = true,
+            BlockAction::RejectedBySafetyGate { .. } => saw_safety_gate = true,
             BlockAction::RejectedNotSmaller { .. } => saw_rejected_not_smaller = true,
             BlockAction::BelowByteThreshold { content_type, .. } => {
                 if *content_type == "output_item" {
@@ -500,6 +524,8 @@ pub fn summarize_openai_responses_no_change_reason(manifest: &CompressionManifes
 
     if saw_compressor_error {
         "compressor_error"
+    } else if saw_safety_gate {
+        "rejected_by_safety_gate"
     } else if saw_rejected_not_smaller {
         "rejected_not_smaller"
     } else if saw_below_output_floor {
@@ -563,9 +589,18 @@ const HOT_ZONE_BLOCK_TYPES: &[&str] = &[
 // builder. Hold one instance per process behind `OnceLock`; cheap to
 // clone the &reference each call.
 
+// Compressor-internal retrieval markers are OFF in the live zone: the
+// dispatcher owns CCR (one verified `<<ccr:HASH>>` for the whole original,
+// emitted only when a store is wired). A compressor marker with no store
+// behind it would be unredeemable, and the SafetyGate rejects it.
 fn smart_crusher() -> &'static SmartCrusher {
     static INSTANCE: OnceLock<SmartCrusher> = OnceLock::new();
-    INSTANCE.get_or_init(|| SmartCrusher::new(SmartCrusherConfig::default()))
+    INSTANCE.get_or_init(|| {
+        SmartCrusher::new(SmartCrusherConfig {
+            enable_ccr_marker: false,
+            ..SmartCrusherConfig::default()
+        })
+    })
 }
 
 fn log_compressor() -> &'static LogCompressor {
@@ -580,7 +615,12 @@ fn search_compressor() -> &'static SearchCompressor {
 
 fn diff_compressor() -> &'static DiffCompressor {
     static INSTANCE: OnceLock<DiffCompressor> = OnceLock::new();
-    INSTANCE.get_or_init(|| DiffCompressor::new(DiffCompressorConfig::default()))
+    INSTANCE.get_or_init(|| {
+        DiffCompressor::new(DiffCompressorConfig {
+            enable_ccr: false,
+            ..DiffCompressorConfig::default()
+        })
+    })
 }
 
 fn code_compressor() -> &'static CodeAwareCompressor {
@@ -917,13 +957,119 @@ fn arm_disabled(content_type: ContentType) -> bool {
 ///   failed / produced larger output).
 /// - [`LiveZoneOutcome::Modified`] when at least one block was
 ///   rewritten — the proxy forwards the new body.
+/// Per-request inputs beyond the body (unified-21 #1/#7/#13).
+///
+/// * `query` — the task relevance query (Python `RelevanceQuery.to_dict()`
+///   through the bindings). `None` derives one from the request's own
+///   latest user text, so compressors never run with an empty query while
+///   a user ask exists.
+/// * `policy` — the resolved `CompressionPolicy`. `None` resolves it from
+///   the auth mode (unknown → PAYG, the upstream defensive default).
+/// * `ccr_store` — when set, originals are stored (and verified) before a
+///   retrieval marker is emitted, and drops become exactly recoverable.
+#[derive(Default)]
+pub struct LiveZoneOptions<'a> {
+    pub query: Option<TaskQuery>,
+    pub policy: Option<CompressionPolicy>,
+    pub ccr_store: Option<&'a dyn CcrStore>,
+}
+
+fn policy_for(auth_mode: AuthMode, explicit: Option<CompressionPolicy>) -> CompressionPolicy {
+    explicit.unwrap_or_else(|| {
+        let mode = match auth_mode {
+            AuthMode::OAuth => crate::auth_mode::AuthMode::OAuth,
+            AuthMode::Subscription => crate::auth_mode::AuthMode::Subscription,
+            AuthMode::Payg | AuthMode::Unknown => crate::auth_mode::AuthMode::Payg,
+        };
+        CompressionPolicy::for_mode(mode)
+    })
+}
+
+/// Concatenated text of a user message: string content, or its
+/// `text` / `input_text` parts (tool results excluded).
+fn user_message_text(msg: &Value) -> String {
+    match msg.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.get("type").and_then(Value::as_str),
+                    Some("text") | Some("input_text") | None
+                )
+            })
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Derive the task query from the newest user message that carries
+/// authentic text (a tool-result-only continuation turn walks back to
+/// the ask it continues). Mirrors `extract_user_query` on the Python side.
+fn derive_query(items: &[Value], is_user: impl Fn(&Value) -> bool) -> TaskQuery {
+    for item in items.iter().rev() {
+        if !is_user(item) {
+            continue;
+        }
+        let q = TaskQuery::from_user_text(&user_message_text(item));
+        if !q.is_empty() {
+            return q;
+        }
+    }
+    TaskQuery::default()
+}
+
+fn is_role_user(v: &Value) -> bool {
+    v.get("role").and_then(Value::as_str) == Some("user")
+}
+
+fn is_responses_user_message(v: &Value) -> bool {
+    is_role_user(v)
+        && matches!(
+            v.get("type").and_then(Value::as_str),
+            None | Some("message")
+        )
+}
+
+/// Per-request dispatch context shared by every block.
+struct BlockCtx<'a> {
+    query: TaskQuery,
+    compressor_query: String,
+    policy: GatePolicy,
+    ccr_store: Option<&'a dyn CcrStore>,
+}
+
+impl<'a> BlockCtx<'a> {
+    fn new(
+        query: TaskQuery,
+        policy: CompressionPolicy,
+        ccr_store: Option<&'a dyn CcrStore>,
+    ) -> Self {
+        let compressor_query = query.compressor_query();
+        BlockCtx {
+            query,
+            compressor_query,
+            policy: GatePolicy::from(policy),
+            ccr_store,
+        }
+    }
+}
+
 pub fn compress_anthropic_live_zone(
     body_raw: &[u8],
     frozen_message_count: usize,
     auth_mode: AuthMode,
     model: &str,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
-    compress_anthropic_live_zone_with_ccr(body_raw, frozen_message_count, auth_mode, model, None)
+    compress_anthropic_live_zone_with_options(
+        body_raw,
+        frozen_message_count,
+        auth_mode,
+        model,
+        &LiveZoneOptions::default(),
+    )
 }
 
 /// Same as [`compress_anthropic_live_zone`] but with an optional
@@ -945,10 +1091,31 @@ pub fn compress_anthropic_live_zone(
 pub fn compress_anthropic_live_zone_with_ccr(
     body_raw: &[u8],
     frozen_message_count: usize,
-    _auth_mode: AuthMode,
+    auth_mode: AuthMode,
     model: &str,
     ccr_store: Option<&dyn CcrStore>,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
+    compress_anthropic_live_zone_with_options(
+        body_raw,
+        frozen_message_count,
+        auth_mode,
+        model,
+        &LiveZoneOptions {
+            ccr_store,
+            ..LiveZoneOptions::default()
+        },
+    )
+}
+
+/// Full-control Anthropic entry point: task query, policy and CCR store.
+pub fn compress_anthropic_live_zone_with_options(
+    body_raw: &[u8],
+    frozen_message_count: usize,
+    auth_mode: AuthMode,
+    model: &str,
+    options: &LiveZoneOptions<'_>,
+) -> Result<LiveZoneOutcome, LiveZoneError> {
+    let ccr_store = options.ccr_store;
     let parsed: Value = serde_json::from_slice(body_raw).map_err(LiveZoneError::BodyNotJson)?;
     let messages = parsed
         .get("messages")
@@ -1012,6 +1179,11 @@ pub fn compress_anthropic_live_zone_with_ccr(
     // produced compressed output; the byte-threshold gate filters
     // sub-threshold content first.
     let tokenizer = get_tokenizer(model);
+    let query = options
+        .query
+        .clone()
+        .unwrap_or_else(|| derive_query(&messages[..=target_idx], is_role_user));
+    let ctx = BlockCtx::new(query, policy_for(auth_mode, options.policy), ccr_store);
 
     for slot in plan {
         let outcome = match slot.kind {
@@ -1029,6 +1201,7 @@ pub fn compress_anthropic_live_zone_with_ccr(
                 content_byte_range,
             } => {
                 let detected = detect_content_type(&content_text);
+                let user_ask = block_type == "text";
                 let outcome: BlockOutcome = compress_one_block(
                     &content_text,
                     detected.content_type,
@@ -1038,7 +1211,8 @@ pub fn compress_anthropic_live_zone_with_ccr(
                     block_type,
                     tokenizer.as_ref(),
                     &mut replacements,
-                    ccr_store,
+                    &ctx,
+                    user_ask,
                 );
                 outcome
             }
@@ -1056,7 +1230,8 @@ pub fn compress_anthropic_live_zone_with_ccr(
                     "string_content".to_string(),
                     tokenizer.as_ref(),
                     &mut replacements,
-                    ccr_store,
+                    &ctx,
+                    true,
                 )
             }
         };
@@ -1130,7 +1305,8 @@ fn compress_one_block(
     block_type: String,
     tokenizer: &dyn crate::tokenizer::Tokenizer,
     replacements: &mut Vec<Replacement>,
-    ccr_store: Option<&dyn CcrStore>,
+    ctx: &BlockCtx<'_>,
+    user_ask_slot: bool,
 ) -> BlockOutcome {
     // 1. Byte-threshold gate. Empty content always falls through to
     //    `dispatch_compressor` (which short-circuits on empty), so
@@ -1149,92 +1325,241 @@ fn compress_one_block(
         };
     }
 
-    match dispatch_compressor(content_text, content_type) {
-        DispatchResult::NoOp { content_type } => BlockOutcome {
+    // The newest explicit user ask (prose the user wrote) is never
+    // compressed; structured output pasted into the same turn still is.
+    if user_ask_slot && content_type == ContentType::PlainText {
+        return BlockOutcome {
             message_index,
             block_index,
             block_type,
-            action: BlockAction::NoCompressionApplied {
-                content_type: content_type.to_string(),
+            action: BlockAction::Excluded {
+                reason: ExclusionReason::LatestUserAsk,
             },
-        },
+        };
+    }
+
+    let (strategy, compressed) = match dispatch_compressor(
+        content_text,
+        content_type,
+        &ctx.compressor_query,
+        DEFAULT_BIAS,
+    ) {
+        DispatchResult::NoOp { content_type } => {
+            return BlockOutcome {
+                message_index,
+                block_index,
+                block_type,
+                action: BlockAction::NoCompressionApplied {
+                    content_type: content_type.to_string(),
+                },
+            }
+        }
+        DispatchResult::Error { strategy, error } => {
+            return BlockOutcome {
+                message_index,
+                block_index,
+                block_type,
+                action: BlockAction::CompressorError { strategy, error },
+            }
+        }
         DispatchResult::Compressed {
             strategy,
             compressed,
-        } => {
-            let original_bytes = content_text.len();
-            // PR-B7: when a CCR store is wired, persist the original
-            // block content keyed by `BLAKE3(original)[..24]` and append
-            // the `<<ccr:HASH>>` marker to the compressed string. The
-            // marker stays on a fresh trailing line so it is easy for
-            // the model to spot and so that the per-content-type
-            // compressors (which already produce trailing summary
-            // lines) keep their final newline before the marker.
-            //
-            // The token-validation gate (step 3) is computed against
-            // the marker-augmented string so the saved-token check
-            // stays honest — the marker costs ~6 tokens and we'd
-            // rather forward the original than ship a bigger payload
-            // for a 5-byte block.
-            let (compressed_for_replacement, ccr_hash_emitted) =
-                maybe_inject_ccr_marker(content_text, &compressed, ccr_store);
-            let compressed_bytes = compressed_for_replacement.len();
-            // 3. Tokenizer-validated rejection. Per PR-B4 spec we
-            //    count both the original and compressed strings
-            //    using the model's tokenizer; the compression is
-            //    accepted only when it shrinks the token count.
-            //    Bytes-shrinking-but-tokens-growing happens for
-            //    pathological inputs (e.g. dense base64 → tokenizer
-            //    fragments more aggressively after a transform).
-            let original_tokens = tokenizer.count_text(content_text);
-            let compressed_tokens = tokenizer.count_text(&compressed_for_replacement);
-            if compressed_tokens >= original_tokens {
-                BlockOutcome {
-                    message_index,
-                    block_index,
-                    block_type,
-                    action: BlockAction::RejectedNotSmaller {
-                        strategy,
-                        original_bytes,
-                        compressed_bytes,
-                        original_tokens,
-                        compressed_tokens,
-                    },
-                }
-            } else {
-                // Only persist to the CCR store once the rejection
-                // gate has admitted the compression — otherwise we
-                // populate the store with hashes whose markers
-                // never reach the wire (still correct, but wastes
-                // storage capacity).
-                if let (Some(store), Some(hash)) = (ccr_store, ccr_hash_emitted.as_deref()) {
-                    store.put(hash, content_text);
-                }
-                let replacement_bytes = serde_json::to_vec(&compressed_for_replacement)
-                    .expect("string is always JSON-encodable");
-                replacements.push(Replacement {
-                    range: content_byte_range,
-                    replacement: replacement_bytes,
-                });
-                BlockOutcome {
-                    message_index,
-                    block_index,
-                    block_type,
-                    action: BlockAction::Compressed {
-                        strategy,
-                        original_bytes,
-                        compressed_bytes,
-                        original_tokens,
-                        compressed_tokens,
-                    },
+        } => (strategy, compressed),
+    };
+
+    // 2. Exact originals first: when a CCR store is wired, persist the
+    //    original under `BLAKE3(original)[..24]` and verify it reads back
+    //    byte-exact BEFORE any marker may reference it.
+    let verified_hash: Option<String> = ctx.ccr_store.and_then(|store| {
+        let hash = compute_key(content_text.as_bytes());
+        store.put(&hash, content_text);
+        (store.get(&hash).as_deref() == Some(content_text)).then_some(hash)
+    });
+    let base_prov = || {
+        let mut prov = Provenance {
+            content_type: Some(content_type.as_str().to_string()),
+            retrieval_available: verified_hash.is_some(),
+            ..Provenance::default()
+        };
+        if let Some(h) = &verified_hash {
+            prov.ccr_payloads
+                .insert(h.clone(), content_text.to_string());
+        }
+        prov
+    };
+    let with_marker = |text: &str| -> String {
+        match &verified_hash {
+            Some(h) => {
+                let marker = marker_for(h);
+                if text.ends_with('\n') {
+                    format!("{text}{marker}")
+                } else {
+                    format!("{text}\n{marker}")
                 }
             }
+            None => text.to_string(),
         }
-        DispatchResult::Error { strategy, error } => BlockOutcome {
+    };
+    let original_tokens = tokenizer.count_text(content_text);
+    let prov_with = |strategy: &str| {
+        let mut p = base_prov();
+        p.strategy = strategy.to_string();
+        p.original_tokens = Some(original_tokens);
+        p
+    };
+
+    // 3. Aggressive rung through the SafetyGate.
+    let aggressive_text = with_marker(&compressed);
+    let aggressive = vec![Candidate {
+        tier: Tier::Aggressive,
+        text: aggressive_text,
+        provenance: prov_with(strategy),
+    }];
+    let first = safety_gate::select(
+        content_text,
+        &aggressive,
+        &ctx.query,
+        Some(&ctx.policy),
+        tokenizer,
+    );
+    let first_decision = first.decisions[0].1.clone();
+
+    let (chosen_text, chosen_strategy) = if first.chosen.is_some() {
+        (aggressive.into_iter().next().map(|c| c.text), strategy)
+    } else if first_decision.reasons == ["no_token_savings"] {
+        // The tokenizer says the compressor did not shrink the block:
+        // every larger rung would fail the same way.
+        return BlockOutcome {
             message_index,
             block_index,
             block_type,
-            action: BlockAction::CompressorError { strategy, error },
+            action: BlockAction::RejectedNotSmaller {
+                strategy,
+                original_bytes: content_text.len(),
+                compressed_bytes: aggressive[0].text.len(),
+                original_tokens,
+                compressed_tokens: first_decision.candidate_tokens,
+            },
+        };
+    } else {
+        // 4. Backoff: conservative → structural/lossless → CCR exact.
+        let mut rungs: Vec<(Candidate, &'static str)> = Vec::new();
+        if let DispatchResult::Compressed {
+            strategy: s2,
+            compressed: c2,
+        } = dispatch_compressor(
+            content_text,
+            content_type,
+            &ctx.compressor_query,
+            CONSERVATIVE_BIAS,
+        ) {
+            if c2 != compressed {
+                rungs.push((
+                    Candidate {
+                        tier: Tier::Conservative,
+                        text: with_marker(&c2),
+                        provenance: prov_with(s2),
+                    },
+                    s2,
+                ));
+            }
+        }
+        if safety_gate::line_fittable(content_type.as_str()) {
+            if let Some(fit) = safety_gate::fit_lossy_budget(
+                content_text,
+                Some(&compressed),
+                &ctx.query,
+                &ctx.policy,
+                content_type.as_str(),
+                tokenizer,
+            ) {
+                rungs.push((
+                    Candidate {
+                        tier: Tier::Conservative,
+                        text: with_marker(&fit),
+                        provenance: prov_with(STRATEGY_POLICY_FIT),
+                    },
+                    STRATEGY_POLICY_FIT,
+                ));
+            }
+        }
+        if content_type == ContentType::JsonArray {
+            if let Some(min) = safety_gate::minify_json(content_text) {
+                let mut p = prov_with(STRATEGY_JSON_MINIFY);
+                p.reversible = true;
+                rungs.push((
+                    Candidate {
+                        tier: Tier::Lossless,
+                        text: min,
+                        provenance: p,
+                    },
+                    STRATEGY_JSON_MINIFY,
+                ));
+            }
+        }
+        if let Some(h) = &verified_hash {
+            rungs.push((
+                Candidate {
+                    tier: Tier::CcrExact,
+                    text: safety_gate::ccr_exact_stub(content_text, h),
+                    provenance: prov_with(STRATEGY_CCR_EXACT),
+                },
+                STRATEGY_CCR_EXACT,
+            ));
+        }
+        let (cands, labels): (Vec<Candidate>, Vec<&'static str>) = rungs.into_iter().unzip();
+        let sel = safety_gate::select(
+            content_text,
+            &cands,
+            &ctx.query,
+            Some(&ctx.policy),
+            tokenizer,
+        );
+        match sel.chosen {
+            Some(i) => (Some(cands[i].text.clone()), labels[i]),
+            None => {
+                tracing::debug!(
+                    event = "safety_gate_original",
+                    strategy,
+                    reasons = ?first_decision.reasons,
+                    "every backoff rung rejected; forwarding original"
+                );
+                return BlockOutcome {
+                    message_index,
+                    block_index,
+                    block_type,
+                    action: BlockAction::RejectedBySafetyGate {
+                        strategy,
+                        reasons: first_decision.reasons,
+                        original_tokens,
+                    },
+                };
+            }
+        }
+    };
+
+    let Some(replacement) = chosen_text else {
+        unreachable!("a chosen rung always carries text");
+    };
+    let compressed_tokens = tokenizer.count_text(&replacement);
+    let replacement_bytes =
+        serde_json::to_vec(&replacement).expect("string is always JSON-encodable");
+    let compressed_bytes = replacement.len();
+    replacements.push(Replacement {
+        range: content_byte_range,
+        replacement: replacement_bytes,
+    });
+    BlockOutcome {
+        message_index,
+        block_index,
+        block_type,
+        action: BlockAction::Compressed {
+            strategy: chosen_strategy,
+            original_bytes: content_text.len(),
+            compressed_bytes,
+            original_tokens,
+            compressed_tokens,
         },
     }
 }
@@ -1566,39 +1891,6 @@ fn apply_replacements(original: &[u8], replacements: &mut [Replacement]) -> Vec<
     out
 }
 
-/// PR-B7: append a `<<ccr:HASH>>` retrieval marker to the compressed
-/// block content when a CCR store is wired. Returns the
-/// (possibly-augmented) compressed string and the hash that was
-/// emitted (so the caller can decide whether to put the original into
-/// the store after the rejection gate). When `ccr_store` is `None`,
-/// returns the input compressed string unchanged with `None`.
-///
-/// The marker is appended on its own line — `\n<<ccr:HASH>>` — so:
-///
-/// 1. The marker is unambiguously after the compressor's last byte,
-///    even if that byte was a newline already (we only add one).
-/// 2. Markers are easy to detect in human-readable diffs / logs.
-/// 3. The Python `inject_ccr_retrieve_tool` regex in
-///    `headroom/ccr/tool_injection.py` keeps working — it matches
-///    `[a-f0-9]{24}` anywhere in the text.
-fn maybe_inject_ccr_marker(
-    original: &str,
-    compressed: &str,
-    ccr_store: Option<&dyn CcrStore>,
-) -> (String, Option<String>) {
-    if ccr_store.is_none() {
-        return (compressed.to_string(), None);
-    }
-    let hash = compute_key(original.as_bytes());
-    let marker = marker_for(&hash);
-    let augmented = if compressed.ends_with('\n') {
-        format!("{compressed}{marker}")
-    } else {
-        format!("{compressed}\n{marker}")
-    };
-    (augmented, Some(hash))
-}
-
 /// Per-block dispatch result — whether any compressor ran and what
 /// it produced.
 enum DispatchResult {
@@ -1634,7 +1926,12 @@ enum DispatchResult {
 /// Any arm whose content type is named in
 /// `HEADROOM_LIVE_ZONE_DISABLE_ARMS` short-circuits to a no-op before
 /// the table below is consulted.
-fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult {
+fn dispatch_compressor(
+    text: &str,
+    content_type: ContentType,
+    query: &str,
+    bias: f64,
+) -> DispatchResult {
     if text.is_empty() {
         return DispatchResult::NoOp {
             content_type: content_type.as_str(),
@@ -1657,7 +1954,7 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
             // too (confidence 0.8). SmartCrusher's `crush` is safe to
             // call on those — it parses, finds no compressible
             // arrays, and returns the input.
-            let result = smart_crusher().crush(text, EMPTY_QUERY, DEFAULT_BIAS);
+            let result = smart_crusher().crush(text, query, bias);
             if !result.was_modified {
                 return DispatchResult::NoOp {
                     content_type: content_type.as_str(),
@@ -1669,7 +1966,7 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
             }
         }
         ContentType::BuildOutput => {
-            let (result, _stats) = log_compressor().compress(text, DEFAULT_BIAS);
+            let (result, _stats) = log_compressor().compress(text, bias);
             if result.compressed == result.original {
                 return DispatchResult::NoOp {
                     content_type: content_type.as_str(),
@@ -1681,7 +1978,7 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
             }
         }
         ContentType::SearchResults => {
-            let (result, _stats) = search_compressor().compress(text, EMPTY_QUERY, DEFAULT_BIAS);
+            let (result, _stats) = search_compressor().compress(text, query, bias);
             if result.compressed == result.original {
                 return DispatchResult::NoOp {
                     content_type: content_type.as_str(),
@@ -1693,7 +1990,7 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
             }
         }
         ContentType::GitDiff => {
-            let result = diff_compressor().compress(text, EMPTY_QUERY);
+            let result = diff_compressor().compress(text, query);
             if result.compressed == text {
                 return DispatchResult::NoOp {
                     content_type: content_type.as_str(),
@@ -1715,7 +2012,7 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
         // to Kompress rather than giving up — mirrors the Python
         // router's no-shrink → Kompress fallback.
         ContentType::SourceCode => {
-            let result = code_compressor().compress(text);
+            let result = code_compressor().compress_with(text, None, query);
             if result.compressed == text {
                 // Exact passthrough only: the compressor declined
                 // (min-token floor, unknown language, parse failure,
@@ -2218,8 +2515,23 @@ mod tests {
 /// equality on the prefix and suffix.
 pub fn compress_openai_chat_live_zone(
     body_raw: &[u8],
-    _auth_mode: AuthMode,
+    auth_mode: AuthMode,
     model: &str,
+) -> Result<LiveZoneOutcome, LiveZoneError> {
+    compress_openai_chat_live_zone_with_options(
+        body_raw,
+        auth_mode,
+        model,
+        &LiveZoneOptions::default(),
+    )
+}
+
+/// Full-control OpenAI Chat entry point (task query, policy, CCR store).
+pub fn compress_openai_chat_live_zone_with_options(
+    body_raw: &[u8],
+    auth_mode: AuthMode,
+    model: &str,
+    options: &LiveZoneOptions<'_>,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
     let parsed: Value = serde_json::from_slice(body_raw).map_err(LiveZoneError::BodyNotJson)?;
     let messages = parsed
@@ -2285,9 +2597,19 @@ pub fn compress_openai_chat_live_zone(
     let tokenizer = get_tokenizer(model);
     let mut block_outcomes: Vec<BlockOutcome> = Vec::with_capacity(all_slots.len());
     let mut replacements: Vec<Replacement> = Vec::new();
+    let query = options
+        .query
+        .clone()
+        .unwrap_or_else(|| derive_query(messages, is_role_user));
+    let ctx = BlockCtx::new(
+        query,
+        policy_for(auth_mode, options.policy),
+        options.ccr_store,
+    );
 
     for (msg_idx, slot) in all_slots {
         let detected = detect_content_type(&slot.content_text);
+        let user_ask = Some(msg_idx) == latest_user_idx;
         let outcome = compress_one_block(
             &slot.content_text,
             detected.content_type,
@@ -2297,7 +2619,8 @@ pub fn compress_openai_chat_live_zone(
             slot.block_type,
             tokenizer.as_ref(),
             &mut replacements,
-            None, // PR-C2: no CCR store yet on the OpenAI path.
+            &ctx,
+            user_ask,
         );
         block_outcomes.push(outcome);
     }
@@ -2675,8 +2998,23 @@ const RESPONSES_OUTPUT_MIN_BYTES: usize = 512;
 /// input, never re-serialized.
 pub fn compress_openai_responses_live_zone(
     body_raw: &[u8],
-    _auth_mode: AuthMode,
+    auth_mode: AuthMode,
     model: &str,
+) -> Result<LiveZoneOutcome, LiveZoneError> {
+    compress_openai_responses_live_zone_with_options(
+        body_raw,
+        auth_mode,
+        model,
+        &LiveZoneOptions::default(),
+    )
+}
+
+/// Full-control Responses entry point (task query, policy, CCR store).
+pub fn compress_openai_responses_live_zone_with_options(
+    body_raw: &[u8],
+    auth_mode: AuthMode,
+    model: &str,
+    options: &LiveZoneOptions<'_>,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
     let parsed: Value = serde_json::from_slice(body_raw).map_err(LiveZoneError::BodyNotJson)?;
 
@@ -2779,6 +3117,15 @@ pub fn compress_openai_responses_live_zone(
     let tokenizer = get_tokenizer(model);
     let mut block_outcomes: Vec<BlockOutcome> = Vec::with_capacity(all_slots.len());
     let mut replacements: Vec<Replacement> = Vec::new();
+    let query = options
+        .query
+        .clone()
+        .unwrap_or_else(|| derive_query(items, is_responses_user_message));
+    let ctx = BlockCtx::new(
+        query,
+        policy_for(auth_mode, options.policy),
+        options.ccr_store,
+    );
 
     for (msg_idx, slot) in all_slots {
         // Output items must clear the response-output floor BEFORE the
@@ -2807,7 +3154,8 @@ pub fn compress_openai_responses_live_zone(
             slot.block_type,
             tokenizer.as_ref(),
             &mut replacements,
-            None, // PR-C3: no CCR store on the Responses path yet.
+            &ctx,
+            !slot.is_output_item,
         );
         block_outcomes.push(outcome);
     }

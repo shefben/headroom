@@ -40,9 +40,11 @@
 
 use bytes::Bytes;
 use headroom_core::auth_mode::AuthMode as RequestAuthMode;
+use headroom_core::compression_policy::CompressionPolicy;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{
-    compress_anthropic_live_zone, BlockAction, ExclusionReason, LiveZoneError, LiveZoneOutcome,
+    compress_anthropic_live_zone_with_options, BlockAction, ExclusionReason, LiveZoneError,
+    LiveZoneOptions, LiveZoneOutcome,
 };
 use serde_json::Value;
 
@@ -151,6 +153,28 @@ pub fn compress_anthropic_request(
     mode: CompressionMode,
     cache_control_policy: CacheControlAutoFrozen,
     auth_mode: RequestAuthMode,
+    request_id: &str,
+) -> Outcome {
+    compress_anthropic_request_with_policy(
+        body,
+        mode,
+        cache_control_policy,
+        auth_mode,
+        CompressionPolicy::for_mode(auth_mode),
+        request_id,
+    )
+}
+
+/// [`compress_anthropic_request`] with the request's resolved
+/// `CompressionPolicy` (honors `auth_mode_policy_enforcement`). The
+/// live-zone SafetyGate enforces its `max_lossy_ratio` and
+/// `volatile_token_threshold` on every block.
+pub fn compress_anthropic_request_with_policy(
+    body: &Bytes,
+    mode: CompressionMode,
+    cache_control_policy: CacheControlAutoFrozen,
+    auth_mode: RequestAuthMode,
+    policy: CompressionPolicy,
     request_id: &str,
 ) -> Outcome {
     if matches!(mode, CompressionMode::Off) {
@@ -355,7 +379,17 @@ pub fn compress_anthropic_request(
     // getting compression, not losing it). The plumbing here lets
     // F2.2 vary per-block thresholds by mode without touching this
     // call site again.
-    match compress_anthropic_live_zone(&dispatch_body, frozen_count, auth_mode.into(), model) {
+    let options = LiveZoneOptions {
+        policy: Some(policy),
+        ..LiveZoneOptions::default()
+    };
+    match compress_anthropic_live_zone_with_options(
+        &dispatch_body,
+        frozen_count,
+        auth_mode.into(),
+        model,
+        &options,
+    ) {
         Ok(LiveZoneOutcome::NoChange { manifest }) => {
             let block_count = manifest.block_outcomes.len();
             let blocks_excluded = manifest

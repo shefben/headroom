@@ -13,6 +13,8 @@
 //! expected rather than a defect.
 #![allow(dead_code)]
 
+use headroom_core::ccr::InMemoryCcrStore;
+use headroom_core::transforms::live_zone::compress_anthropic_live_zone_with_ccr;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{
     compress_anthropic_live_zone, AuthMode, BlockAction, CompressionManifest, LiveZoneOutcome,
@@ -25,8 +27,20 @@ pub fn body_of(value: &Value) -> Vec<u8> {
     serde_json::to_vec(value).expect("fixture body serializes")
 }
 
-/// Run the public dispatcher entry point with no frozen prefix.
+/// Run the dispatcher with no frozen prefix and a CCR store wired, the
+/// way every host with a retrieval path (Python proxy, PyO3) runs it:
+/// lossy drops are exactly recoverable, so the SafetyGate admits the
+/// aggressive rung and these routing / byte-fidelity tests see the
+/// compressor each content type routes to.
 pub fn dispatch(body: &[u8]) -> LiveZoneOutcome {
+    let store = InMemoryCcrStore::new();
+    compress_anthropic_live_zone_with_ccr(body, 0, AuthMode::Payg, DEFAULT_MODEL, Some(&store))
+        .expect("dispatcher returns Ok on valid bodies")
+}
+
+/// Run the dispatcher with no retrieval path (the native Rust proxy):
+/// irreversible loss is capped by the PAYG `max_lossy_ratio`.
+pub fn dispatch_without_store(body: &[u8]) -> LiveZoneOutcome {
     compress_anthropic_live_zone(body, 0, AuthMode::Payg, DEFAULT_MODEL)
         .expect("dispatcher returns Ok on valid bodies")
 }
