@@ -21,6 +21,36 @@ from typing import Any, Protocol, runtime_checkable
 # Tool name constant - used for matching tool calls
 CCR_TOOL_NAME = "headroom_retrieve"
 
+#: Optional selective-retrieval arguments (unified-21 #3). ``hash`` stays the
+#: only required argument and ``headroom_retrieve(hash)`` stays a byte-exact
+#: full retrieval.
+CCR_OPTIONAL_PROPERTIES: dict[str, Any] = {
+    "mode": {
+        "type": "string",
+        "enum": ["full", "search", "range", "metadata"],
+        "description": (
+            "full (default): exact original. search: top_k spans relevant to query. "
+            "range: spans start..end. metadata: entry shape (types, paths, symbols)."
+        ),
+    },
+    "query": {
+        "type": "string",
+        "description": "What you are looking for (mode=search; implies search when set).",
+    },
+    "top_k": {"type": "integer", "description": "Max spans to return (default 5)."},
+    "cursor": {"type": "string", "description": "Cursor from a previous result's has_more page."},
+    "start": {"type": "integer", "description": "First span ordinal (mode=range)."},
+    "end": {"type": "integer", "description": "Span ordinal to stop before (mode=range)."},
+}
+
+_CCR_DESCRIPTION = (
+    "Retrieve original uncompressed content that was compressed to save tokens. "
+    "Use this when you need more data than what's shown in compressed tool results. "
+    "The hash is provided in compression markers like [N items compressed... hash=abc123]. "
+    "With only hash it returns the exact original; pass query (mode=search) to get just "
+    "the most relevant spans, or mode=range/metadata to page through large originals."
+)
+
 
 @runtime_checkable
 class _HashOwnershipStore(Protocol):
@@ -55,11 +85,7 @@ def create_ccr_tool_definition(
         "type": "function",
         "function": {
             "name": CCR_TOOL_NAME,
-            "description": (
-                "Retrieve original uncompressed content that was compressed to save tokens. "
-                "Use this when you need more data than what's shown in compressed tool results. "
-                "The hash is provided in compression markers like [N items compressed... hash=abc123]."
-            ),
+            "description": _CCR_DESCRIPTION,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -67,6 +93,7 @@ def create_ccr_tool_definition(
                         "type": "string",
                         "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)",
                     },
+                    **CCR_OPTIONAL_PROPERTIES,
                 },
                 "required": ["hash"],
             },
@@ -80,11 +107,7 @@ def create_ccr_tool_definition(
         # Anthropic uses a slightly different format
         return {
             "name": CCR_TOOL_NAME,
-            "description": (
-                "Retrieve original uncompressed content that was compressed to save tokens. "
-                "Use this when you need more data than what's shown in compressed tool results. "
-                "The hash is provided in compression markers like [N items compressed... hash=abc123]."
-            ),
+            "description": _CCR_DESCRIPTION,
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -92,6 +115,7 @@ def create_ccr_tool_definition(
                         "type": "string",
                         "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)",
                     },
+                    **CCR_OPTIONAL_PROPERTIES,
                 },
                 "required": ["hash"],
             },
@@ -107,11 +131,7 @@ def create_ccr_tool_definition(
         return {
             "type": "function",
             "name": CCR_TOOL_NAME,
-            "description": (
-                "Retrieve original uncompressed content that was compressed to save tokens. "
-                "Use this when you need more data than what's shown in compressed tool results. "
-                "The hash is provided in compression markers like [N items compressed... hash=abc123]."
-            ),
+            "description": _CCR_DESCRIPTION,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -121,6 +141,7 @@ def create_ccr_tool_definition(
                             "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)"
                         ),
                     },
+                    **CCR_OPTIONAL_PROPERTIES,
                 },
                 "required": ["hash"],
             },
@@ -141,6 +162,7 @@ def create_ccr_tool_definition(
                         "type": "string",
                         "description": "Hash key from the compression marker",
                     },
+                    **CCR_OPTIONAL_PROPERTIES,
                 },
                 "required": ["hash"],
             },
@@ -570,6 +592,43 @@ class CCRToolInjector:
         updated_messages = self.inject_into_system_message(messages)
 
         return updated_messages, updated_tools if updated_tools else None, was_injected
+
+
+def parse_retrieval_args(
+    tool_call: dict[str, Any],
+    provider: str = "anthropic",
+) -> dict[str, Any]:
+    """Optional selective-retrieval arguments of a CCR tool call.
+
+    Returns only the recognised optional keys (``mode``, ``query``, ``top_k``,
+    ``cursor``, ``start``, ``end``) that are present; ``{}`` for a plain
+    ``headroom_retrieve(hash)`` (a byte-exact full retrieval).
+    """
+    if parse_tool_call(tool_call, provider) is None:
+        return {}
+    input_data = _tool_call_input(tool_call, provider)
+    if not isinstance(input_data, dict):
+        return {}
+    return {k: input_data[k] for k in CCR_OPTIONAL_PROPERTIES if input_data.get(k) is not None}
+
+
+def _tool_call_input(tool_call: dict[str, Any], provider: str) -> Any:
+    if provider == "anthropic":
+        return tool_call.get("input", {})
+    if provider == "openai":
+        function = tool_call.get("function") or {}
+        args_str = function.get("arguments", "{}")
+    elif provider == "google":
+        function_call = tool_call.get("functionCall") or {}
+        return function_call.get("args", {})
+    elif provider == "openai_responses":
+        args_str = tool_call.get("arguments", "{}")
+    else:
+        return tool_call.get("input", tool_call.get("args", {}))
+    try:
+        return json.loads(args_str)
+    except (json.JSONDecodeError, TypeError):
+        return {}
 
 
 def parse_tool_call(

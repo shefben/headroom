@@ -502,22 +502,74 @@ class ContextTracker:
     def execute_expansions(
         self,
         recommendations: list[ExpansionRecommendation],
+        *,
+        query: str = "",
+        max_tokens: int = 1200,
+        top_k: int = 5,
     ) -> list[dict[str, Any]]:
         """Execute expansion recommendations and return the expanded content.
 
+        Unified-21 #3: expansion is *selective*. With a ``query`` each entry
+        contributes only its most relevant spans from the indexed CCR, and all
+        expansions together stay under ``max_tokens`` (default 1200). The full
+        original is used only when localization is impossible (no ranked span)
+        and it fits the remaining budget; otherwise the entry is skipped and its
+        marker stays in context for an explicit ``headroom_retrieve``.
+
         Args:
             recommendations: List of expansion recommendations.
+            query: The turn's relevance query.
+            max_tokens: Token budget shared by every expansion of this turn.
+            top_k: Max spans per entry.
 
         Returns:
             List of expanded content dicts with hash, content, and metadata.
         """
+        from .indexed import estimate_tokens, get_indexed_ccr
+
         store = get_compression_store()
+        index = get_indexed_ccr()
         results = []
+        remaining = max_tokens
 
         for rec in recommendations:
+            if remaining <= 0:
+                break
             try:
-                # Retrieval is by hash: proactive expansion always restores the
-                # full original content (no partial/search expansion).
+                spans: list[dict[str, Any]] = []
+                if query.strip():
+                    found = index.retrieve(
+                        store,
+                        rec.hash_key,
+                        mode="search",
+                        query=query,
+                        top_k=top_k,
+                        max_tokens=remaining,
+                    )
+                    spans = [r for r in found.get("results") or () if not r.get("span_truncated")]
+                if spans:
+                    content = "\n".join(
+                        f"[span {r['ordinal']} of {rec.hash_key}]\n{r['text']}" for r in spans
+                    )
+                    used = sum(estimate_tokens(r["text"]) for r in spans)
+                    results.append(
+                        {
+                            "hash": rec.hash_key,
+                            "type": "spans",
+                            "content": content,
+                            "spans": [r["span_id"] for r in spans],
+                            "item_count": len(spans),
+                            "reason": rec.reason,
+                        }
+                    )
+                    remaining -= used
+                    logger.info(
+                        f"CCR Tracker: Proactively expanded {len(spans)} span(s) of {rec.hash_key}"
+                    )
+                    continue
+                original = store.peek_original(rec.hash_key)
+                if original is None or estimate_tokens(original) > remaining:
+                    continue
                 entry = store.retrieve(rec.hash_key)
                 if entry:
                     results.append(
@@ -529,9 +581,10 @@ class ContextTracker:
                             "reason": rec.reason,
                         }
                     )
+                    remaining -= estimate_tokens(entry.original_content)
                     logger.info(
-                        f"CCR Tracker: Proactively expanded {rec.hash_key} "
-                        f"({entry.original_item_count} items)"
+                        f"CCR Tracker: Proactively expanded {rec.hash_key} in full "
+                        f"({entry.original_item_count} items; no localizable span)"
                     )
             except Exception as e:
                 logger.warning(f"CCR Tracker: Failed to expand {rec.hash_key}: {e}")

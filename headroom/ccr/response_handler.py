@@ -15,13 +15,15 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
 from headroom.proxy.anthropic_wire import AnthropicSSEEnvelope
 
 from ..cache.compression_store import format_retrieval_miss_detail, get_compression_store
+from .indexed import retrieve_with_args, selective_args
 from .tool_calls import (
     CCRToolCall,
     drop_tool_calls,
@@ -30,9 +32,15 @@ from .tool_calls import (
     is_ccr_tool_call,
     parse_ccr_tool_calls,
 )
-from .tool_injection import CCR_TOOL_NAME
+from .tool_injection import CCR_TOOL_NAME, CCRToolInjector
 
 logger = logging.getLogger(__name__)
+
+#: (reachable CCR hashes, workspace key) of the conversation a retrieval round
+#: serves. ``None`` reachability (direct callers) means "hash knowledge only".
+_RETRIEVAL_SCOPE: ContextVar[tuple[Collection[str] | None, str]] = ContextVar(
+    "headroom_ccr_retrieval_scope", default=(None, "")
+)
 
 # Residual-CCR status signals (provider-generic).
 #
@@ -187,6 +195,16 @@ class CCRResponseHandler:
     def _execute_retrieval(self, ccr_call: CCRToolCall) -> CCRToolResult:
         """Execute a CCR retrieval.
 
+        A plain ``headroom_retrieve(hash)`` returns the full original
+        byte-for-byte (unchanged behavior). Selective arguments
+        (``mode``/``query``/``top_k``/``cursor``/``start``/``end``) are served by
+        the indexed CCR, restricted to entries whose markers are reachable in
+        the requesting conversation and with cursors bound to ``workspace``.
+
+        The conversation scope (reachable hashes, workspace key) comes from
+        :data:`_RETRIEVAL_SCOPE`, set by :meth:`handle_response` for the
+        duration of one retrieval round.
+
         Args:
             ccr_call: The CCR tool call to execute.
 
@@ -194,6 +212,34 @@ class CCRResponseHandler:
             CCRToolResult with the retrieved content.
         """
         store = get_compression_store()
+        reachable, workspace = _RETRIEVAL_SCOPE.get()
+
+        if selective_args(ccr_call.args):
+            try:
+                data = retrieve_with_args(
+                    store,
+                    ccr_call.hash_key,
+                    ccr_call.args,
+                    workspace=workspace,
+                    reachable=reachable,
+                )
+            except Exception as e:  # noqa: BLE001 - surfaced to the model, never raised
+                logger.error(f"CCR indexed retrieval failed for {ccr_call.hash_key}: {e}")
+                data = {"error": f"Retrieval failed: {e}", "hash": ccr_call.hash_key}
+            ok = "error" not in data
+            if ok:
+                # Same feedback/telemetry side effect a full retrieval records.
+                try:
+                    store.retrieve(ccr_call.hash_key, query=str(ccr_call.args.get("query") or ""))
+                except Exception:  # noqa: BLE001 - feedback is best effort
+                    pass
+            return CCRToolResult(
+                tool_call_id=ccr_call.tool_call_id,
+                content=json.dumps(data, indent=2),
+                success=ok,
+                items_retrieved=len(data.get("results") or ()) if ok else 0,
+                tool_name=ccr_call.tool_name,
+            )
 
         try:
             get_status = getattr(store, "get_entry_status", None)
@@ -443,6 +489,8 @@ class CCRResponseHandler:
             [list[dict[str, Any]], list[dict[str, Any]] | None], Awaitable[dict[str, Any]]
         ],
         provider: str = "anthropic",
+        *,
+        workspace: str = "",
     ) -> dict[str, Any]:
         """Handle CCR tool calls in a response.
 
@@ -520,8 +568,15 @@ class CCRResponseHandler:
 
             logger.info(f"CCR: Handling {len(ccr_calls)} retrieval(s) in round {rounds}")
 
-            # Execute all CCR retrievals
-            results = [self._execute_retrieval(call) for call in ccr_calls]
+            # Execute all CCR retrievals. Selective (indexed) retrievals may
+            # only touch entries whose markers this conversation carries.
+            scope = _RETRIEVAL_SCOPE.set(
+                (set(CCRToolInjector().scan_for_markers(current_messages)), workspace)
+            )
+            try:
+                results = [self._execute_retrieval(call) for call in ccr_calls]
+            finally:
+                _RETRIEVAL_SCOPE.reset(scope)
 
             # Log retrieval stats
             total_items = sum(r.items_retrieved for r in results)

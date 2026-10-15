@@ -80,6 +80,8 @@ from headroom.ccr import (
     ResponseHandlerConfig,
     parse_tool_call,
 )
+from headroom.ccr.indexed import retrieve_with_args, selective_args
+from headroom.ccr.tool_injection import parse_retrieval_args
 from headroom.config import (
     DEFAULT_EXCLUDE_TOOLS,
     CacheAlignerConfig,
@@ -5705,9 +5707,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         Request body:
             hash (str): Hash key from compression marker (required)
+            mode/query/top_k/cursor/start/end (optional): selective
+                retrieval through the indexed CCR (unified-21 #3).
+            workspace (str, optional): workspace key cursors bind to.
 
         Response:
-            {"hash": "...", "original_content": "...", ...}
+            {"hash": "...", "original_content": "...", ...} (full), or the
+            indexed result (spans with hash, span id, score, ordinal,
+            has_more/cursor and completeness).
         """
         data = await request.json()
         hash_key = data.get("hash")
@@ -5716,6 +5723,19 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="hash required")
 
         store = get_compression_store()
+
+        if selective_args(data):
+            result = retrieve_with_args(
+                store, hash_key, data, workspace=str(data.get("workspace") or "")
+            )
+            if result.get("status") == "missing":
+                raise HTTPException(
+                    status_code=404,
+                    detail=format_retrieval_miss_detail(
+                        store.get_entry_status(hash_key, clean_expired=True)
+                    ),
+                )
+            return result
 
         entry_status = store.get_entry_status(hash_key, clean_expired=True)
         if entry_status["status"] != "available":
@@ -6046,9 +6066,39 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
 
     @app.get("/v1/retrieve/{hash_key}", dependencies=[Depends(_require_loopback)])
-    async def ccr_retrieve_get(hash_key: str):
-        """GET version of CCR retrieve for easier testing."""
+    async def ccr_retrieve_get(
+        hash_key: str,
+        mode: str | None = None,
+        query: str | None = None,
+        top_k: int | None = None,
+        cursor: str | None = None,
+        start: int | None = None,
+        end: int | None = None,
+    ):
+        """GET version of CCR retrieve for easier testing (same optional args)."""
         store = get_compression_store()
+        args = {
+            k: v
+            for k, v in (
+                ("mode", mode),
+                ("query", query),
+                ("top_k", top_k),
+                ("cursor", cursor),
+                ("start", start),
+                ("end", end),
+            )
+            if v is not None
+        }
+        if selective_args(args):
+            result = retrieve_with_args(store, hash_key, args)
+            if result.get("status") == "missing":
+                raise HTTPException(
+                    status_code=404,
+                    detail=format_retrieval_miss_detail(
+                        store.get_entry_status(hash_key, clean_expired=True)
+                    ),
+                )
+            return result
         entry_status = store.get_entry_status(hash_key, clean_expired=True)
 
         if entry_status["status"] != "available":
@@ -6132,8 +6182,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # Perform retrieval
         store = get_compression_store()
         entry_status = store.get_entry_status(hash_key, clean_expired=True)
+        retrieval_args = parse_retrieval_args(tool_call, provider)
 
-        if entry_status["status"] != "available":
+        if entry_status["status"] == "available" and selective_args(retrieval_args):
+            retrieval_data = retrieve_with_args(store, hash_key, retrieval_args)
+        elif entry_status["status"] != "available":
             retrieval_data = {
                 "error": format_retrieval_miss_detail(entry_status),
                 "hash": hash_key,

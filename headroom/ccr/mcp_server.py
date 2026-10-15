@@ -36,6 +36,8 @@ from typing import TYPE_CHECKING, Any
 from headroom import paths as _paths
 from headroom import savings_ledger
 from headroom.cache.compression_store import format_retrieval_miss_detail
+from headroom.ccr.indexed import retrieve_with_args, selective_args
+from headroom.ccr.tool_injection import CCR_OPTIONAL_PROPERTIES
 from headroom.log_safety import describe_exception, redact_url, safe_id
 from headroom.telemetry import session as telemetry_session
 
@@ -582,16 +584,38 @@ class HeadroomMCPServer:
             "compressed by the proxy uses the configured CCR TTL.",
         }
 
+    async def _retrieve_selective(self, hash_key: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Indexed (search/range/metadata) retrieval: session store, then proxy.
+
+        The MCP server's local store holds only this session's compressions,
+        so an entry found there is session-reachable; a proxy entry is served by
+        the proxy's ``/v1/retrieve`` with the same arguments.
+        """
+        store = self._get_local_store()
+        if store.peek_original(hash_key) is not None:
+            self._stats.record_retrieval(hash_key)
+            return retrieve_with_args(store, hash_key, args, workspace="mcp")
+        if self.check_proxy and HTTPX_AVAILABLE:
+            try:
+                return await self._retrieve_via_proxy(hash_key, args)
+            except Exception as exc:  # noqa: BLE001 - reported to the caller
+                return {
+                    "error": f"proxy retrieval failed: {describe_exception(exc)}",
+                    "hash": hash_key,
+                }
+        return {"error": "Content not found. It may have expired.", "hash": hash_key}
+
     async def _retrieve_via_proxy(
         self,
         hash_key: str,
+        args: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Retrieve full content by hash via proxy's HTTP endpoint."""
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(timeout=15.0)
 
         url = f"{self.proxy_url}/v1/retrieve"
-        payload: dict[str, str] = {"hash": hash_key}
+        payload: dict[str, Any] = {"hash": hash_key, **(args or {})}
 
         response = await self._http_client.post(url, json=payload)
 
@@ -689,7 +713,9 @@ class HeadroomMCPServer:
                         "Retrieve original uncompressed content by hash. "
                         "Use this when you need full details from previously compressed content. "
                         "The hash comes from headroom_compress results or from compression "
-                        "markers like [N items compressed... hash=abc123]."
+                        "markers like [N items compressed... hash=abc123]. With only hash it "
+                        "returns the exact original; pass query (mode=search) for just the "
+                        "most relevant spans, or mode=range/metadata to page large originals."
                     ),
                     inputSchema={
                         "type": "object",
@@ -698,6 +724,7 @@ class HeadroomMCPServer:
                                 "type": "string",
                                 "description": "Hash key from compression (e.g., 'abc123' from hash=abc123)",
                             },
+                            **CCR_OPTIONAL_PROPERTIES,
                         },
                         "required": ["hash"],
                     },
@@ -884,7 +911,11 @@ class HeadroomMCPServer:
             ]
 
         logger.info("event=mcp_retrieve_started hash=%s", hash_key)
-        result = await self._retrieve_content(hash_key)
+        args = {k: arguments[k] for k in CCR_OPTIONAL_PROPERTIES if arguments.get(k) is not None}
+        if selective_args(args):
+            result = await self._retrieve_selective(hash_key, args)
+        else:
+            result = await self._retrieve_content(hash_key)
         logger.info(
             "event=mcp_retrieve_completed hash=%s result=%s",
             hash_key,
