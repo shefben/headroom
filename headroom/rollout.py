@@ -130,6 +130,18 @@ FEATURES: dict[str, FeatureSpec] = {
             "to Bedrock models that support prompt caching (opt-in)."
         ),
     ),
+    "agent_runtime": FeatureSpec(
+        name="agent_runtime",
+        available_in=RolloutChannel.STABLE,
+        # Observe-only foundation: normalizes request turns into session-scoped
+        # agent events and keeps the local JevK5 advisor available. It never
+        # rewrites a request by itself, but it does create local state, so it
+        # stays opt-in until the later phases' acceptance gate.
+        description=(
+            "Shared agent runtime: session-scoped events, local state store and "
+            "the JevK5 decision advisor (opt-in)."
+        ),
+    ),
 }
 
 

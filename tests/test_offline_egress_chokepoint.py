@@ -2248,8 +2248,8 @@ def _python_egress_sites(source: str) -> list[_Site]:
 #                     the operator configured — the proxy's actual job, and
 #                     the reason an air-gapped deployment runs one at all.
 #   operator-endpoint Headroom dialling an address that comes entirely from
-#                     operator configuration and defaults to loopback. Exactly
-#                     one thing qualifies today (the Ollama embedder). A
+#                     operator configuration and defaults to loopback. Two things
+#                     qualify today (the Ollama embedder, the JevK5 endpoint). A
 #                     hard-coded internet host may never hide behind this.
 #   cache-only        the call provably cannot reach the network because the
 #                     surrounding code forces the HuggingFace stack offline for
@@ -2349,6 +2349,16 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "its duration, so a pre-seeded eval dataset loads from the cache and a "
         "cold one raises without opening a socket. The network load below it "
         "calls guard_egress first.",
+    ),
+    "intelligence/transport.py": (
+        1,
+        "operator-endpoint: http_json is the single transport to the JevK5 decision "
+        "endpoint, which is either the Headroom-managed llama-server bound to 127.0.0.1 "
+        "or an operator-configured HEADROOM_JEVK5_LLAMA_URL / HEADROOM_JEVK5_SYSTEMONE_URL. "
+        "Headroom ships no internet host here; under HEADROOM_OFFLINE a non-loopback "
+        "endpoint is refused through guard_egress before the request is built (a "
+        "conditional guard, so the scanner cannot see it dominate). Model downloads "
+        "live in intelligence/model.py and are guarded.",
     ),
     "relevance/embedding.py": (
         1,

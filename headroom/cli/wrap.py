@@ -9247,6 +9247,38 @@ def unwrap_zcode(port: int, no_stop_proxy: bool) -> None:
     click.echo()
 
 
+def _agent_runtime_mismatches(running_config: Mapping[str, Any]) -> list[str]:
+    """Agent-runtime settings this session asked for that a reused proxy ignores.
+
+    Only compared when the running proxy reports the keys (older proxies do
+    not), so a shared/reused proxy reports the difference instead of silently
+    dropping the session's agent features.
+    """
+    out: list[str] = []
+    running_agent = running_config.get("agent_runtime")
+    if isinstance(running_agent, bool):
+        from headroom.rollout import resolve_rollout
+
+        try:
+            requested_agent = resolve_rollout(os.environ).is_enabled("agent_runtime")
+        except Exception:  # noqa: BLE001 - an invalid local env must not break reuse
+            requested_agent = running_agent
+        if requested_agent != running_agent:
+            out.append(
+                f"agent_runtime={'on' if requested_agent else 'off'} "
+                f"(running: {'on' if running_agent else 'off'})"
+            )
+    running_policy = running_config.get("jevk5_policy")
+    requested_policy_raw = os.environ.get("HEADROOM_JEVK5")
+    if isinstance(running_policy, str) and requested_policy_raw:
+        from headroom.intelligence.settings import ServicePolicy
+
+        requested_policy = ServicePolicy.parse(requested_policy_raw).value
+        if requested_policy != running_policy:
+            out.append(f"HEADROOM_JEVK5={requested_policy} (running: {running_policy})")
+    return out
+
+
 def _warn_proxy_mode_mismatch(running_config: dict[str, Any] | None) -> None:
     """Warn when reuse ignores this session's startup-only settings.
 
@@ -9283,6 +9315,8 @@ def _warn_proxy_mode_mismatch(running_config: dict[str, Any] | None) -> None:
                 f"HEADROOM_EXCLUDE_TOOLS={sorted(requested_names)!r} "
                 f"(running: {sorted(running_names)!r})"
             )
+
+    mismatches.extend(_agent_runtime_mismatches(config))
 
     if mismatches:
         click.echo(

@@ -174,6 +174,7 @@ from headroom.proxy.project_context import (
     classify_project,
     set_current_project,
     set_registered_cwd,
+    set_registered_session,
     strip_project_path_prefix,
 )
 from headroom.proxy.prometheus_metrics import PrometheusMetrics
@@ -3345,6 +3346,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 if _cc_reconciler is not None and _beacon_is_owner[0]:
                     await _cc_reconciler.start()
 
+                from headroom.agent.install import start_agent_runtime
+
+                start_agent_runtime(app)
+
                 app.state.ready = True
                 yield
             except Exception as exc:
@@ -3425,6 +3430,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             proxy._background_compression_executor.shutdown(wait=False)
             if proxy.code_graph_watcher:
                 proxy.code_graph_watcher.stop()
+            from headroom.agent.install import stop_agent_runtime
+
+            await _timed(
+                asyncio.to_thread(stop_agent_runtime, app),
+                label="agent_runtime.stop",
+                timeout=5.0,
+            )
             await _timed(proxy.shutdown(), label="proxy.shutdown", timeout=5.0)
             shutdown_headroom_tracing()
             shutdown_otel_metrics()
@@ -3712,6 +3724,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         app.state.previous_loop_exception_handler = previous_handler
         return previous_handler
 
+    def _jevk5_policy() -> str:
+        intelligence = getattr(app.state, "agent_intelligence", None)
+        if intelligence is not None:
+            return str(intelligence.settings.policy.value)
+        from headroom.intelligence.settings import ServicePolicy
+
+        return ServicePolicy.parse(os.environ.get("HEADROOM_JEVK5")).value
+
     def _health_payload(*, include_config: bool) -> dict[str, Any]:
         checks = _health_checks()
         # Kompress is an optional soft component: model downloads lazily on
@@ -3825,7 +3845,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 # actually using and hot-sync it via /admin/runtime-env.
                 "runtime_env": runtime_env.effective_runtime_env(),
                 "pid": os.getpid(),
+                # Startup-fixed agent settings, compared by `headroom wrap`
+                # when it reuses this proxy so a mismatch is reported.
+                "agent_runtime": bool(
+                    proxy.config.rollout and proxy.config.rollout.is_enabled("agent_runtime")
+                ),
+                "jevk5_policy": _jevk5_policy(),
             }
+            from headroom.agent.install import agent_runtime_health
+
+            payload["agent_runtime"] = agent_runtime_health(app, proxy.config)
         return payload
 
     # ---------------------------------------------------------------------------
@@ -3942,9 +3971,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # Non-None only if a live wrap session registered this exact token
         # (workspace_registry.py) -- the caller-supplied x-headroom-cwd
         # header is never itself sufficient authority.
-        set_registered_cwd(
-            resolve_registered_cwd(config.port, headers.get("x-headroom-session-token"))
-        )
+        _session_token = headers.get("x-headroom-session-token")
+        _registered_cwd = resolve_registered_cwd(config.port, _session_token)
+        set_registered_cwd(_registered_cwd)
+        set_registered_session(_session_token, _registered_cwd)
         # Path-based Codex identification: stamp X-Client: codex on the
         # Responses endpoint for callers that don't otherwise classify (e.g.
         # Codex Desktop, whose User-Agent isn't a known codex UA). Without it
@@ -4109,6 +4139,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     from headroom.proxy.extensions import install_all as _install_extensions
 
     _install_extensions(app, config, enabled=getattr(config, "proxy_extensions", None))
+
+    # First-party agent runtime (shared events/state + JevK5 advisor). Installed
+    # centrally so wrapped sessions need no third-party extension opt-in; a
+    # no-op (no hook registered) unless the `agent_runtime` rollout feature is
+    # enabled. Registers exactly one stream-safe TurnHook at priority 80.
+    from headroom.agent.install import install_agent_runtime as _install_agent_runtime
+
+    _install_agent_runtime(app, config)
 
     # Body ceiling for everything inside it (extensions and handlers alike).
     # The handlers keep their own streaming check — this layer exists so that

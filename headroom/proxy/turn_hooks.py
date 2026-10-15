@@ -148,6 +148,17 @@ def register_turn_hook(hook: TurnHook) -> None:
     )
 
 
+def unregister_turn_hook(name: str) -> bool:
+    """Remove every registered hook named ``name``; returns whether any was removed.
+
+    Used by first-party installers so re-creating the app in one process (the
+    test suite, embedded callers) never leaves a stale or duplicate hook.
+    """
+    before = len(_hooks)
+    _hooks[:] = [hook for hook in _hooks if getattr(hook, "name", None) != name]
+    return len(_hooks) != before
+
+
 def registered_turn_hooks() -> list[TurnHook]:
     """Registered hooks in run order: ``priority`` ascending, registration
     order for ties."""

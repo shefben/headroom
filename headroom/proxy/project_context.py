@@ -64,6 +64,31 @@ def get_registered_cwd() -> str | None:
     return _current_registered_cwd.get()
 
 
+# Digest of the session token, bound only when the token matched a live wrap
+# marker (i.e. alongside a non-None registered cwd). The raw token is never
+# kept in a contextvar; the agent runtime derives its session id from this.
+_current_registered_session: ContextVar[str | None] = ContextVar(
+    "headroom_current_registered_session", default=None
+)
+
+
+def set_registered_session(session_token: str | None, registered_cwd: str | None) -> None:
+    """Bind the verified session digest; ``None`` unless the token resolved a cwd."""
+    if not session_token or not registered_cwd:
+        _current_registered_session.set(None)
+        return
+    import hashlib
+
+    _current_registered_session.set(
+        hashlib.sha256(session_token.encode("utf-8", "replace")).hexdigest()
+    )
+
+
+def get_registered_session() -> str | None:
+    """Verified session digest for the current request, or ``None``."""
+    return _current_registered_session.get()
+
+
 def strip_project_path_prefix(scope: MutableMapping[str, Any]) -> str | None:
     """Strip a ``/p/<name>`` prefix from an ASGI scope, returning the name.
 
@@ -82,8 +107,10 @@ __all__ = [
     "classify_project",
     "get_current_project",
     "get_registered_cwd",
+    "get_registered_session",
     "set_current_project",
     "set_registered_cwd",
+    "set_registered_session",
     "split_project_path",
     "strip_project_path_prefix",
     "with_project_prefix",

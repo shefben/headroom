@@ -51,6 +51,7 @@ HEADROOM_SAVINGS_EVENTS_PATH_ENV = "HEADROOM_SAVINGS_EVENTS_PATH"
 HEADROOM_TOIN_PATH_ENV = "HEADROOM_TOIN_PATH"
 HEADROOM_SUBSCRIPTION_STATE_PATH_ENV = "HEADROOM_SUBSCRIPTION_STATE_PATH"
 HEADROOM_SETTINGS_PATH_ENV = "HEADROOM_SETTINGS_PATH"
+HEADROOM_AGENT_STATE_DB_ENV = "HEADROOM_AGENT_STATE_DB"
 
 # ---------------------------------------------------------------------------
 # Default sub-path fragments
@@ -83,6 +84,9 @@ _BIN_DIR = "bin"
 _PROXY_CLIENTS_DIR = "clients"
 _DEPLOY_DIR = "deploy"
 _PLUGINS_DIR = "plugins"
+_AGENT_DIR = "agent"
+_AGENT_STATE_DB_FILE = "agent_state.db"
+_INTELLIGENCE_DIR = "intelligence"
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +296,27 @@ def memory_db_path() -> Path:
     return workspace_dir() / _MEMORY_DB_FILE
 
 
+def agent_state_db_path(explicit: str | os.PathLike[str] | None = None) -> Path:
+    """Return the shared agent-runtime SQLite path (events + projections).
+
+    Precedence: explicit argument > ``HEADROOM_AGENT_STATE_DB`` >
+    ``$HEADROOM_WORKSPACE_DIR/agent/agent_state.db``. Callers must consult
+    :func:`persistence_allowed` before creating it.
+    """
+
+    return _resolve(
+        explicit,
+        HEADROOM_AGENT_STATE_DB_ENV,
+        workspace_dir() / _AGENT_DIR / _AGENT_STATE_DB_FILE,
+    )
+
+
+def intelligence_dir() -> Path:
+    """Return the local-intelligence root (JevK5 models, managed llama-server state)."""
+
+    return workspace_dir() / _INTELLIGENCE_DIR
+
+
 def native_memory_dir() -> Path:
     """Return the default native-memory directory."""
 
@@ -478,6 +503,7 @@ __all__ = [
     "HEADROOM_SAVINGS_EVENTS_PATH_ENV",
     "HEADROOM_TOIN_PATH_ENV",
     "HEADROOM_SUBSCRIPTION_STATE_PATH_ENV",
+    "HEADROOM_AGENT_STATE_DB_ENV",
     "HEADROOM_SETTINGS_PATH_ENV",
     "set_process_stateless",
     "process_is_stateless",
@@ -490,6 +516,8 @@ __all__ = [
     "toin_path",
     "subscription_state_path",
     "memory_db_path",
+    "agent_state_db_path",
+    "intelligence_dir",
     "native_memory_dir",
     "license_cache_path",
     "session_stats_path",
