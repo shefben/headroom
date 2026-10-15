@@ -29,10 +29,9 @@ from pathlib import Path
 from typing import Any
 
 from headroom import fileperms
-from headroom._subprocess import pid_alive
 from headroom.agent.private_fs import atomic_write_json, read_json, secure_dir
 from headroom.intelligence.discovery import LlamaBinary
-from headroom.intelligence.process import matches_owned, process_info, terminate
+from headroom.intelligence.process import is_running, matches_owned, process_info, terminate
 from headroom.intelligence.settings import IntelligenceSettings
 from headroom.intelligence.transport import LlamaProbe, llama_health, probe_llama_server
 
@@ -144,7 +143,7 @@ class ServiceManager:
         if self.settings.llama_url:
             return ("llama-server", self.settings.llama_url)
         manifest = self.read_manifest()
-        if manifest and pid_alive(int(manifest.get("pid") or 0)):
+        if manifest and is_running(int(manifest.get("pid") or 0)):
             return ("llama-server", str(manifest["url"]))
         return None
 
@@ -195,7 +194,7 @@ class ServiceManager:
                     holder = int(self.lock_path.read_text(encoding="utf-8").strip() or 0)
                 except (OSError, ValueError):
                     holder = 0
-                if not pid_alive(holder):
+                if not is_running(holder):
                     self.lock_path.unlink(missing_ok=True)
                     continue
                 if time.monotonic() > deadline:
@@ -363,7 +362,7 @@ class ServiceManager:
         owned, reason = self._owned_process_ok(manifest)
         pid = int(manifest.get("pid") or 0)
         if not owned:
-            if not pid_alive(pid):
+            if not is_running(pid):
                 self.manifest_path.unlink(missing_ok=True)
                 return False, "recorded llama-server is not running (stale record removed)"
             # Alive but not provably ours: never signal it. Drop the stale record.

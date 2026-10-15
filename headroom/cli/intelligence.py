@@ -129,5 +129,5 @@ def stop_cmd() -> None:
     """Stop the Headroom-managed llama-server (never an operator or foreign process)."""
     stopped, detail = _manager().stop()
     click.echo(detail)
-    if not stopped and "no managed" not in detail and "not running" not in detail:
+    if not stopped and ("refusing" in detail or "did not exit" in detail):
         sys.exit(1)

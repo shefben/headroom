@@ -18,6 +18,41 @@ from dataclasses import dataclass
 
 from headroom._subprocess import pid_alive
 
+_STILL_ACTIVE = 259
+
+
+def _windows_running(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+    if not handle:
+        return bool(kernel32.GetLastError() == 5)  # access denied => exists
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True
+        return code.value == _STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def is_running(pid: int) -> bool:
+    """True while ``pid`` is a running process.
+
+    On Windows an exited process stays openable while any handle to it is
+    open, so liveness is decided by its exit code, not by OpenProcess alone.
+    """
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            return _windows_running(pid)
+        except (OSError, AttributeError, ValueError):
+            return pid_alive(pid)
+    return pid_alive(pid)
+
 
 @dataclass(frozen=True)
 class ProcessInfo:
@@ -91,7 +126,7 @@ def _linux_info(pid: int) -> ProcessInfo | None:
 
 
 def process_info(pid: int) -> ProcessInfo | None:
-    if pid <= 0 or not pid_alive(pid):
+    if not is_running(pid):
         return None
     try:
         import psutil  # type: ignore[import-untyped]
@@ -161,7 +196,7 @@ def terminate(pid: int, *, timeout: float = 10.0) -> bool:
                 pass
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not pid_alive(pid):
+        if not is_running(pid):
             return True
         time.sleep(0.1)
     if sys.platform != "win32":
@@ -173,4 +208,4 @@ def terminate(pid: int, *, timeout: float = 10.0) -> bool:
             except OSError:
                 pass
         time.sleep(0.2)
-    return not pid_alive(pid)
+    return not is_running(pid)

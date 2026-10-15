@@ -327,7 +327,8 @@ class DecisionAdvisor:
             self._record_failure(exc)
             return None
         except (TransportError, ValueError, KeyError, TypeError, ImportError) as exc:
-            self._record_failure(exc)
+            # A socket timeout sized to the remaining budget is the deadline firing.
+            self._record_failure(exc, timeout=deadline.remaining() <= 0.01)
             return None
         with self._lock:
             self._breaker.success()
