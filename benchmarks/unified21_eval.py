@@ -647,6 +647,7 @@ class PythonProxyPath:
         profile = get_agent_savings_profile(DEFAULT_PROFILE)
         apply_agent_savings_env_defaults(os.environ, profile)
         self.config = ProxyConfig(
+            **self._extra_config(),
             savings_profile=profile.name,
             mode=profile.proxy_mode,
             code_aware_enabled=profile.code_aware,
@@ -661,6 +662,10 @@ class PythonProxyPath:
         self._policy = resolve_policy
         self._query = extract_user_query
         self.tokenizer = self.proxy.anthropic_pipeline._get_tokenizer(MODEL)
+
+    @staticmethod
+    def _extra_config() -> dict[str, Any]:
+        return {}
 
     def run(self, fx: Fixture) -> PathResult:
         res = PathResult(self.name)
@@ -695,6 +700,19 @@ class PythonProxyPath:
         res.structure_valid = _anthropic_structure_ok(original, forwarded)
         _score_facts(res, fx.must_keep, _texts_from_anthropic(forwarded))
         return res
+
+
+class PythonProxyWrapPath(PythonProxyPath):
+    """The same pipeline with the rollout ``headroom wrap`` launches (Phase 4+:
+    tool admission on). Kept separate so the bare-proxy series stays comparable."""
+
+    name = "python_proxy_anthropic_wrap"
+
+    @staticmethod
+    def _extra_config() -> dict[str, Any]:
+        from headroom.rollout import apply_wrap_feature_defaults, resolve_rollout
+
+        return {"rollout": resolve_rollout(apply_wrap_feature_defaults({}))}
 
 
 def _anthropic_structure_ok(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> bool:
@@ -840,7 +858,7 @@ def _run_eval(label: str, fixtures: list[Fixture]) -> dict[str, Any]:
 
     paths: list[Any] = []
     init_failures: dict[str, str] = {}
-    for cls in (PythonProxyPath, RustLiveZonePath):
+    for cls in (PythonProxyPath, PythonProxyWrapPath, RustLiveZonePath):
         try:
             paths.append(cls())
         except Exception as exc:
@@ -859,7 +877,7 @@ def _run_eval(label: str, fixtures: list[Fixture]) -> dict[str, Any]:
             "paths": {},
         }
         for p in paths:
-            if p.name == PythonProxyPath.name and not fx.messages:
+            if isinstance(p, PythonProxyPath) and not fx.messages:
                 continue
             r = p.run(fx)
             if r is None:
