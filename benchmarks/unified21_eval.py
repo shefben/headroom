@@ -24,6 +24,14 @@ fidelity, structural validity of the forwarded body, wall time, and any error.
 Run::
 
     python -m benchmarks.unified21_eval --label baseline --out benchmarks/results/baseline.json
+
+``--jevk5 off|on`` additionally installs the agent runtime for the wrap path
+exactly as ``create_app`` does (``install_agent_runtime``), with the JevK5
+service policy ``HEADROOM_JEVK5`` set to the given value, so the transform
+arbiter reaches the real ``DecisionAdvisor``. The advisor is activated
+synchronously (``on`` reuses a running managed llama-server, or the one named by
+``HEADROOM_JEVK5_LLAMA_URL``), and every advisor call's latency is recorded with
+whether its advice cleared the confidence floor and was blended in.
 """
 
 from __future__ import annotations
@@ -816,6 +824,15 @@ def _environment(tokenizers: dict[str, str]) -> dict[str, Any]:
     return env
 
 
+def _percentile(values: list[float], pct: float) -> float | None:
+    """Nearest-rank percentile (no interpolation: every value was measured)."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, -(-len(ordered) * int(pct) // 100))
+    return round(ordered[rank - 1], 2)
+
+
 def _aggregate(rows: list[PathResult]) -> dict[str, Any]:
     raw = sum(r.raw_tokens for r in rows)
     fwd = sum(r.forwarded_tokens for r in rows)
@@ -834,10 +851,89 @@ def _aggregate(rows: list[PathResult]) -> dict[str, Any]:
         "frozen_prefix_violations": sum(1 for r in rows if r.frozen_prefix_identical is False),
         "errors": sum(1 for r in rows if r.error),
         "wall_ms": round(sum(r.wall_ms for r in rows), 2),
+        "wall_ms_p50": _percentile([r.wall_ms for r in rows], 50),
+        "wall_ms_p95": _percentile([r.wall_ms for r in rows], 95),
+        # The first fixture of a path pays one-time process warm-up (parsers,
+        # tokenizers, model probes); the warm figures exclude it.
+        "wall_ms_warm_p50": _percentile([r.wall_ms for r in rows[1:]], 50),
+        "wall_ms_warm_p95": _percentile([r.wall_ms for r in rows[1:]], 95),
     }
 
 
-def run_eval(label: str, fixtures: list[Fixture] | None = None) -> dict[str, Any]:
+class AgentRuntimeSession:
+    """The agent runtime + JevK5 advisor, installed as ``create_app`` installs it.
+
+    Only the benchmark wraps ``advisor.choose`` to time each call; the advisor,
+    its deadline and confidence floor, and the arbiter blend are untouched.
+    """
+
+    def __init__(self, config: Any, mode: str) -> None:
+        from types import SimpleNamespace
+
+        from headroom.agent.arbiter import reset_arbiter
+        from headroom.agent.install import install_agent_runtime
+
+        self.mode = mode
+        self.fixture = ""
+        self.calls: list[dict[str, Any]] = []
+        reset_arbiter()
+        self.app = SimpleNamespace(state=SimpleNamespace())
+        runtime = install_agent_runtime(self.app, config)
+        if runtime is None:
+            raise RuntimeError("agent_runtime is not enabled by the wrap rollout")
+        runtime.start()
+        self.intelligence = self.app.state.agent_intelligence
+        t0 = time.perf_counter()
+        self.intelligence.activate()
+        self.activation_ms = round((time.perf_counter() - t0) * 1000, 2)
+        self.advisor = runtime.advisor
+        inner = self.advisor.choose
+
+        def timed_choose(family: str, *args: Any, **kwargs: Any) -> Any:
+            t = time.perf_counter()
+            advice = inner(family, *args, **kwargs)
+            self.calls.append(
+                {
+                    "fixture": self.fixture,
+                    "family": family,
+                    "ms": round((time.perf_counter() - t) * 1000, 2),
+                    "advice": advice is not None,
+                    "confidence": None if advice is None else round(advice.confidence, 4),
+                }
+            )
+            return advice
+
+        self.advisor.choose = timed_choose
+
+    def report(self) -> dict[str, Any]:
+        from headroom.agent.arbiter import get_arbiter
+
+        jev = get_arbiter().status().get("jev", {})
+        called = len(self.calls)
+        used = int(jev.get("applied", 0))
+        return {
+            "mode": self.mode,
+            "advisor_health": self.intelligence.health(),
+            "activation_ms": self.activation_ms,
+            "advisor_stats": self.advisor.status()["stats"],
+            "arbiter_jev": jev,
+            "advice_requests": called,
+            "advice_used": used,
+            "acceptance_rate": round(used / called, 4) if called else None,
+            "call_ms_p50": _percentile([c["ms"] for c in self.calls], 50),
+            "call_ms_p95": _percentile([c["ms"] for c in self.calls], 95),
+            "calls": self.calls,
+        }
+
+    def close(self) -> None:
+        from headroom.agent.install import stop_agent_runtime
+
+        stop_agent_runtime(self.app)
+
+
+def run_eval(
+    label: str, fixtures: list[Fixture] | None = None, *, jevk5: str | None = None
+) -> dict[str, Any]:
     """Run every fixture through every available path.
 
     The offline/stateless defaults and the savings-profile env seeding are
@@ -848,13 +944,15 @@ def run_eval(label: str, fixtures: list[Fixture] | None = None) -> dict[str, Any
     try:
         for k, v in _ENV_DEFAULTS.items():
             os.environ.setdefault(k, v)
-        return _run_eval(label, fixtures if fixtures is not None else build_fixtures())
+        if jevk5 is not None:
+            os.environ["HEADROOM_JEVK5"] = jevk5
+        return _run_eval(label, fixtures if fixtures is not None else build_fixtures(), jevk5)
     finally:
         os.environ.clear()
         os.environ.update(saved_env)
 
 
-def _run_eval(label: str, fixtures: list[Fixture]) -> dict[str, Any]:
+def _run_eval(label: str, fixtures: list[Fixture], jevk5: str | None = None) -> dict[str, Any]:
 
     paths: list[Any] = []
     init_failures: dict[str, str] = {}
@@ -863,7 +961,26 @@ def _run_eval(label: str, fixtures: list[Fixture]) -> dict[str, Any]:
             paths.append(cls())
         except Exception as exc:
             init_failures[cls.name] = f"{type(exc).__name__}: {exc}"
+    session: AgentRuntimeSession | None = None
+    if jevk5 is not None:
+        wrap = next((p for p in paths if isinstance(p, PythonProxyWrapPath)), None)
+        if wrap is None:
+            raise RuntimeError(f"--jevk5 needs the wrap path: {init_failures}")
+        session = AgentRuntimeSession(wrap.config, jevk5)
+    try:
+        return _run_paths(label, fixtures, paths, init_failures, session)
+    finally:
+        if session is not None:
+            session.close()
 
+
+def _run_paths(
+    label: str,
+    fixtures: list[Fixture],
+    paths: list[Any],
+    init_failures: dict[str, str],
+    session: AgentRuntimeSession | None,
+) -> dict[str, Any]:
     started = time.perf_counter()
     per_fixture: list[dict[str, Any]] = []
     by_path: dict[str, list[PathResult]] = {p.name: [] for p in paths}
@@ -879,6 +996,8 @@ def _run_eval(label: str, fixtures: list[Fixture]) -> dict[str, Any]:
         for p in paths:
             if isinstance(p, PythonProxyPath) and not fx.messages:
                 continue
+            if session is not None:
+                session.fixture = fx.name
             r = p.run(fx)
             if r is None:
                 continue
@@ -928,6 +1047,7 @@ def _run_eval(label: str, fixtures: list[Fixture]) -> dict[str, Any]:
         "fixtures": per_fixture,
         "known_failures": known_failures,
         "total_wall_ms": round((time.perf_counter() - started) * 1000, 2),
+        **({"jevk5": session.report()} if session is not None else {}),
     }
 
 
@@ -935,14 +1055,27 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--label", required=True)
     ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument(
+        "--jevk5",
+        choices=("off", "on"),
+        default=None,
+        help="Install the agent runtime for the wrap path with HEADROOM_JEVK5=off|on.",
+    )
     args = ap.parse_args(argv)
-    report = run_eval(args.label)
+    report = run_eval(args.label, jevk5=args.jevk5)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     for name, s in report["summary"].items():
         print(
             f"{name}: reduction={s['reduction_pct']}% recall={s['must_keep_recall']} "
             f"recall_with_ccr={s['must_keep_recall_with_ccr']} errors={s['errors']}"
+        )
+    jev = report.get("jevk5")
+    if jev:
+        print(
+            f"jevk5={jev['mode']} state={jev['advisor_health']['advisor_state']} "
+            f"requests={jev['advice_requests']} used={jev['advice_used']} "
+            f"call_p50={jev['call_ms_p50']}ms call_p95={jev['call_ms_p95']}ms"
         )
     print(f"known_failures={len(report['known_failures'])} -> {args.out}")
     return 0

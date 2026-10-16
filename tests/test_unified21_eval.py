@@ -84,3 +84,30 @@ def test_run_eval_end_to_end_on_small_subset(tmp_path, monkeypatch):
     out = tmp_path / "r.json"
     assert ev.main(["--label", "unit", "--out", str(out)]) == 0
     assert json.loads(out.read_text(encoding="utf-8"))["label"] == "unit"
+
+
+def test_jevk5_off_installs_the_runtime_and_records_advisor_requests(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+    monkeypatch.setenv("HEADROOM_STATELESS", "1")
+    subset = [f for f in ev.build_fixtures() if f.name in {"large_search", "json_records"}]
+    report = ev.run_eval("unit", subset, jevk5="off")
+    if ev.PythonProxyWrapPath.name not in report["summary"]:
+        pytest.skip(f"wrap path not initialised: {report['known_failures']}")
+    jev = report["jevk5"]
+    assert jev["mode"] == "off"
+    assert jev["advisor_health"]["advisor_state"] == "disabled"
+    assert jev["advice_used"] == 0 and jev["advisor_stats"]["calls"] == 0
+    assert all(c["advice"] is False for c in jev["calls"])
+    summary = report["summary"][ev.PythonProxyWrapPath.name]
+    assert summary["wall_ms_p50"] is not None and summary["wall_ms_p95"] >= summary["wall_ms_p50"]
+    from headroom.agent.install import _installed
+
+    assert _installed["runtime"] is None  # torn down after the run
+
+
+def test_percentile_is_nearest_rank():
+    assert ev._percentile([], 50) is None
+    assert ev._percentile([5.0], 95) == 5.0
+    values = [float(v) for v in range(1, 11)]
+    assert ev._percentile(values, 50) == 5.0
+    assert ev._percentile(values, 95) == 10.0
