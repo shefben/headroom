@@ -530,6 +530,55 @@ page for the full bucket table, plugin-author guidance, and the Docker
 naming overlap note (`HEADROOM_WORKSPACE` is *not* the same as
 `HEADROOM_WORKSPACE_DIR`).
 
+### JevK5 decision advisor
+
+The `wrap` intelligence stack can consult JevK5 (runtime v0.3.3, model
+`jevk5-4b-v0.3-Q8_0.gguf`) as an optional, local, English-only advisory
+classifier. It only breaks close calls: transform-arbiter finalists, ambiguous
+tool-catalog ties, the uncertain middle of effort routing, which existing task
+item a correction targets, and the order of already-safe repair suggestions.
+It never establishes facts, authorizes a file change or a command, or overrides
+the SafetyGate, scope or contract checks. When it is unavailable, slow or
+unsure, Headroom behaves exactly as without it.
+
+`HEADROOM_JEVK5` is a *service policy*, not a rollout feature:
+
+| Value | Behavior |
+|-------|----------|
+| `auto` (default) | Use the advisor when it is ready. On first run, setup runs in a background thread, only when online, and never delays `wrap` or request traffic. |
+| `on` | Same request behavior (requests always fail open), but setup and start failures are logged as explicit warnings and shown by `headroom intelligence status`. |
+| `off` | No setup, no service start, no advisor calls. |
+
+Commands: `headroom intelligence setup` (discover or build `llama-server`,
+install the pinned GGUF client, download and verify the model, start the
+service and run conformance), `status`, `doctor` (executable, runtime version,
+model and hash, endpoint type, effective context, calibration, missing-letter
+health, process ownership), and `stop`.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HEADROOM_JEVK5_AUTOSTART` | Start (or reuse) the managed llama-server when the proxy starts. `0` only reuses a running one. | `1` |
+| `HEADROOM_JEVK5_LLAMA_SERVER` | Path of the `llama-server` executable to use. It is authoritative: nothing else is tried. Without it, Headroom searches the previous setup, `PATH`, `LLAMA_CPP_HOME`, and common llama.cpp checkout and install directories, then builds a separate managed copy from source as a last resort. Your installation is never modified. | discovered |
+| `HEADROOM_JEVK5_LLAMA_URL` | An operator-managed **llama-server** (`/health`, `/tokenize`, `/completion`). Headroom probes these endpoints before use and never starts or stops it. | -- |
+| `HEADROOM_JEVK5_SYSTEMONE_URL` | An operator-managed JevK5-compatible **`/v1/systemone`** service, probed at `/v1/systemone` and used through its own client. It is a different API from `HEADROOM_JEVK5_LLAMA_URL`. Headroom never treats one as the other. | -- |
+| `HEADROOM_JEVK5_MODEL` | Path of a custom GGUF file (operator-managed, never downloaded). Requires `HEADROOM_JEVK5_MODEL_SHA256` or `HEADROOM_JEVK5_MODEL_OPERATOR_MANAGED=1`. The default model's publisher hash is never applied to another file. | -- |
+| `HEADROOM_JEVK5_MODEL_SHA256` / `HEADROOM_JEVK5_MODEL_OPERATOR_MANAGED` | Trusted checksum for a custom model, or `1` to accept it without one. | -- |
+| `HEADROOM_JEVK5_PORT` / `HEADROOM_JEVK5_CTX_SIZE` / `HEADROOM_JEVK5_GPU_LAYERS` | Managed server on `127.0.0.1`: preferred port (a free port is chosen if it is taken), context, and GPU layers. | `8091` / `8192` / `auto` |
+| `HEADROOM_JEVK5_DECISION_TIMEOUT_MS` | Hard wall-clock deadline for a whole decision (tokenize, every completion pass, the missing-letter retry). A late result is discarded. | `1200` |
+| `HEADROOM_JEVK5_CALLS_PER_REQUEST` / `HEADROOM_JEVK5_CACHE_TTL_S` | Advisor calls per proxy request (shared by all consumers) and answer cache lifetime. | `4` / `30` |
+| `HEADROOM_JEVK5_MIN_CONFIDENCE` | Advice below this top-choice confidence is ignored. | `0.60` |
+| `HEADROOM_JEVK5_WEIGHT` / `HEADROOM_JEVK5_WEIGHT_CAP` | Weight of the advisor in a utility blend. Never above `0.40`. | `0.25` / `0.40` |
+| `HEADROOM_JEVK5_BREAKER_FAILURES` / `HEADROOM_JEVK5_BREAKER_OPEN_S` | Consecutive failures that open the circuit breaker, and for how long. | `3` / `60` |
+
+`HEADROOM_OFFLINE=1`: only an already-verified cached model and an installed
+`llama-server` are used. No git, pip or Hugging Face access. `HEADROOM_STATELESS=1`:
+setup writes nothing and the proxy only reuses an already-running service.
+State lives under `${HEADROOM_WORKSPACE_DIR}/intelligence` (models, the
+`service.json` ownership record, logs). Headroom stops only a process whose PID,
+executable, start time and command line match the record it wrote. It never
+stops a process it did not start or another program that holds the port. To
+turn JevK5 off, set `HEADROOM_JEVK5=off` and run `headroom intelligence stop`.
+
 ## Custom Model Configuration
 
 Configure context limits and pricing for new or custom models:
