@@ -26,6 +26,23 @@ log = logging.getLogger(__name__)
 
 FEATURE = "agent_runtime"
 
+#: Rollout names reported by /health.agent_runtime.rollout (wrap defaults).
+_AGENT_FEATURES = (
+    "agent_task_state",
+    "agent_evidence",
+    "agent_code_graph",
+    "agent_tool_admission",
+    "agent_arbiter",
+    "agent_tool_catalog",
+    "agent_complexity_routing",
+    "agent_feedback",
+    "agent_speculation",
+    "agent_change_scope",
+    "agent_tool_contracts",
+    "agent_test_impact",
+    "agent_workflow_macros",
+)
+
 _installed: dict[str, Any] = {
     "hook": None,
     "runtime": None,
@@ -136,6 +153,8 @@ def agent_runtime_health(app: Any, config: Any) -> dict[str, Any]:
             name: _feature(config, name)
             for name in ("agent_task_state", "agent_evidence", "agent_code_graph")
         },
+        # Effective rollout of every agent feature (Phase 8 `headroom agent status`).
+        "rollout": {name: _feature(config, name) for name in _AGENT_FEATURES if name != FEATURE},
         "hook_installed": len(hooks) == 1,
         "hook_priority": getattr(hooks[0], "priority", None) if hooks else None,
         "stateless": bool(getattr(config, "stateless", False)),
