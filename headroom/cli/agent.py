@@ -1,11 +1,12 @@
-"""``headroom agent`` — compact status and doctor for the wrap intelligence stack.
+"""``headroom agent`` — compact status, doctor and scoped purge for the wrap intelligence stack.
 
 ``status`` reads the running proxy's ``/health`` (loopback) and condenses the
 agent blocks: effective rollout, which capabilities enforce at a host versus
 only observe, trusted workspaces, the state DB, JevK5 readiness, enforcement
 policies and per-feature counters. ``doctor`` adds local checks that do not
 need a proxy (the rollout ``headroom wrap`` would apply, persistence, ripgrep,
-JevK5 files). Neither command changes any state.
+JevK5 files). Neither changes state. ``purge`` deletes one workspace's persisted
+agent rows only.
 """
 
 from __future__ import annotations
@@ -209,3 +210,31 @@ def doctor_cmd(port: int | None, as_json: bool) -> None:
             click.echo(f"[ok ] proxy: {on} agent features on, jevk5 {view['jevk5']['state']}")
     if not all(ok for _n, ok, _d in checks):
         raise SystemExit(1)
+
+
+@agent_group.command("purge")
+@click.option(
+    "--workspace",
+    "workspace",
+    type=click.Path(exists=True, file_okay=False),
+    required=True,
+    help="Worktree whose agent state to delete (the same scope wrap registers).",
+)
+@click.option("--yes", is_flag=True, help="Do not ask for confirmation.")
+def purge_cmd(workspace: str, yes: bool) -> None:
+    """Delete one workspace's persisted agent state (events, task state, evidence,
+    graph index, verification history, workflows, feedback priors). Other
+    workspaces, memory, CCR, savings and settings are untouched."""
+    from headroom.agent.retention import purge_workspace, workspace_id_for
+
+    try:
+        workspace_id = workspace_id_for(workspace)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if not yes:
+        click.confirm(f"Delete agent state for {workspace}?", abort=True)
+    removed = purge_workspace(workspace_id)
+    total = sum(removed.values())
+    click.echo(f"removed {total} rows" + (f": {removed}" if removed else ""))
+    if total:
+        click.echo("A running proxy keeps in-memory state until it restarts.")

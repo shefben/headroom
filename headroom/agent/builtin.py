@@ -136,6 +136,13 @@ def install_builtin_components(runtime: Any, config: Any) -> Callable[[], None]:
 
     ledger = open_ledger(runtime.store)
     runtime.services["ledger"] = ledger
+    from headroom.agent.retention import LISTENER as LISTENER_RETENTION
+    from headroom.agent.retention import RetentionScheduler
+
+    # Phase 8 bounded retention: pruned on a background thread, never on a request.
+    retention = RetentionScheduler(runtime, ledger)
+    runtime.services["retention"] = retention
+    registry.register_commit_listener(LISTENER_RETENTION, retention.on_commit)
     evidence = None
     compiler = None
     graph = None
@@ -236,6 +243,9 @@ def install_builtin_components(runtime: Any, config: Any) -> Callable[[], None]:
             from headroom.agent.tool_admission.service import unbind_persistence
 
             unbind_persistence(runtime)
+        registry.unregister(LISTENER_RETENTION)
+        runtime.services.pop("retention", None)
+        retention.close()
         for name in _REGISTERED_NAMES:
             registry.unregister(name)
         for key in ("task_state", "evidence", "code_graph", "ledger"):
