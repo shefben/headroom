@@ -2326,10 +2326,11 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "127.0.0.1 to become ready. Test-only code.",
     ),
     "ccr/mcp_server.py": (
-        3,
+        6,
         "loopback: retrieval and liveness calls against the operator's local "
-        "proxy_url (defaults to 127.0.0.1). The MCP server is a sidecar to the "
-        "proxy, not an internet client.",
+        "proxy_url (defaults to 127.0.0.1), plus the unified-21 workflow tool's "
+        "status, run and cancel calls to /v1/agent/workflow* on that same proxy. "
+        "The MCP server is a sidecar to the proxy, not an internet client.",
     ),
     "memory/adapters/embedders.py": (
         1,
@@ -2853,6 +2854,13 @@ _RUST_ALLOWLIST: dict[str, tuple[int, str]] = {
         "own request through, the exact counterpart of the Python proxy's "
         "allowlist entry. An air-gapped deployment points it at an on-prem "
         "endpoint and still needs it to work.",
+    ),
+    "headroom-core/src/relevance/semantic.rs": (
+        1,
+        "cache-only: try_new_from_user_defined builds the embedding model from "
+        "ONNX/tokenizer bytes already read from the local fastembed/HF cache "
+        "directory; it never downloads. The only download path for this model "
+        "is semantic_relevance_prefetch, which is guarded.",
     ),
 }
 
