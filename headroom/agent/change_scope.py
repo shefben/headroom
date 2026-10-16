@@ -498,6 +498,16 @@ def _pattern_matches(pattern: str, rel: str, fold: bool) -> bool:
     r = path_key(rel, fold)
     if not p:
         return False
+    if p.startswith("**/") and not any(ch in p[3:] for ch in "*?["):
+        # A relative path the user wrote from a subdirectory of the worktree:
+        # match it on whole path components from the right.
+        rest = p[3:].rstrip("/")
+        return bool(rest) and (
+            r == rest
+            or r.endswith("/" + rest)
+            or r.startswith(rest + "/")
+            or f"/{rest}/" in f"/{r}/"
+        )
     if any(ch in p for ch in "*?["):
         return fnmatch.fnmatchcase(r, p) or fnmatch.fnmatchcase(r.rsplit("/", 1)[-1], p)
     if r == p or r.startswith(p + "/"):
@@ -1053,8 +1063,16 @@ class ChangeScopeFirewall:
         if root is None:
             return None
         canon = canonicalize(raw, root=root, cwd=root, case_insensitive=self.fold)
-        if canon.rel is not None:
+        relative = not (os.path.isabs(_unwrap(raw)) or raw.startswith(("\\\\", "//")))
+        parent_exists = os.path.isdir(os.path.dirname(canon.resolved.rstrip("/")))
+        if canon.rel is not None and (canon.exists or parent_exists or not relative):
             return canon.rel + ("/" if canon.is_dir or raw.endswith(("/", "\\")) else "")
+        if relative and canon.rel is not None:
+            # Not under the worktree root: the user is in a subdirectory (or
+            # names a file to be created). Anchor on path components instead.
+            norm = raw.replace("\\", "/").strip()
+            norm = re.sub(r"^(?:\./)+", "", norm)
+            return "**/" + norm
         return canon.resolved  # an explicitly named external path
 
     def _recent_writes(self, identity: WorkspaceIdentity, state: Any) -> tuple[str, ...]:

@@ -740,3 +740,22 @@ def test_codex_client_hook_reports_unsupported(wired):
             },
         ).json()
         assert got["output"] is None and got["capability"] == "observational_or_proxy_only"
+
+
+def test_relative_mentions_from_a_subdirectory_anchor_on_components(project: Path):
+    """A user in ``<repo>/proj`` names ``src/x.py``; the worktree root is the repo."""
+    repo = project.parent
+    (repo / ".git").mkdir(exist_ok=True)
+    e = _Env(project)
+    e.identity = resolve_identity(session_token="tok-sub", registered_cwd=str(repo))
+    e.instruct("Fix src/app.py but do not modify src/other.py")
+    contract = e.firewall.contract(e.identity)
+    assert contract.expected_paths == ("**/src/app.py",)
+    blocked = e.authorize(e.path("src/other.py"))
+    assert blocked.verdict is Verdict.BLOCK and blocked.reason_code == "scope.user_forbidden"
+    assert e.authorize(e.path("src/app.py")).verdict is Verdict.ALLOW
+    from headroom.agent.change_scope import matches_any
+
+    assert matches_any(("**/src/app.py",), "proj/src/app.py") is not None
+    assert matches_any(("**/src/app.py",), "proj/xsrc/app.py") is None
+    e.runtime.stop(timeout=1.0)
