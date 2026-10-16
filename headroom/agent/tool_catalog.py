@@ -368,6 +368,7 @@ class CatalogRequest:
     advisor: Any = None
     feedback: Any = None
     materialize: int = DEFAULT_MATERIALIZE
+    request_id: str | None = None  # keys the request's shared JevK5 allowance
 
 
 class ProgressiveToolCatalog:
@@ -607,7 +608,7 @@ class ProgressiveToolCatalog:
         purposes = {_name(t, shape): _purpose(_description(t, shape))[:120] for t in candidates}
         options = {f"t{i}": f"{n}: {purposes.get(n, '')}" for i, (n, _) in enumerate(finalists)}
         try:
-            budget = req.advisor.request_budget()
+            budget = req.advisor.request_budget(req.request_id)
             advice = req.advisor.choose(
                 "tool_catalog",
                 {"task": (req.query or " ".join(req.terms))[:600], "tools": options},
@@ -722,6 +723,7 @@ def apply_request_catalog(
                 model=model,
                 advisor=advisor,
                 feedback=feedback,
+                request_id=request_id,
             )
         )
     except Exception as exc:  # noqa: BLE001 - the catalog never fails a request

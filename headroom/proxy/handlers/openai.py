@@ -4346,7 +4346,9 @@ class OpenAIHandlerMixin:
             # native tool search); sticky per session, never on tool-free calls.
             from headroom.agent.tool_catalog import apply_request_catalog
 
-            _catalog = apply_request_catalog(
+            # Off the event loop: an ambiguous shortlist may consult JevK5.
+            _catalog = await asyncio.to_thread(
+                apply_request_catalog,
                 config=self.config,
                 tools=tools,
                 messages=optimized_messages,
@@ -4638,7 +4640,10 @@ class OpenAIHandlerMixin:
             # Unified-21 #10: complexity-aware effort/verbosity routing.
             from headroom.agent.complexity import route_request
 
-            _route = route_request(
+            # Off the event loop: an uncertain turn may consult the local
+            # JevK5 advisor (bounded by its 1200 ms decision deadline).
+            _route = await asyncio.to_thread(
+                route_request,
                 body,
                 shape="chat",
                 config=getattr(self, "config", None),

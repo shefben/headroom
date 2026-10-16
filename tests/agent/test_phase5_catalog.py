@@ -304,7 +304,7 @@ def test_jevk5_breaks_ambiguous_ties_only():
         def __init__(self):
             self.calls = 0
 
-        def request_budget(self):
+        def request_budget(self, request_key=None):
             return SimpleNamespace()
 
         def choose(self, family, state, instructions, options, *, budget):

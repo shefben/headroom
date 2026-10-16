@@ -585,9 +585,12 @@ class TransformArbiter:
         margin = survivors[0].utility - survivors[1].utility if len(survivors) > 1 else 1.0
         jev_w, jev_conf = 0.0, None
         if len(survivors) > 1 and (ctx.ambiguous or margin < JEV_MARGIN):
-            jev_w, jev_conf = self._jev_blend(survivors[:MAX_FINALISTS], ctx, family)
+            finalists = survivors[:MAX_FINALISTS]
+            jev_w, jev_conf = self._jev_blend(finalists, ctx, family)
             if jev_w > 0:
-                survivors.sort(key=order)
+                # The blend reorders the finalists only: a survivor ranked below
+                # the top 16 was never shown to JevK5 and cannot overtake one.
+                survivors = sorted(finalists, key=order) + survivors[MAX_FINALISTS:]
         winner = survivors[0]
         decision = ArbiterDecision(
             winner=winner,

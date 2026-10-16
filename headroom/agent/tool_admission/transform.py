@@ -237,7 +237,13 @@ class ToolAdmissionTransform(Transform):
             arbiter = get_arbiter()
             limits = RequestLimits()
             advisor = _advisor()
-            advisor_budget = advisor.request_budget() if advisor is not None else None
+            # One JevK5 allowance per proxy request, shared with every other
+            # consumer (catalog, effort routing) that passes the same id.
+            advisor_budget = (
+                advisor.request_budget(str(kwargs.get("request_id") or "") or None)
+                if advisor is not None
+                else None
+            )
         speculation = None
         if self.speculation_enabled:
             from headroom.agent.speculation import RequestSpeculation

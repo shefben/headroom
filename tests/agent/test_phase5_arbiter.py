@@ -406,6 +406,50 @@ def test_jevk5_blends_only_when_close_and_is_capped():
             assert 0.0 <= rec.blended <= 1.0
 
 
+def test_jevk5_reorders_only_the_top_16_finalists():
+    """A survivor ranked below the 16 finalists was never shown to JevK5.
+
+    Blending scales every finalist by ``(1-w)``; the 17th+ survivors keep their
+    raw utility and must still rank after every finalist, never overtake one.
+    """
+    original = "\n".join(f"row {i}: k={i % 7} payload={'x' * 30}" for i in range(400))
+    key = "c" * 24
+    lines = original.splitlines()
+    cands = [
+        Candidate(
+            "structural",
+            "\n".join(lines[: 100 + 12 * n]) + f"\n[headroom: hash={key}]",
+            "conservative",
+            f"head{n}",
+            _prov(original, key),
+        )
+        for n in range(20)
+    ]
+    arb = TransformArbiter()
+    base = ArbiterContext(original=original, policy=policy_default_payg(), tokenizer=Tok())
+    plain_eval = arb.evaluate(cands, base)
+    ranked = sorted(
+        (r for r in plain_eval.records if r.allowed),
+        key=lambda r: (-round(r.utility, 9), r.label),
+    )
+    assert len(ranked) > 16, "fixture needs more than 16 safe survivors"
+    finalists = {r.label for r in ranked[:16]}
+    # The advisor favors none of the shown options (uniform low probability).
+    adv = FakeAdvisor("no-such-option", weight=0.40)
+    ctx = ArbiterContext(
+        original=original,
+        policy=policy_default_payg(),
+        tokenizer=Tok(),
+        advisor=adv,
+        advisor_budget=adv.request_budget(),
+        ambiguous=True,
+    )
+    d = arb.choose(arb.evaluate(cands, ctx), ctx)
+    assert d.jev_weight == 0.40
+    assert len(adv.calls) == 1 and len(adv.calls[0]["options"]) == 16
+    assert d.winner.label in finalists
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher + transform (the real tool-admission path)
 # ---------------------------------------------------------------------------

@@ -191,7 +191,7 @@ def test_jevk5_scores_only_the_uncertain_middle(monkeypatch):
     calls = []
 
     class Adv:
-        def request_budget(self):
+        def request_budget(self, request_key=None):
             return SimpleNamespace()
 
         def score(self, family, state, instructions, levels, *, budget):

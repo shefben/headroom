@@ -3348,7 +3348,9 @@ class AnthropicHandlerMixin:
             if _decision.should_compress and not _bypass and not preserve_tool_order:
                 from headroom.agent.tool_catalog import apply_request_catalog
 
-                _catalog = apply_request_catalog(
+                # Off the event loop: an ambiguous shortlist may consult JevK5.
+                _catalog = await asyncio.to_thread(
+                    apply_request_catalog,
                     config=self.config,
                     tools=body.get("tools"),
                     messages=optimized_messages,
@@ -3655,7 +3657,10 @@ class AnthropicHandlerMixin:
             if not _bypass:
                 from headroom.agent.complexity import route_request
 
-                _route = route_request(
+                # Off the event loop: an uncertain turn may consult the local
+                # JevK5 advisor (bounded by its 1200 ms decision deadline).
+                _route = await asyncio.to_thread(
+                    route_request,
                     body,
                     shape="anthropic",
                     config=getattr(self, "config", None),

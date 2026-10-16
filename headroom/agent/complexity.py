@@ -390,11 +390,14 @@ def lowered_effort(current: str, score: int) -> str:
     return EFFORT_ORDER[min(target, idx)]
 
 
-def _jev_score(advisor: Any, signals: ComplexitySignals) -> int | None:
+def _jev_score(
+    advisor: Any, signals: ComplexitySignals, request_id: str | None = None
+) -> int | None:
     if advisor is None:
         return None
     try:
-        budget = advisor.request_budget()
+        # The request's shared allowance (arbiter + catalog + this call <= 4).
+        budget = advisor.request_budget(request_id)
         advice = advisor.score(
             "effort_complexity",
             {"signals": signals.to_dict()},
@@ -525,14 +528,27 @@ def route_request(
     if not _enabled(config, FEATURE_COMPLEXITY):
         return None
     try:
-        return _route(body, shape=shape, config=config, model=model, session_key=session_key)
+        return _route(
+            body,
+            shape=shape,
+            config=config,
+            model=model,
+            session_key=session_key,
+            request_id=request_id,
+        )
     except Exception as exc:  # noqa: BLE001 - routing never fails a request
         log.warning("[%s] complexity routing failed: %s", request_id, describe_exception(exc))
         return None
 
 
 def _route(
-    body: dict[str, Any], *, shape: str, config: Any, model: str, session_key: str | None
+    body: dict[str, Any],
+    *,
+    shape: str,
+    config: Any,
+    model: str,
+    session_key: str | None,
+    request_id: str | None = None,
 ) -> RoutingDecision:
     from headroom.proxy.output_savings import (
         assign_arm,
@@ -580,7 +596,7 @@ def _route(
     else:
         score = signals.score
         if score == 2:
-            jev = _jev_score(advisor, signals)
+            jev = _jev_score(advisor, signals, request_id)
             if jev is not None:
                 score, source = jev, "jevk5"
                 _bump("jevk5_scores")
