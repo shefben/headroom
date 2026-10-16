@@ -2084,6 +2084,12 @@ _CLAUDE_TOOL_HOOK_EVENTS: dict[str, tuple[str, int]] = {
 _CLAUDE_ENFORCEMENT_HOOK_EVENTS: dict[str, tuple[str, int]] = {
     "PreToolUse": ("Bash|PowerShell", 5),
 }
+#: Unified-21 Phase 7: the learned-workflow tool (served by the Headroom MCP
+#: server) starts only behind this pre-tool entry, which validates the call
+#: and issues its single-use execution ticket.
+_CLAUDE_WORKFLOW_HOOK_EVENTS: dict[str, tuple[str, int]] = {
+    "PreToolUse": ("mcp__headroom__headroom_workflow", 15),
+}
 
 
 def _wrap_rollout_enabled(*names: str) -> bool:
@@ -2106,16 +2112,29 @@ def _tool_enforcement_enabled_for_wrap() -> bool:
     return _wrap_rollout_enabled("agent_change_scope", "agent_tool_contracts")
 
 
+def _workflows_enabled_for_wrap() -> bool:
+    """Whether the proxy would run learned workflow macros (rollout)."""
+    return _wrap_rollout_enabled("agent_workflow_macros")
+
+
 def _host_hooks_enabled_for_wrap() -> bool:
-    return _tool_admission_enabled_for_wrap() or _tool_enforcement_enabled_for_wrap()
+    return (
+        _tool_admission_enabled_for_wrap()
+        or _tool_enforcement_enabled_for_wrap()
+        or _workflows_enabled_for_wrap()
+    )
 
 
 def _claude_tool_hook_entries(
-    *, admission: bool | None = None, enforcement: bool | None = None
+    *,
+    admission: bool | None = None,
+    enforcement: bool | None = None,
+    workflows: bool | None = None,
 ) -> list[tuple[str, str, int]]:
     """``(event, matcher, timeout)`` for every hook entry this launch installs."""
     admission = _tool_admission_enabled_for_wrap() if admission is None else admission
     enforcement = _tool_enforcement_enabled_for_wrap() if enforcement is None else enforcement
+    workflows = _workflows_enabled_for_wrap() if workflows is None else workflows
     entries: list[tuple[str, str, int]] = []
     if admission or enforcement:
         matcher, timeout = _CLAUDE_TOOL_HOOK_EVENTS["PreToolUse"]
@@ -2125,6 +2144,9 @@ def _claude_tool_hook_entries(
         entries.append(("PostToolUse", matcher, timeout))
     if enforcement:
         for event, (matcher, timeout) in _CLAUDE_ENFORCEMENT_HOOK_EVENTS.items():
+            entries.append((event, matcher, timeout))
+    if workflows:
+        for event, (matcher, timeout) in _CLAUDE_WORKFLOW_HOOK_EVENTS.items():
             entries.append((event, matcher, timeout))
     return entries
 
@@ -2295,6 +2317,20 @@ def _report_tool_enforcement(client: str, *, hook_installed: bool, reason: str =
         click.echo(
             "  Change scope / tool checks: observe-only (the proxy sees tool calls after "
             f"the client ran them, so nothing is blocked{detail})"
+        )
+
+
+def _report_workflows(*, hook_installed: bool) -> None:
+    """One honest line: whether learned workflows can run in this session."""
+    if hook_installed:
+        click.echo(
+            "  Learned workflows: headroom_workflow (MCP) runs repeated read-only/verification "
+            "steps behind the pre-tool hook; mutating steps never auto-run"
+        )
+    else:
+        click.echo(
+            "  Learned workflows: observed only (no host pre-tool hook / MCP tool, so "
+            "nothing is run for you)"
         )
 
 
@@ -6691,6 +6727,8 @@ def claude(
                 _report_tool_enforcement(
                     "claude", hook_installed=_tool_hooks_installed, reason=_tool_hooks_reason
                 )
+            if _workflows_enabled_for_wrap():
+                _report_workflows(hook_installed=_tool_hooks_installed and not no_mcp)
 
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.

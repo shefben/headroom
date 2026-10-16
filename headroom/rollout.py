@@ -243,6 +243,26 @@ FEATURES: dict[str, FeatureSpec] = {
             "auto-executed; needs agent_runtime)."
         ),
     ),
+    # Phase-7 verification and learned workflows. Default-on for `wrap`: the
+    # planner only reads the diff and advises; workflows run solely through
+    # the host-authorized headroom_workflow tool (read-only/verification
+    # steps, re-validated before every step).
+    "agent_test_impact": FeatureSpec(
+        name="agent_test_impact",
+        available_in=RolloutChannel.STABLE,
+        description=(
+            "Test Impact and Verification Planner: diff/task/evidence/graph-tied "
+            "test selection, staged escalation, flaky tracking (needs agent_runtime)."
+        ),
+    ),
+    "agent_workflow_macros": FeatureSpec(
+        name="agent_workflow_macros",
+        available_in=RolloutChannel.STABLE,
+        description=(
+            "Safe learned Workflow Macro Compiler: repeated read-only/verification "
+            "tool sequences become one host-authorized headroom_workflow call."
+        ),
+    ),
 }
 
 #: Safe, non-destructive features `headroom wrap` turns on for the proxy it
@@ -260,6 +280,8 @@ WRAP_DEFAULT_FEATURES: tuple[str, ...] = (
     "agent_speculation",
     "agent_change_scope",
     "agent_tool_contracts",
+    "agent_test_impact",
+    "agent_workflow_macros",
 )
 
 

@@ -340,7 +340,11 @@ def test_gate6_existing_permissions_unaffected(tmp_path, monkeypatch):
         for h in e["hooks"]
         if "headroom.host_hook" in h["command"]
     ]
-    assert sorted(m for m, _ in ours) == ["Bash|PowerShell", "Edit|Write|MultiEdit|NotebookEdit"]
+    assert sorted(m for m, _ in ours) == [
+        "Bash|PowerShell",
+        "Edit|Write|MultiEdit|NotebookEdit",
+        "mcp__headroom__headroom_workflow",  # Phase 7 workflow tool boundary
+    ]
     assert wrap_cli._remove_claude_tool_hooks(path)
     assert json.loads(path.read_text(encoding="utf-8")) == user
     # The --settings flag carries hooks only, never permissions.
@@ -350,4 +354,5 @@ def test_gate6_existing_permissions_unaffected(tmp_path, monkeypatch):
     assert [e["matcher"] for e in flag["hooks"]["PreToolUse"]] == [
         "Edit|Write|MultiEdit|NotebookEdit",
         "Bash|PowerShell",
+        "mcp__headroom__headroom_workflow",
     ]

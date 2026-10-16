@@ -229,6 +229,8 @@ def test_wrap_feature_defaults_respect_disable():
         "agent_speculation",
         "agent_change_scope",
         "agent_tool_contracts",
+        "agent_test_impact",
+        "agent_workflow_macros",
     ]
     env = apply_wrap_feature_defaults({"HEADROOM_DISABLE_FEATURES": "agent_runtime,agent_evidence"})
     snapshot = resolve_rollout(env)

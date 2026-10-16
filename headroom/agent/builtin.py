@@ -38,6 +38,8 @@ FEATURE_TOOL_ADMISSION = "agent_tool_admission"
 FEATURE_FEEDBACK = "agent_feedback"
 FEATURE_CHANGE_SCOPE = "agent_change_scope"
 FEATURE_TOOL_CONTRACTS = "agent_tool_contracts"
+FEATURE_TEST_IMPACT = "agent_test_impact"
+FEATURE_WORKFLOW_MACROS = "agent_workflow_macros"
 
 STAGE_TASK_STATE = "task_state"
 LISTENER_SNAPSHOTS = "task_state_snapshots"
@@ -117,6 +119,8 @@ def install_builtin_components(runtime: Any, config: Any) -> Callable[[], None]:
     feedback_on = _enabled(config, FEATURE_FEEDBACK)
     scope_on = _enabled(config, FEATURE_CHANGE_SCOPE)
     contracts_on = _enabled(config, FEATURE_TOOL_CONTRACTS)
+    impact_on = _enabled(config, FEATURE_TEST_IMPACT)
+    macros_on = _enabled(config, FEATURE_WORKFLOW_MACROS)
     if not (
         task_on
         or evidence_on
@@ -125,6 +129,8 @@ def install_builtin_components(runtime: Any, config: Any) -> Callable[[], None]:
         or feedback_on
         or scope_on
         or contracts_on
+        or impact_on
+        or macros_on
     ):
         return lambda: None
 
@@ -205,8 +211,18 @@ def install_builtin_components(runtime: Any, config: Any) -> Callable[[], None]:
         runtime.services["feedback"] = feedback
 
     enforcement_names = _install_enforcement(runtime, scope_on=scope_on, contracts_on=contracts_on)
+    phase7_names = _install_verification(runtime, ledger, impact_on=impact_on, macros_on=macros_on)
 
     def teardown() -> None:
+        for name in phase7_names:
+            registry.unregister(name)
+        for key in ("test_impact", "workflow_macros"):
+            service = runtime.services.pop(key, None)
+            unbind = getattr(service, "unbind", None) or getattr(
+                getattr(service, "history", None), "unbind", None
+            )
+            if callable(unbind):
+                unbind()
         for name in enforcement_names:
             registry.unregister(name)
         for key in ("change_scope", "tool_contracts"):
@@ -264,4 +280,53 @@ def _install_enforcement(runtime: Any, *, scope_on: bool, contracts_on: bool) ->
         )
     registry.register_request_stage(STAGE_OBSERVE, observe_stage, order=60)
     names.append(STAGE_OBSERVE)
+    return names
+
+
+def _install_verification(
+    runtime: Any, ledger: Any, *, impact_on: bool, macros_on: bool
+) -> list[str]:
+    """Phase 7: the verification planner (#24) first, then workflow macros (#20).
+
+    The planner parses every ``TEST_RESULT`` (projector), records runs and
+    refreshes plans after commits (listener) and folds one advisory block per
+    request (stage order 65, which also carries the eligible workflows). The
+    macro registry observes closed tool segments (stage order 62, recorded on
+    the worker) and registers ``headroom_workflow`` in the shared tool registry.
+    """
+    names: list[str] = []
+    if impact_on:
+        from headroom.agent.test_impact import LISTENER_PLANNER, TestImpactPlanner
+
+        planner = TestImpactPlanner(runtime)
+        try:
+            planner.history.bind(ledger, runtime.submit_task)
+        except Exception as exc:  # noqa: BLE001 - memory-only history still works
+            log.warning("verification history persistence unavailable: %s", describe_exception(exc))
+        runtime.services["test_impact"] = planner
+        registry.register_projector(planner)
+        registry.register_commit_listener(LISTENER_PLANNER, planner.on_commit)
+        names += [planner.name, LISTENER_PLANNER]
+    if macros_on:
+        from headroom.agent.workflow_macros import (
+            STAGE_OBSERVE,
+            WorkflowMacroRegistry,
+            observe_stage,
+            register_local_tool,
+        )
+
+        macros = WorkflowMacroRegistry(runtime)
+        try:
+            macros.bind(ledger, runtime.submit_task)
+        except Exception as exc:  # noqa: BLE001 - memory-only macros still work
+            log.warning("workflow macro persistence unavailable: %s", describe_exception(exc))
+        runtime.services["workflow_macros"] = macros
+        register_local_tool()
+        registry.register_request_stage(STAGE_OBSERVE, observe_stage, order=62)
+        names.append(STAGE_OBSERVE)
+    if impact_on or macros_on:
+        from headroom.agent.test_impact import STAGE_VERIFICATION, verification_stage
+
+        registry.register_request_stage(STAGE_VERIFICATION, verification_stage, order=65)
+        names.append(STAGE_VERIFICATION)
     return names

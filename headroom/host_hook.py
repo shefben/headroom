@@ -37,7 +37,18 @@ MAX_STDIN_BYTES = 64 * 1024 * 1024
 MIN_RESULT_CHARS = 1500
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 _POST_TOOLS = frozenset({"Bash", "PowerShell", "Grep", "Glob"})
-_PRE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "PowerShell"})
+_PRE_TOOLS = frozenset(
+    {
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "NotebookEdit",
+        "Bash",
+        "PowerShell",
+        # Unified-21 #20: the workflow tool runs only behind this boundary.
+        "mcp__headroom__headroom_workflow",
+    }
+)
 _URL_ENVS = (
     PROXY_ENV,
     "ANTHROPIC_BASE_URL",

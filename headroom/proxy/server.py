@@ -3879,6 +3879,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
             # Unified-21 Phase 6: host pre-tool enforcement vs observe-only paths.
             payload["agent_enforcement"] = enforcement_health(proxy.config)
+            from headroom.agent.tool_admission.service import verification_health
+
+            # Unified-21 Phase 7: verification planner + learned workflows.
+            payload["agent_verification"] = verification_health(proxy.config)
         return payload
 
     # ---------------------------------------------------------------------------
@@ -5733,6 +5737,47 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="JSON object required")
         # to_thread copies the request context (trusted cwd/session vars).
         return await asyncio.to_thread(handle_host_hook_request, data, proxy.config)
+
+    # Unified-21 #20: the headroom_workflow tool (served by the Headroom MCP
+    # server, which forwards here with the wrap session token). Execution
+    # additionally needs the ticket the host pre-tool hook issued.
+    @app.post(
+        "/v1/agent/workflow",
+        dependencies=[Depends(_require_loopback), Depends(_require_same_origin)],
+    )
+    async def agent_workflow(request: Request):
+        from headroom.agent.workflow_macros import handle_workflow_request
+
+        try:
+            data = await request.json()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="JSON body required") from None
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="JSON object required")
+        return await asyncio.to_thread(handle_workflow_request, data, proxy.config)
+
+    @app.post(
+        "/v1/agent/workflow/cancel",
+        dependencies=[Depends(_require_loopback), Depends(_require_same_origin)],
+    )
+    async def agent_workflow_cancel(request: Request):
+        from headroom.agent.workflow_macros import handle_workflow_cancel
+
+        try:
+            data = await request.json()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="JSON body required") from None
+        return handle_workflow_cancel(data if isinstance(data, dict) else {}, proxy.config)
+
+    @app.get(
+        "/v1/agent/workflow/status",
+        dependencies=[Depends(_require_loopback)],
+    )
+    async def agent_workflow_status():
+        from headroom.agent.workflow_macros import workflow_status
+
+        status = workflow_status(proxy.config)
+        return {"enabled": status.get("enabled", False), "tool": status.get("tool")}
 
     # CCR (Compress-Cache-Retrieve) endpoints
     @app.post(

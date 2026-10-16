@@ -101,6 +101,10 @@ class LocalTool:
     available: Callable[[Mapping[str, Any]], bool] | None = None
 
 
+#: How Claude Code names a tool served by the Headroom MCP server.
+MCP_PREFIX = "mcp__headroom__"
+
+
 class ToolRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -118,9 +122,16 @@ class ToolRegistry:
         with self._lock:
             return [self._tools[k] for k in sorted(self._tools)]
 
-    def is_resident(self, name: str) -> bool:
+    def get(self, name: str) -> LocalTool | None:
+        """A local tool by its own name or as the host exposes it (``mcp__headroom__<name>``)."""
         with self._lock:
             tool = self._tools.get(name)
+            if tool is None and name.startswith(MCP_PREFIX):
+                tool = self._tools.get(name[len(MCP_PREFIX) :])
+        return tool
+
+    def is_resident(self, name: str) -> bool:
+        tool = self.get(name)
         return bool(tool is not None and tool.resident)
 
 

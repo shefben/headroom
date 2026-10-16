@@ -80,6 +80,9 @@ CCR_TOOL_NAME = "headroom_retrieve"
 COMPRESS_TOOL_NAME = "headroom_compress"
 STATS_TOOL_NAME = "headroom_stats"
 READ_TOOL_NAME = "headroom_read"
+WORKFLOW_TOOL_NAME = "headroom_workflow"
+#: A workflow may run up to 120 s in the proxy; leave room for the round trip.
+WORKFLOW_TIMEOUT_S = 150.0
 
 logger = logging.getLogger("headroom.ccr.mcp")
 
@@ -777,6 +780,13 @@ class HeadroomMCPServer:
                     )
                 )
 
+            # Unified-21 #20: the learned-workflow tool, listed only when the
+            # proxy runs the workflow feature. The schema is the one registered
+            # in the shared local-tool registry (no second catalog).
+            workflow = await self._workflow_tool()
+            if workflow is not None:
+                tools.append(workflow)
+
             return tools
 
         @self.server.call_tool()
@@ -796,6 +806,8 @@ class HeadroomMCPServer:
                     result = await self._handle_stats()
                 elif name == READ_TOOL_NAME and _READ_ENABLED:
                     result = await self._handle_read(arguments)
+                elif name == WORKFLOW_TOOL_NAME:
+                    result = await self._handle_workflow(arguments)
                 else:
                     result = [
                         TextContent(
@@ -922,6 +934,85 @@ class HeadroomMCPServer:
             json.dumps(result, ensure_ascii=False, default=str),
         )
 
+        return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
+
+    async def _workflow_tool(self) -> Any:
+        if not HTTPX_AVAILABLE:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                response = await client.get(f"{self.proxy_url}/v1/agent/workflow/status")
+            enabled = response.status_code == 200 and bool(response.json().get("enabled"))
+        except Exception:  # noqa: BLE001 - no proxy / feature off: the tool is not listed
+            return None
+        if not enabled:
+            return None
+        from headroom.agent.tool_catalog import REGISTRY
+        from headroom.agent.workflow_macros import register_local_tool
+
+        register_local_tool()
+        local = REGISTRY.get(WORKFLOW_TOOL_NAME)
+        if local is None or local.schema is None:
+            return None
+        return Tool(
+            name=WORKFLOW_TOOL_NAME,
+            description=str(local.schema["description"]),
+            inputSchema=dict(local.schema["input_schema"]),
+        )
+
+    async def _handle_workflow(self, arguments: dict[str, Any]) -> list[TextContent]:
+        """Forward ``headroom_workflow`` to the proxy with this session's wrap token.
+
+        The proxy executes only with the single-use ticket Claude Code's
+        pre-tool hook obtained for this exact call; a cancelled MCP request
+        cancels the run (its process group is killed).
+        """
+        import uuid
+
+        from headroom.host_hook import custom_headers
+
+        if not HTTPX_AVAILABLE:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps({"status": "unavailable", "reason": "httpx missing"}),
+                )
+            ]
+        run_id = uuid.uuid4().hex
+        body = {
+            "macro_id": arguments.get("macro_id") or "",
+            "typed_inputs": arguments.get("typed_inputs") or {},
+            "dry_run": bool(arguments.get("dry_run")),
+            "run_id": run_id,
+        }
+        headers = {"Content-Type": "application/json", **custom_headers(os.environ)}
+        try:
+            async with httpx.AsyncClient(timeout=WORKFLOW_TIMEOUT_S) as client:
+                response = await client.post(
+                    f"{self.proxy_url}/v1/agent/workflow", json=body, headers=headers
+                )
+            result = (
+                response.json()
+                if response.status_code == 200
+                else {
+                    "status": "unavailable",
+                    "reason": f"proxy HTTP {response.status_code}",
+                }
+            )
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    await client.post(
+                        f"{self.proxy_url}/v1/agent/workflow/cancel",
+                        json={"run_id": run_id},
+                        headers=headers,
+                    )
+            raise
+        except Exception as exc:  # noqa: BLE001 - reported to the caller
+            result = {
+                "status": "unavailable",
+                "reason": f"proxy unreachable: {describe_exception(exc)}",
+            }
         return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
     async def _handle_stats(self) -> list[TextContent]:
