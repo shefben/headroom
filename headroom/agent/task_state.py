@@ -48,6 +48,7 @@ from headroom.agent.events import (
     content_digest,
     make_event,
 )
+from headroom.agent.interfaces import WORKFLOW_TOOL_NAMES
 from headroom.agent.text_safety import safe_text
 from headroom.log_safety import describe_exception
 
@@ -906,9 +907,53 @@ class _Deriver:
         else:
             self.set_state(blocker, AtomState.ACTIVE, evidence=True)
 
+    def verification(self, meta: Mapping[str, Any]) -> None:
+        """Unified-21 #24: a failed/flaky/incomplete verification blocks completion.
+
+        A flaky test (failed, then passed on an unchanged changeset) or a
+        mandatory full suite that has not run yet keeps one blocker ACTIVE even
+        when the latest test command exited 0; only a verified plan clears it.
+        """
+        if self.state is None:
+            return
+        overall = str(meta.get("overall") or "")
+        blocker_id = _blocker_id(self.state.id, "verification")
+        existing = self.state.atom(blocker_id)
+        if overall == "verified":
+            if (
+                existing is not None
+                and existing.live
+                and existing.state != AtomState.SATISFIED.value
+            ):
+                self.set_state(existing, AtomState.SATISFIED, evidence=True)
+            return
+        if overall == "flaky":
+            ids = ", ".join(str(i) for i in (meta.get("flaky_ids") or ())[:3])
+            text = f"Verification not green: flaky test(s) {ids} failed then passed unchanged"
+        elif overall == "failed":
+            text = f"Verification failed: {meta.get('failed') or 0} failing test(s)"
+        elif overall == "incomplete" and meta.get("status") == "passed":
+            required = [str(c) for c in (meta.get("required") or ())]
+            missing = ", ".join(c.replace("_", " ") for c in required) or "required checks"
+            text = f"Verification incomplete: required {missing} not yet passed"
+        else:
+            return
+        if existing is None or not existing.live:
+            self.add_atom(
+                AtomKind.BLOCKER,
+                text,
+                AtomOrigin.TOOL,
+                atom_id=blocker_id,
+                evidence_ids=self.evidence_ids,
+            )
+        elif existing.state != AtomState.ACTIVE.value:
+            self.set_state(existing, AtomState.ACTIVE, evidence=True)
+
     def tool_result(self, meta: Mapping[str, Any], text: str | None) -> None:
         if self.state is None:
             return
+        if str(meta.get("tool_name") or "") in WORKFLOW_TOOL_NAMES:
+            return  # its steps were ingested individually
         from headroom.agent.evidence import _error_signature
         from headroom.agent.normalize import _TEST_COMMAND
 
@@ -1013,6 +1058,8 @@ def derive_transitions(
         deriver.agent_output(text)
     elif kind == EventKind.TEST_RESULT.value:
         deriver.test_result(event.redacted_metadata)
+    elif kind == EventKind.VERIFICATION_DECISION.value:
+        deriver.verification(event.redacted_metadata)
     elif kind == EventKind.TOOL_RESULT.value:
         deriver.tool_result(event.redacted_metadata, text)
     elif kind == EventKind.FILE_CHANGE.value:
@@ -1082,9 +1129,10 @@ class TaskStateProjector:
             EventKind.TEST_RESULT.value,
             EventKind.TOOL_RESULT.value,
             EventKind.FILE_CHANGE.value,
+            EventKind.VERIFICATION_DECISION.value,
         ):
             return
-        if envelope.content is None:
+        if envelope.content is None and event.kind != EventKind.VERIFICATION_DECISION.value:
             return  # replay of a raw event: the TASK_STATE_CHANGE events carry its effect
         evidence_ids: list[str] | None = None
         chooser = None
@@ -1093,6 +1141,7 @@ class TaskStateProjector:
             if evidence_ids is None and event.kind in (
                 EventKind.TEST_RESULT.value,
                 EventKind.TOOL_RESULT.value,
+                EventKind.VERIFICATION_DECISION.value,
             ):
                 evidence_ids = self._evidence_lookup(event)
             if chooser is None and event.kind == EventKind.USER_INTENT.value:

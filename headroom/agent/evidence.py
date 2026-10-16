@@ -50,6 +50,7 @@ from headroom.agent.events import (
     content_digest,
     make_event,
 )
+from headroom.agent.interfaces import WORKFLOW_TOOL_NAMES
 from headroom.agent.text_safety import clip, safe_text
 
 if TYPE_CHECKING:
@@ -392,6 +393,32 @@ def extract_candidates(envelope: EventEnvelope) -> list[FactCandidate]:
     kind = event.kind
     out: list[FactCandidate] = []
 
+    if kind == EventKind.VERIFICATION_DECISION.value:
+        # Unified-21 #24: one verification verdict per recorded run. A flaky
+        # or failed verdict is negative evidence even when the last run passed.
+        overall = str(meta.get("overall") or meta.get("status") or "")
+        if overall not in ("verified", "failed", "flaky", "incomplete"):
+            return out
+        value = {
+            "overall": overall,
+            "check": meta.get("check"),
+            "rev": meta.get("plan_revision"),
+            "failed": meta.get("failed"),
+            "flaky": meta.get("flaky"),
+            "exit": meta.get("exit_code"),
+            "os": meta.get("platform"),
+        }
+        out.append(
+            FactCandidate(
+                f"verification:{meta.get('framework') or 'tests'}",
+                "verification.status",
+                value,
+                "negative" if overall in ("failed", "flaky") else "positive",
+                SourceKind.TEST,
+            )
+        )
+        return out
+
     if kind == EventKind.TEST_RESULT.value:
         command = str(meta.get("command_head") or meta.get("runner") or "tests")
         exit_code = meta.get("exit_code")
@@ -423,6 +450,8 @@ def extract_candidates(envelope: EventEnvelope) -> list[FactCandidate]:
 
     if kind == EventKind.TOOL_RESULT.value:
         tool = str(meta.get("tool_name") or "")
+        if tool in WORKFLOW_TOOL_NAMES:
+            return out  # each workflow step was ingested as its own tool event
         command = meta.get("command_head")
         path_subject = event.resource_id or (
             normalize_subject(str(meta["path"])) if meta.get("path") else None

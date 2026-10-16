@@ -29,6 +29,10 @@ RELEVANCE_QUERY_VERSION = 1
 RELEVANCE_QUERY_MAX_TOKENS = 512
 DECISION_HINTS_VERSION = 1
 TOOL_RESULT_ENVELOPE_VERSION = 2
+
+#: Headroom's own workflow tool (unified-21 #20): its steps are ingested as
+#: individual tool events, so its aggregate result is never re-ingested.
+WORKFLOW_TOOL_NAMES = frozenset({"headroom_workflow", "mcp__headroom__headroom_workflow"})
 #: v1 envelopes (no admission fields) still deserialize; their new fields default.
 _ENVELOPE_READABLE_VERSIONS = (1, 2)
 ACTION_AUTHORIZATION_VERSION = 1
