@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from headroom._subprocess import run as _run_process
 from headroom.agent.private_fs import secure_dir
 from headroom.intelligence.settings import IntelligenceSettings
 from headroom.offline import guard_egress, is_offline
@@ -49,7 +50,7 @@ def _cuda_available() -> bool:
 def _step(args: list[str], cwd: Path | None, log: LogFn, timeout: float) -> None:
     log("$ " + " ".join(args))
     try:
-        result = subprocess.run(
+        result = _run_process(
             args,
             cwd=str(cwd) if cwd else None,
             capture_output=True,
@@ -90,8 +91,12 @@ def build_llama_server(settings: IntelligenceSettings, *, log: LogFn = print) ->
     secure_dir(root.parent)
     guard_egress("llama.cpp source checkout", settings.llama_cpp_repo)
     if not (root / ".git").is_dir():
-        _step([git, "clone", "--filter=blob:none", settings.llama_cpp_repo, str(root)], None, log,
-              1800)
+        _step(
+            [git, "clone", "--filter=blob:none", settings.llama_cpp_repo, str(root)],
+            None,
+            log,
+            1800,
+        )
     else:
         _step([git, "fetch", "--tags", "origin"], root, log, 900)
     _step([git, "checkout", "--detach", settings.llama_cpp_ref], root, log, 300)
@@ -111,8 +116,17 @@ def build_llama_server(settings: IntelligenceSettings, *, log: LogFn = print) ->
     _step(configure, root, log, 1800)
     jobs = str(max(1, (os.cpu_count() or 2) - 1))
     _step(
-        [cmake, "--build", str(root / "build"), "--config", "Release", "--target", "llama-server",
-         "-j", jobs],
+        [
+            cmake,
+            "--build",
+            str(root / "build"),
+            "--config",
+            "Release",
+            "--target",
+            "llama-server",
+            "-j",
+            jobs,
+        ],
         root,
         log,
         7200,

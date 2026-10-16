@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from headroom._subprocess import run as _run_process
 from headroom.agent.private_fs import read_json
 from headroom.intelligence.settings import JEVK5_PIP_SPEC, JEVK5_RUNTIME_VERSION
 from headroom.offline import is_offline
@@ -57,7 +58,7 @@ class LlamaBinary:
 
 def _run(args: list[str], timeout: float = _PROBE_TIMEOUT_S) -> tuple[int, str]:
     try:
-        result = subprocess.run(
+        result = _run_process(
             args,
             capture_output=True,
             text=True,
@@ -111,9 +112,7 @@ def probe_binary(path: str, source: str) -> LlamaBinary:
     )
 
 
-def candidate_binaries(
-    override: str | None, manifest_path: Path | None
-) -> list[tuple[str, str]]:
+def candidate_binaries(override: str | None, manifest_path: Path | None) -> list[tuple[str, str]]:
     seen: set[str] = set()
     out: list[tuple[str, str]] = []
 
@@ -139,8 +138,16 @@ def candidate_binaries(
     home = os.environ.get("LLAMA_CPP_HOME")
     if home:
         base = Path(home).expanduser()
-        for rel in ("", "bin", "build/bin", "build/bin/Release", "build/bin/RelWithDebInfo",
-                    "build-cuda/bin", "build-cuda/bin/Release", "build/Release"):
+        for rel in (
+            "",
+            "bin",
+            "build/bin",
+            "build/bin/Release",
+            "build/bin/RelWithDebInfo",
+            "build-cuda/bin",
+            "build-cuda/bin/Release",
+            "build/Release",
+        ):
             add(str(base / rel / _EXE), "LLAMA_CPP_HOME")
     return out
 
