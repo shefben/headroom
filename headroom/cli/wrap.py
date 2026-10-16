@@ -2320,18 +2320,23 @@ def _report_tool_enforcement(client: str, *, hook_installed: bool, reason: str =
         )
 
 
-def _report_workflows(*, hook_installed: bool) -> None:
+def _report_workflows(*, hook_installed: bool, client: str = "claude") -> None:
     """One honest line: whether learned workflows can run in this session."""
-    if hook_installed:
+    from headroom.agent.workflow_hosts import workflow_host
+
+    host = workflow_host(client)
+    if host.ticketed and hook_installed:
         click.echo(
             "  Learned workflows: headroom_workflow (MCP) runs repeated read-only/verification "
             "steps behind the pre-tool hook; mutating steps never auto-run"
         )
-    else:
+    elif host.ticketed:
         click.echo(
             "  Learned workflows: observed only (no host pre-tool hook / MCP tool, so "
             "nothing is run for you)"
         )
+    else:
+        click.echo(f"  Learned workflows: observed only ({host.reason})")
 
 
 def _write_claude_wrap_base_url(
@@ -5964,6 +5969,8 @@ def _launch_tool(
             _report_tool_admission(agent_type, hook_installed=False)
         if _tool_enforcement_enabled_for_wrap():
             _report_tool_enforcement(agent_type, hook_installed=False)
+        if _workflows_enabled_for_wrap():
+            _report_workflows(hook_installed=False, client=agent_type)
         _print_telemetry_notice()
         click.echo()
 

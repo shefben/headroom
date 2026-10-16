@@ -32,6 +32,8 @@ from typing import Any
 ENDPOINT = "/v1/agent/host-hook"
 PROXY_ENV = "HEADROOM_HOOK_PROXY_URL"
 DEBUG_ENV = "HEADROOM_HOOK_DEBUG"
+#: Set by Claude Code for its child processes (hooks included).
+HOST_AGENT_ENV = "AI_AGENT"
 MAX_STDIN_BYTES = 64 * 1024 * 1024
 #: Below this serialized size a result is never worth a round trip.
 MIN_RESULT_CHARS = 1500
@@ -136,7 +138,14 @@ def forward(
     headers = {"Content-Type": "application/json"}
     for key, value in custom_headers(env).items():
         headers[key] = value
-    body = json.dumps({"client": client, "payload": payload}).encode("utf-8")
+    body_obj: dict[str, Any] = {"client": client, "payload": payload}
+    agent = env.get(HOST_AGENT_ENV)
+    if agent:
+        # The host's own name/version (e.g. ``claude-code_2-1-300_agent``): the
+        # proxy only lets workflow steps that reproduce host tool semantics run
+        # on host versions they were verified against.
+        body_obj["host"] = {"agent": agent[:128]}
+    body = json.dumps(body_obj).encode("utf-8")
     request = urllib.request.Request(base + ENDPOINT, data=body, headers=headers, method="POST")
     # Loopback only: never route the payload through an environment HTTP proxy.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))

@@ -10,7 +10,9 @@ targeted test runs, compiled workflow-macro steps) goes through
   ``CREATE_NEW_PROCESS_GROUP`` — so a timeout or cancellation kills the whole
   tree (``killpg``; ``taskkill /T /F`` on Windows), never just the parent;
 * **strict deadline** and a cooperative ``cancel`` event polled while waiting;
-* **bounded output** — stdout+stderr are merged and kept up to
+* **bounded output** — stdout+stderr are merged (or, with
+  ``merge_stderr=False``, kept apart: a tool whose stdout is its *result*,
+  such as ripgrep, must not have diagnostics mixed into it) and kept up to
   ``capture_bytes``; anything beyond is counted and flagged as truncated so a
   partial output is never presented as complete;
 * **scrubbed environment** — provider credentials and the wrap session token
@@ -60,6 +62,8 @@ class RunResult:
     started: bool = True
     tree_killed: bool = False
     meta: dict[str, Any] = field(default_factory=dict)
+    #: Separate stderr (only with ``merge_stderr=False``; else merged into output).
+    stderr: str = ""
 
     @property
     def ok(self) -> bool:
@@ -187,6 +191,7 @@ def run_argv(
     cancel: threading.Event | None = None,
     capture_bytes: int = DEFAULT_CAPTURE_BYTES,
     env: Mapping[str, str] | None = None,
+    merge_stderr: bool = True,
 ) -> RunResult:
     """Run ``argv`` directly (``shell=False``) under a strict deadline (see module doc)."""
     started_at = time.monotonic()
@@ -208,7 +213,7 @@ def run_argv(
             shell=False,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
             env=dict(env) if env is not None else child_env(),
             **_popen_kwargs(),
         )
@@ -217,6 +222,11 @@ def run_argv(
     collector = _Collector(capture_bytes)
     reader = threading.Thread(target=collector.feed, args=(proc.stdout,), daemon=True)
     reader.start()
+    errors = _Collector(64 * 1024)
+    err_reader: threading.Thread | None = None
+    if not merge_stderr:
+        err_reader = threading.Thread(target=errors.feed, args=(proc.stderr,), daemon=True)
+        err_reader.start()
     deadline = started_at + max(0.1, float(timeout_s))
     timed_out = cancelled = killed = False
     while proc.poll() is None:
@@ -237,11 +247,14 @@ def run_argv(
         except OSError:
             pass
     reader.join(timeout=_KILL_GRACE_S * 2)
-    try:
-        if proc.stdout is not None:
-            proc.stdout.close()
-    except OSError:
-        pass
+    if err_reader is not None:
+        err_reader.join(timeout=_KILL_GRACE_S * 2)
+    for stream in (proc.stdout, proc.stderr):
+        try:
+            if stream is not None:
+                stream.close()
+        except OSError:
+            pass
     return RunResult(
         argv=tokens,
         exit_code=None if (timed_out or cancelled) else proc.returncode,
@@ -253,6 +266,7 @@ def run_argv(
         total_bytes=collector.total,
         tree_killed=killed,
         meta={"pid": proc.pid},
+        stderr=errors.text() if not merge_stderr else "",
     )
 
 

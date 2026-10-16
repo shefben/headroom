@@ -781,7 +781,8 @@ class HeadroomMCPServer:
                 )
 
             # Unified-21 #20: the learned-workflow tool, listed only when the
-            # proxy runs the workflow feature. The schema is the one registered
+            # proxy runs the workflow feature and the MCP client is a host whose
+            # pre-tool boundary can approve it. The schema is the one registered
             # in the shared local-tool registry (no second catalog).
             workflow = await self._workflow_tool()
             if workflow is not None:
@@ -938,6 +939,13 @@ class HeadroomMCPServer:
 
     async def _workflow_tool(self) -> Any:
         if not HTTPX_AVAILABLE:
+            return None
+        from headroom.agent.workflow_hosts import host_for_mcp_client
+
+        if host_for_mcp_client(self._current_client()) is None:
+            # Only a client with a Headroom-installed pre-tool permission
+            # boundary can ever start a workflow; others are observe-only
+            # (agent.workflow_hosts), so the tool is not offered to them.
             return None
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:

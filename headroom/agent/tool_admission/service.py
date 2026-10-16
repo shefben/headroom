@@ -77,14 +77,16 @@ def handle_host_hook_request(data: dict[str, Any], config: Any) -> dict[str, Any
             runtime = active_runtime()
             macros = runtime.services.get("workflow_macros") if runtime is not None else None
             if macros is not None:
-                macros.note_hook(identity.session_id)  # this session has the host hook
+                macros.note_hook(identity.session_id, client)  # this session has the hook
                 if (
                     payload.get("hook_event_name") == "PreToolUse"
                     and str(payload.get("tool_name") or "") in WORKFLOW_TOOL_NAMES
                 ):
-                    # Unified-21 #20: the workflow tool's host boundary issues
-                    # the single-use, revision-pinned execution ticket.
-                    return macros.pretool(payload, identity=identity)
+                    # Unified-21 #20: the host adapter (workflow_hosts) reads the
+                    # hook; the client-independent registry issues the
+                    # single-use, revision-pinned execution ticket.
+                    host = data.get("host") if isinstance(data.get("host"), dict) else None
+                    return macros.pretool(payload, identity=identity, client=client, host=host)
         if payload.get("hook_event_name") == "PreToolUse" and enforcement_on:
             # Unified-21 Phase 6: the trusted pre-tool boundary. Admission's
             # edit-target observation still runs (it never prints anything).

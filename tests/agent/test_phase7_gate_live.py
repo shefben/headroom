@@ -298,11 +298,15 @@ def _learn(live) -> tuple[list[dict], str]:
     return history, match.group(1)
 
 
-def test_gate7_live_macro_reduces_model_tool_turns(live):
+def test_gate7_live_macro_reduces_model_tool_turns(live, monkeypatch):
     history, macro_id = _learn(live)
     baseline_turns = _tool_turns(_round(live["project"], 9))
     assert baseline_turns == 3
-    # The MCP server lists the tool (schema from the shared registry).
+    # Observe-only clients (no Headroom pre-tool boundary) are never offered it.
+    monkeypatch.setenv("HEADROOM_MCP_CLIENT", "codex-mcp-client")
+    assert asyncio.run(_mcp(live)._workflow_tool()) is None
+    # Claude Code's MCP client gets the tool (schema from the shared registry).
+    monkeypatch.setenv("HEADROOM_MCP_CLIENT", "claude-code")
     tool = asyncio.run(_mcp(live)._workflow_tool())
     assert tool is not None and tool.name == "headroom_workflow"
     # The model calls the workflow once: host pre-tool hook → MCP → proxy.

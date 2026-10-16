@@ -25,10 +25,15 @@ Promotion:
 
 Execution (``headroom_workflow(macro_id, typed_inputs, dry_run)``):
     A local tool registered in the existing :data:`tool_catalog.REGISTRY`
-    and exposed by the Headroom MCP server. Only a genuine host permission
-    boundary can start it: Claude Code's pre-tool hook validates the call and
-    issues a revision-pinned single-use ticket; the MCP call (which runs only
-    after the host's own permission check) must present a matching ticket.
+    and exposed by the Headroom MCP server. This engine is client-independent;
+    host specifics live in :mod:`headroom.agent.workflow_hosts`. Only a host
+    adapter with a genuine pre-tool permission boundary can start a workflow
+    (today: Claude Code's PreToolUse hook, which validates the call so a
+    revision-pinned single-use ticket is issued; the MCP call, which runs only
+    after the host's own permission check, must present it). Every other
+    client is observe-only. Steps learned from a host's built-in read/search
+    tools re-execute only through that host's step dialect (same semantics,
+    e.g. ripgrep for Claude Code's Grep/Glob) or are not eligible at all.
     Every step is re-checked immediately before it runs — fresh task/scope
     revision compare, current ToolContract decision, ChangeScope
     authorization — and runs as direct argv with ``shell=False`` in its own
@@ -43,7 +48,6 @@ Execution (``headroom_workflow(macro_id, typed_inputs, dry_run)``):
 
 from __future__ import annotations
 
-import fnmatch
 import hashlib
 import json
 import logging
@@ -67,6 +71,7 @@ log = logging.getLogger(__name__)
 
 FEATURE_WORKFLOW_MACROS = "agent_workflow_macros"
 WORKFLOW_TOOL = "headroom_workflow"
+#: Claude Code's spelling of the tool (kept for callers; see workflow_hosts).
 WORKFLOW_MCP_TOOL = "mcp__headroom__headroom_workflow"
 STAGE_OBSERVE = "agent_workflow_observe"
 
@@ -81,9 +86,6 @@ MAX_STEP_SECONDS = 90.0
 TICKET_TTL_S = 300.0
 STEP_OUTPUT_PREVIEW = 1500
 STEP_OUTPUT_EXTERNALIZE = 4000
-MAX_READ_BYTES = 2 * 1024 * 1024
-MAX_GREP_FILES = 2000
-MAX_GLOB_RESULTS = 500
 _SEGMENT_MESSAGES = 400
 _SEEN_LIMIT = 16384
 _OBS_PER_MACRO = 32
@@ -177,7 +179,7 @@ def _digest(*parts: Any) -> str:
 @dataclass(frozen=True)
 class SlotSpec:
     name: str
-    type: str  # path | paths | pattern | glob | tests | int
+    type: str  # path | paths | rg_pattern | rg_glob | tests | int
     required: bool = True
 
     def to_dict(self) -> dict[str, Any]:
@@ -193,12 +195,19 @@ class StepTemplate:
     slots: tuple[SlotSpec, ...] = ()
     safety: str = Safety.UNSUPPORTED.value
     framework: str = ""
+    #: Host step dialect of a host built-in tool step (workflow_hosts); "" for argv steps.
+    dialect: str = ""
 
     def key(self) -> str:
-        return json.dumps(
-            [self.kind, self.family, list(self.argv), [s.to_dict() for s in self.slots]],
-            separators=(",", ":"),
-        )
+        parts: list[Any] = [
+            self.kind,
+            self.family,
+            list(self.argv),
+            [s.to_dict() for s in self.slots],
+        ]
+        if self.dialect:
+            parts.append(self.dialect)
+        return json.dumps(parts, separators=(",", ":"))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -209,6 +218,7 @@ class StepTemplate:
             "slots": [s.to_dict() for s in self.slots],
             "safety": self.safety,
             "framework": self.framework,
+            "dialect": self.dialect,
         }
 
     @classmethod
@@ -224,6 +234,7 @@ class StepTemplate:
             ),
             safety=str(value.get("safety") or Safety.UNSUPPORTED.value),
             framework=str(value.get("framework") or ""),
+            dialect=str(value.get("dialect") or ""),
         )
 
     def describe(self, defaults: Mapping[str, Any] | None = None) -> str:
@@ -455,79 +466,16 @@ def normalize_call(tool_name: str, args: Mapping[str, Any], root: str | None) ->
     if name in WORKFLOW_TOOL_NAMES:
         return _unsupported(name, "headroom.workflow")
     args = args if isinstance(args, Mapping) else {}
+    from headroom.agent.workflow_hosts import normalize_host_tool
+
+    hosted = normalize_host_tool(name, args, root)
+    if hosted is not None:
+        return hosted  # a host built-in tool: its dialect reproduces it, or refuses it
     family = family_of(name, args)
-    if lname == "read":
-        rel = _rel_value(args.get("file_path") or args.get("path"), root)
-        if rel is None:
-            return _unsupported(name, "read.outside")
-        values: dict[str, Any] = {"path": rel}
-        slots = [SlotSpec("path", "path")]
-        for key in ("offset", "limit"):
-            if isinstance(args.get(key), int) and not isinstance(args.get(key), bool):
-                values[key] = int(args[key])
-                slots.append(SlotSpec(key, "int", required=False))
-        return NormalizedStep(
-            StepTemplate("read", "read.file", "Read", (), tuple(slots), Safety.READ_ONLY.value),
-            values,
-        )
-    if lname == "glob":
-        pattern = args.get("pattern")
-        if not isinstance(pattern, str) or not _glob_ok(pattern):
-            return _unsupported(name, "search.glob")
-        values = {"pattern": pattern}
-        slots = [SlotSpec("pattern", "glob")]
-        if args.get("path"):
-            rel = _rel_value(args.get("path"), root)
-            if rel is None:
-                return _unsupported(name, "search.glob")
-            values["path"] = rel or "."
-            slots.append(SlotSpec("path", "path", required=False))
-        return NormalizedStep(
-            StepTemplate("glob", "search.glob", "Glob", (), tuple(slots), Safety.READ_ONLY.value),
-            values,
-        )
-    if lname == "grep":
-        pattern = args.get("pattern")
-        if not isinstance(pattern, str) or not _pattern_ok(pattern):
-            return _unsupported(name, "search.grep")
-        values = {"pattern": pattern}
-        slots = [SlotSpec("pattern", "pattern")]
-        constants: list[str] = []
-        for key in sorted(args):
-            value = args[key]
-            if key == "pattern":
-                continue
-            if key == "path":
-                rel = _rel_value(value, root)
-                if rel is None:
-                    return _unsupported(name, "search.grep")
-                values["path"] = rel or "."
-                slots.append(SlotSpec("path", "path", required=False))
-            elif key == "glob" and isinstance(value, str) and _glob_ok(value):
-                values["glob"] = value
-                slots.append(SlotSpec("glob", "glob", required=False))
-            elif key in (
-                "output_mode",
-                "-i",
-                "-n",
-                "multiline",
-                "type",
-                "head_limit",
-            ) and isinstance(value, str | bool | int):
-                constants.append(f"{key}={json.dumps(value)}")
-            else:
-                return _unsupported(name, "search.grep")
-        return NormalizedStep(
-            StepTemplate(
-                "grep",
-                "search.grep",
-                "Grep",
-                tuple(constants),
-                tuple(slots),
-                Safety.READ_ONLY.value,
-            ),
-            values,
-        )
+    if family in (Family.READ, Family.SEARCH):
+        # Another host's read/search tool: no dialect reproduces its
+        # semantics, so it is never generalized into an executable step.
+        return _unsupported(name, f"{family.value}.{lname}")
     if family is Family.EDIT:
         return _no_argv(name, f"edit.{lname}", Safety.MUTATING)
     if family is Family.HTTP:
@@ -549,16 +497,6 @@ def _glob_ok(pattern: str) -> bool:
         and not pattern.startswith(("/", "\\"))
         and ".." not in re.split(r"[\\/]", pattern)
     )
-
-
-def _pattern_ok(pattern: str) -> bool:
-    if not (0 < len(pattern) <= 300) or "\x00" in pattern or "\n" in pattern:
-        return False
-    try:
-        re.compile(pattern)
-    except re.error:
-        return False
-    return True
 
 
 def _normalize_command(tool: str, command: str, root: str | None) -> NormalizedStep:
@@ -1183,6 +1121,8 @@ class Ticket:
     pins: tuple[Any, ...]
     issued_at: float
     call_id: str
+    client: str = ""
+    host_version: str | None = None
 
 
 def _inputs_digest(inputs: Any) -> str:
@@ -1246,7 +1186,7 @@ class WorkflowMacroRegistry:
         self._tickets: OrderedDict[tuple[str, str, str], Ticket] = OrderedDict()
         self._runs: dict[str, threading.Event] = {}
         self._busy: set[str] = set()
-        self._hook_seen: OrderedDict[str, float] = OrderedDict()
+        self._hook_seen: OrderedDict[str, tuple[str, float]] = OrderedDict()
         self._db: Any = None
         self._submit: Any = None
         self.counters: dict[str, int] = {
@@ -1483,10 +1423,17 @@ class WorkflowMacroRegistry:
         """Executables, runner config and enforcement policy a macro depends on."""
         from headroom.agent.change_scope import EnforcementPolicy
         from headroom.agent.exec_runner import resolve_executable
+        from headroom.agent.workflow_hosts import dialect
 
         parts: list[str] = [json.dumps(EnforcementPolicy.from_env().to_dict(), sort_keys=True)]
         root = identity.root
         for step in macro.steps:
+            if step.kind in ("read", "glob", "grep"):
+                host_dialect = dialect(step.dialect)
+                stamp = host_dialect.fingerprint(step) if host_dialect is not None else None
+                if stamp is None:
+                    return None  # e.g. ripgrep gone: the step cannot be reproduced
+                parts.append(stamp)
             if step.kind in ("exec", "verify") and step.argv:
                 path = resolve_executable(step.argv[0])
                 if path is None:
@@ -1553,9 +1500,10 @@ class WorkflowMacroRegistry:
 
     # -- advertisement (request path; cheap) --------------------------------
 
-    def note_hook(self, session_id: str) -> None:
+    def note_hook(self, session_id: str, client: str = "claude") -> None:
+        """A host pre-tool hook of ``client`` reached the proxy for this session."""
         with self._lock:
-            self._hook_seen[session_id] = self._clock()
+            self._hook_seen[session_id] = (client, self._clock())
             self._hook_seen.move_to_end(session_id)
             while len(self._hook_seen) > 4096:
                 self._hook_seen.popitem(last=False)
@@ -1567,15 +1515,24 @@ class WorkflowMacroRegistry:
         if not active:
             return []
         from headroom.agent.tool_contracts import _schemas_from_tools
+        from headroom.agent.workflow_hosts import HOSTS, workflow_host
 
         names = set(_schemas_from_tools(getattr(ctx, "tools", None)))
-        tool = next((n for n in (WORKFLOW_MCP_TOOL, WORKFLOW_TOOL) if n in names), None)
-        if tool is None:
+        offered = {n for h in HOSTS.values() if h.ticketed for n in h.workflow_tool_names}
+        if not names & offered:
             self.counters["fallback_tool_missing"] += 1
             return []
         with self._lock:
-            hook = identity.session_id in self._hook_seen
-        if not hook:
+            seen = self._hook_seen.get(identity.session_id)
+        host = workflow_host(seen[0]) if seen is not None else None
+        tool = (
+            next((n for n in sorted(host.workflow_tool_names) if n in names), None)
+            if host is not None and host.ticketed
+            else None
+        )
+        if tool is None:
+            # No host permission boundary has spoken for this session: an
+            # advertised workflow could never start, so none is offered.
             self.counters["fallback_hook_missing"] += 1
             return []
         lines: list[tuple[int, str]] = [
@@ -1659,36 +1616,17 @@ class WorkflowMacroRegistry:
         compiled: list[CompiledStep] = []
         for i, step in enumerate(macro.steps):
             v = values[i]
-            if step.kind == "read":
-                rel = v["path"]
-                tool_input: dict[str, Any] = {
-                    "file_path": os.path.join(root, rel).replace("\\", "/")
-                }
-                for key in ("offset", "limit"):
-                    if key in v:
-                        tool_input[key] = v[key]
-                compiled.append(CompiledStep(i, step, "Read", tool_input, cwd=root, values=v))
-            elif step.kind in ("glob", "grep"):
-                tool_input = {"pattern": v["pattern"]}
-                if "path" in v:
-                    tool_input["path"] = os.path.join(root, v["path"]).replace("\\", "/")
-                if "glob" in v:
-                    tool_input["glob"] = v["glob"]
-                for const in step.argv:
-                    key, _, raw = const.partition("=")
-                    tool_input[key] = json.loads(raw)
-                compiled.append(
-                    CompiledStep(
-                        i,
-                        step,
-                        step.tool.capitalize()
-                        if step.tool.lower() in ("glob", "grep")
-                        else step.tool,
-                        tool_input,
-                        cwd=root,
-                        values=v,
+            if step.kind in ("read", "glob", "grep"):
+                from headroom.agent.workflow_hosts import dialect
+
+                host_dialect = dialect(step.dialect)
+                if host_dialect is None:
+                    raise WorkflowError(
+                        "workflow.step_dialect_unavailable",
+                        f"s{i + 1} ({step.family}) has no host dialect that reproduces it",
                     )
-                )
+                tool_name, tool_input = host_dialect.compile_input(step, v, root)
+                compiled.append(CompiledStep(i, step, tool_name, tool_input, cwd=root, values=v))
             elif step.kind in ("exec", "verify"):
                 tier, targets, argv, cwd, note = 0, (), None, root, ""
                 if step.kind == "verify" and "tests" not in v and plan is not None:
@@ -1771,37 +1709,63 @@ class WorkflowMacroRegistry:
 
     # -- host pre-tool boundary ---------------------------------------------
 
-    def pretool(self, payload: Mapping[str, Any], *, identity: Any) -> dict[str, Any]:
-        """``PreToolUse`` for the workflow tool: validate, then issue a single-use ticket."""
-        from headroom.agent.enforcement import render_pretool
+    def pretool(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        identity: Any,
+        client: str = "claude",
+        host: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """A host pre-tool hook payload for the workflow tool (see :mod:`workflow_hosts`).
 
-        tool_input = (
-            payload.get("tool_input") if isinstance(payload.get("tool_input"), Mapping) else {}
-        )
-        macro_id = str(tool_input.get("macro_id") or "")
-        typed = (
-            tool_input.get("typed_inputs")
-            if isinstance(tool_input.get("typed_inputs"), Mapping)
-            else {}
-        )
-        call_id = str(payload.get("tool_use_id") or "")
-        self.note_hook(identity.session_id)
-        if bool(tool_input.get("dry_run")) or not macro_id:
-            return {"output": None, "stage": "workflow:dry_run", "capability": "host_pretool"}
+        The host adapter parses the payload and renders the answer in the host's
+        own protocol; :meth:`authorize_call` decides, client-independently.
+        """
+        from headroom.agent.workflow_hosts import workflow_host
+
+        adapter = workflow_host(client)
+        call = adapter.parse_pretool(payload, host) if adapter.ticketed else None
+        if call is None:
+            return {
+                "output": None,
+                "stage": "workflow:observe_only",
+                "capability": adapter.capability,
+            }
+        self.note_hook(identity.session_id, adapter.client)
+        verdict = self.authorize_call(identity, call, client=adapter.client)
+        out: dict[str, Any] = {
+            "output": None,
+            "stage": verdict["stage"],
+            "capability": adapter.capability,
+        }
+        if verdict["stage"] == "workflow:denied":
+            out["output"] = adapter.render_refusal(
+                f"{verdict['message']} [{verdict['reason_code']}]; run the steps with your "
+                "normal tools instead"
+            )
+            out["reason_code"] = verdict["reason_code"]
+        return out
+
+    def authorize_call(self, identity: Any, call: Any, *, client: str) -> dict[str, Any]:
+        """Validate one host-approved workflow call; on success issue its single-use ticket.
+
+        ``call`` is a :class:`~headroom.agent.workflow_hosts.PretoolCall`. Returns
+        ``{"stage": "workflow:ticket" | "workflow:dry_run" | "workflow:untrusted" |
+        "workflow:denied", "reason_code", "message"}``.
+        """
+        from headroom.agent.workflow_hosts import dialect
+
+        if call.dry_run or not call.macro_id:
+            return {"stage": "workflow:dry_run", "reason_code": "", "message": ""}
 
         def deny(code: str, message: str) -> dict[str, Any]:
             self.counters["pretool_denied"] += 1
-            return {
-                "output": render_pretool(
-                    "BLOCK", f"{message} [{code}]; run the steps with your normal tools instead"
-                ),
-                "stage": "workflow:denied",
-                "capability": "host_pretool",
-                "reason_code": code,
-            }
+            return {"stage": "workflow:denied", "reason_code": code, "message": message}
 
         if not identity.can_authorize_paths():
-            return {"output": None, "stage": "workflow:untrusted", "capability": "host_pretool"}
+            return {"stage": "workflow:untrusted", "reason_code": "", "message": ""}
+        macro_id = call.macro_id
         macro = self.get(identity.workspace_id, macro_id)
         if macro is None or macro.status != MacroStatus.ACTIVE.value:
             return deny(
@@ -1812,32 +1776,46 @@ class WorkflowMacroRegistry:
             return deny(
                 f"workflow.invalidated.{reason}", f"workflow {macro_id} was disabled ({reason})"
             )
+        for i, step in enumerate(macro.steps):
+            host_dialect = dialect(step.dialect) if step.dialect else None
+            if host_dialect is not None and not host_dialect.host_semantics_ok(
+                step, call.host_version
+            ):
+                # The step reproduces this host tool's semantics as verified for
+                # specific host versions; an unknown/other version is not assumed.
+                return deny(
+                    "workflow.host_semantics_unverified",
+                    f"s{i + 1} ({step.family}) was verified for other {client} versions "
+                    f"(host reports {call.host_version or 'no version'})",
+                )
         self._flush()
         planner = self.runtime.services.get("test_impact") if self.runtime is not None else None
         plan = planner.plan(identity) if planner is not None else None
         try:
-            steps = self.compile(identity, macro, typed, plan=plan)
+            steps = self.compile(identity, macro, call.typed_inputs, plan=plan)
             for step in steps:
                 self._authorize_step(
-                    identity, step, call_id=f"{call_id}:{step.step_id}:pre", dry=True
+                    identity, step, call_id=f"{call.call_id}:{step.step_id}:pre", dry=True
                 )
         except WorkflowError as exc:
             return deny(exc.code, exc.message)
         ticket = Ticket(
             identity.session_id,
             macro_id,
-            _inputs_digest(typed),
+            _inputs_digest(call.typed_inputs),
             macro.version,
             self._pins(identity),
             self._clock(),
-            call_id,
+            call.call_id,
+            client,
+            call.host_version,
         )
         with self._lock:
             self._tickets[(identity.session_id, macro_id, ticket.inputs_digest)] = ticket
             while len(self._tickets) > 1024:
                 self._tickets.popitem(last=False)
         self.counters["tickets_issued"] += 1
-        return {"output": None, "stage": "workflow:ticket", "capability": "host_pretool"}
+        return {"stage": "workflow:ticket", "reason_code": "", "message": ""}
 
     def _authorize_step(
         self, identity: Any, step: CompiledStep, *, call_id: str, dry: bool = False
@@ -2167,15 +2145,23 @@ class WorkflowMacroRegistry:
     ) -> dict[str, Any]:
         t0 = time.monotonic()
         kind = step.template.kind
-        if kind == "read":
-            text, ok, err = _read_step(identity.root, step.values)
-            return self._step_result(step, text, 0 if ok else 1, t0, error=err)
-        if kind == "glob":
-            text, ok, err = _glob_step(identity.root, step.tool_input, deadline_s)
-            return self._step_result(step, text, 0 if ok else 1, t0, error=err)
-        if kind == "grep":
-            text, ok, err = _grep_step(identity.root, step.tool_input, deadline_s)
-            return self._step_result(step, text, 0 if ok else 1, t0, error=err)
+        if kind in ("read", "glob", "grep"):
+            from headroom.agent.workflow_hosts import dialect
+
+            host_dialect = dialect(step.template.dialect)
+            if host_dialect is None:
+                return self._step_result(
+                    step, "", None, t0, error="no host dialect for this step", status="error"
+                )
+            run = host_dialect.run(kind, identity.root, step.tool_input, deadline_s, cancel)
+            return self._step_result(
+                step,
+                run.text,
+                0 if run.ok else 1,
+                t0,
+                error=run.error,
+                truncated=run.partial,
+            )
         from headroom.agent.exec_runner import run_argv
 
         before = worktree_state(identity.root)
@@ -2283,6 +2269,8 @@ class WorkflowMacroRegistry:
     # -- status -------------------------------------------------------------
 
     def status(self) -> dict[str, Any]:
+        from headroom.agent.workflow_hosts import capability_table
+
         with self._lock:
             by_status: dict[str, int] = {}
             for bucket in self._macros.values():
@@ -2297,6 +2285,7 @@ class WorkflowMacroRegistry:
                     "max_seconds": MAX_MACRO_SECONDS,
                 },
                 "counters": dict(self.counters),
+                "hosts": capability_table(),
             }
 
 
@@ -2356,14 +2345,21 @@ def _check_value(kind: str, raw: Any, root: str) -> Any:
         if not isinstance(raw, int) or isinstance(raw, bool) or not (0 <= raw <= 10_000_000):
             raise WorkflowError("workflow.input_invalid", "integer input out of range")
         return raw
-    if kind == "glob":
-        if not isinstance(raw, str) or not _glob_ok(raw):
-            raise WorkflowError("workflow.input_invalid", "glob must be a relative pattern")
-        return raw
-    if kind == "pattern":
-        if not isinstance(raw, str) or not _pattern_ok(raw):
+    if kind == "rg_pattern":
+        from headroom.agent.workflow_hosts import rg_pattern_ok
+
+        if not rg_pattern_ok(raw):
             raise WorkflowError(
-                "workflow.input_invalid", "pattern must be a valid single-line regex"
+                "workflow.input_invalid", "pattern must be a single-line ripgrep regex"
+            )
+        return raw
+    if kind == "rg_glob":
+        from headroom.agent.workflow_hosts import rg_glob_ok
+
+        if not rg_glob_ok(raw):
+            raise WorkflowError(
+                "workflow.input_invalid",
+                "glob must be a relative pattern without '/' or starting with '**/'",
             )
         return raw
     if kind == "tests":
@@ -2388,127 +2384,6 @@ def _check_value(kind: str, raw: Any, root: str) -> Any:
             out.append(value)
         return out
     raise WorkflowError("workflow.input_invalid", f"unsupported input type {kind}")
-
-
-def _read_step(root: str, values: Mapping[str, Any]) -> tuple[str, bool, str | None]:
-    full = os.path.join(root, values["path"])
-    try:
-        size = os.path.getsize(full)
-        with open(full, "rb") as handle:
-            data = handle.read(MAX_READ_BYTES)
-    except OSError as exc:
-        return "", False, f"read failed: {exc.strerror or exc}"
-    text = data.decode("utf-8", "replace")
-    lines = text.splitlines()
-    offset = int(values.get("offset") or 1)
-    start = max(0, offset - 1)
-    limit = values.get("limit")
-    end = start + int(limit) if isinstance(limit, int) and limit > 0 else len(lines)
-    body = "\n".join(f"{i + 1:6}\t{line}" for i, line in enumerate(lines[start:end], start=start))
-    if size > MAX_READ_BYTES:
-        body += f"\n[file truncated at {MAX_READ_BYTES} bytes of {size}]"
-    return body, True, None
-
-
-def _walk(root: str, base: str, deadline: float) -> list[str]:
-    ignore = {
-        ".git",
-        "node_modules",
-        "__pycache__",
-        ".venv",
-        "venv",
-        "target",
-        ".tox",
-        ".mypy_cache",
-        ".pytest_cache",
-    }
-    out: list[str] = []
-    for current, dirs, files in os.walk(base):
-        dirs[:] = sorted(d for d in dirs if d not in ignore)
-        for name in sorted(files):
-            out.append(os.path.relpath(os.path.join(current, name), root).replace("\\", "/"))
-        if time.monotonic() > deadline or len(out) > 50_000:
-            break
-    return out
-
-
-def _search_base(root: str, tool_input: Mapping[str, Any]) -> str:
-    path = tool_input.get("path")
-    return path if isinstance(path, str) and path else root
-
-
-def _glob_step(
-    root: str, tool_input: Mapping[str, Any], deadline_s: float
-) -> tuple[str, bool, str | None]:
-    deadline = time.monotonic() + deadline_s
-    base = _search_base(root, tool_input)
-    pattern = str(tool_input["pattern"])
-    base_rel = os.path.relpath(base, root).replace("\\", "/")
-    hits = []
-    for rel in _walk(root, base, deadline):
-        inner = rel if base_rel in (".", "") else rel[len(base_rel) + 1 :]
-        if fnmatch.fnmatch(inner, pattern) or fnmatch.fnmatch(inner, pattern.replace("**/", "")):
-            hits.append(os.path.join(root, rel).replace("\\", "/"))
-    hits = hits[:MAX_GLOB_RESULTS]
-    return ("\n".join(hits) if hits else "No files found"), True, None
-
-
-def _grep_step(
-    root: str, tool_input: Mapping[str, Any], deadline_s: float
-) -> tuple[str, bool, str | None]:
-    deadline = time.monotonic() + deadline_s
-    base = _search_base(root, tool_input)
-    flags = re.IGNORECASE if tool_input.get("-i") else 0
-    try:
-        regex = re.compile(str(tool_input["pattern"]), flags)
-    except re.error as exc:
-        return "", False, f"invalid pattern: {exc}"
-    glob = tool_input.get("glob")
-    mode = str(tool_input.get("output_mode") or "files_with_matches")
-    out: list[str] = []
-    counts: list[str] = []
-    files = []
-    if os.path.isfile(base):
-        files = [os.path.relpath(base, root).replace("\\", "/")]
-    else:
-        files = _walk(root, base, deadline)
-    for rel in files[:MAX_GREP_FILES]:
-        if time.monotonic() > deadline:
-            return "\n".join(out), False, "grep deadline exceeded"
-        if (
-            glob
-            and not fnmatch.fnmatch(rel.rsplit("/", 1)[-1], str(glob))
-            and not fnmatch.fnmatch(rel, str(glob))
-        ):
-            continue
-        full = os.path.join(root, rel)
-        try:
-            if os.path.getsize(full) > 1024 * 1024:
-                continue
-            with open(full, encoding="utf-8", errors="strict") as handle:
-                text = handle.read()
-        except (OSError, UnicodeDecodeError):
-            continue
-        matched = 0
-        for n, line in enumerate(text.splitlines(), 1):
-            if regex.search(line):
-                matched += 1
-                if mode == "content":
-                    out.append(
-                        f"{full.replace(os.sep, '/')}:{n}:{line}"
-                        if tool_input.get("-n")
-                        else f"{full.replace(os.sep, '/')}:{line}"
-                    )
-        if matched:
-            if mode == "files_with_matches":
-                out.append(full.replace(os.sep, "/"))
-            elif mode == "count":
-                counts.append(f"{full.replace(os.sep, '/')}:{matched}")
-    result = counts if mode == "count" else out
-    limit = tool_input.get("head_limit")
-    if isinstance(limit, int) and limit > 0:
-        result = result[:limit]
-    return ("\n".join(result) if result else "No matches found"), True, None
 
 
 def _externalize(text: str, step: CompiledStep) -> str | None:
