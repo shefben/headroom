@@ -603,6 +603,8 @@ def _normalize_command(tool: str, command: str, root: str | None) -> NormalizedS
         subs = table.get(head, ()) if head in table else ()
         if head in table and (subs is None or sub in subs):
             return _no_argv(tool, f"exec.{head}", safety)
+    if head == "git" and sub in _GIT_NETWORK:
+        return _no_argv(tool, "git.network", Safety.NETWORK)
     if planned_changes(tool, {"command": text}):
         return _no_argv(tool, "exec.mutate", Safety.MUTATING)
     if head == "git":
