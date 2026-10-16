@@ -566,6 +566,8 @@ def test_vitest_selection_respects_yarn_and_runs_when_available(tmp_path: Path):
     vitest_bin = JS_RUNNER / ".bin" / ("vitest.cmd" if sys.platform == "win32" else "vitest")
     if not vitest_bin.exists():
         pytest.skip("platform limit: vitest is not provisioned locally (target/tmp/js_runner)")
+    if shutil.which("node") is None:
+        pytest.skip("platform limit: no node runtime on PATH for the provisioned vitest")
     # Same selection, executed with the provisioned runner binary (direct argv).
     if sys.platform == "win32":  # a junction needs no symlink privilege
         subprocess.run(

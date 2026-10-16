@@ -38,11 +38,38 @@ def _windows_running(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
+def _posix_running(pid: int) -> bool:
+    """POSIX liveness that does not count a zombie as running.
+
+    A terminated child of this process stays a zombie (and ``kill(pid, 0)``
+    still succeeds) until it is reaped, so a service Headroom started and
+    stopped in the same process would look alive forever. Reap it when it is
+    our child; otherwise read its state from ``/proc`` where available.
+    """
+    try:
+        reaped, _ = os.waitpid(pid, os.WNOHANG)
+        if reaped == pid:
+            return False
+    except ChildProcessError:
+        pass  # not our child: nothing to reap here
+    except OSError:
+        pass
+    if not pid_alive(pid):
+        return False
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as handle:
+            state = handle.read().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return True
+    return state not in ("Z", "X")
+
+
 def is_running(pid: int) -> bool:
     """True while ``pid`` is a running process.
 
     On Windows an exited process stays openable while any handle to it is
     open, so liveness is decided by its exit code, not by OpenProcess alone.
+    On POSIX an exited but unreaped child (zombie) is not running either.
     """
     if pid <= 0:
         return False
@@ -51,7 +78,7 @@ def is_running(pid: int) -> bool:
             return _windows_running(pid)
         except (OSError, AttributeError, ValueError):
             return pid_alive(pid)
-    return pid_alive(pid)
+    return _posix_running(pid)
 
 
 @dataclass(frozen=True)
@@ -114,9 +141,7 @@ def _linux_info(pid: int) -> ProcessInfo | None:
             fields = handle.read().rpartition(b")")[2].split()
         ticks = os.sysconf("SC_CLK_TCK")
         with open("/proc/stat", "rb") as handle:
-            btime = next(
-                float(line.split()[1]) for line in handle if line.startswith(b"btime")
-            )
+            btime = next(float(line.split()[1]) for line in handle if line.startswith(b"btime"))
         created = btime + float(fields[19]) / ticks
     except (OSError, IndexError, ValueError, StopIteration):
         created = None
