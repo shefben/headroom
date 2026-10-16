@@ -1,0 +1,885 @@
+{
+  "config": {
+    "model": "claude-sonnet-4-5-20250929",
+    "python_profile": "coding",
+    "responses_model": "gpt-5.4"
+  },
+  "environment": {
+    "headroom_version": "0.42.0-dev",
+    "offline": "1",
+    "platform": "Windows-10-10.0.19045-SP0",
+    "python": "3.12.10",
+    "stateless": "1",
+    "tokenizers": {
+      "python_proxy_anthropic": "AnthropicTokenCounter",
+      "python_proxy_anthropic_wrap": "AnthropicTokenCounter",
+      "rust_live_zone_responses": "TiktokenCounter"
+    }
+  },
+  "fixtures": [
+    {
+      "category": "file_read",
+      "must_keep": [
+        "def compute_checksum(payload: bytes) -> str:",
+        "MAX_RETRIES = 7"
+      ],
+      "name": "file_read",
+      "notes": "",
+      "paths": {
+        "python_proxy_anthropic": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 3706,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 2,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 2,
+          "path": "python_proxy_anthropic",
+          "raw_tokens": 3706,
+          "reduction_pct": 0.0,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "router:excluded:tool"
+          ],
+          "wall_ms": 20128.0
+        },
+        "python_proxy_anthropic_wrap": {
+          "ccr_markers": 1,
+          "error": null,
+          "forwarded_tokens": 2747,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 2,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 2,
+          "path": "python_proxy_anthropic_wrap",
+          "raw_tokens": 3706,
+          "reduction_pct": 25.88,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "tool_admission:read:read_outline",
+            "router:excluded:tool"
+          ],
+          "wall_ms": 20049.31
+        },
+        "rust_live_zone_responses": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 3357,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 2,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 2,
+          "path": "rust_live_zone_responses",
+          "raw_tokens": 3357,
+          "reduction_pct": 0.0,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "no_change:no_compressible_content"
+          ],
+          "wall_ms": 11.9
+        }
+      },
+      "tool_turns": 1
+    },
+    {
+      "category": "search",
+      "must_keep": [
+        "src/core/budget.py:212:    raise TokenBudgetExceeded(limit)"
+      ],
+      "name": "large_search",
+      "notes": "",
+      "paths": {
+        "python_proxy_anthropic": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 9294,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 1,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 1,
+          "path": "python_proxy_anthropic",
+          "raw_tokens": 9294,
+          "reduction_pct": 0.0,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "router:excluded:tool"
+          ],
+          "wall_ms": 6.72
+        },
+        "python_proxy_anthropic_wrap": {
+          "ccr_markers": 1,
+          "error": null,
+          "forwarded_tokens": 571,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 1,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 1,
+          "path": "python_proxy_anthropic_wrap",
+          "raw_tokens": 9294,
+          "reduction_pct": 93.86,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "tool_admission:search:search_grouped",
+            "router:excluded:tool"
+          ],
+          "wall_ms": 39.91
+        },
+        "rust_live_zone_responses": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 4884,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 1,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 1,
+          "path": "rust_live_zone_responses",
+          "raw_tokens": 8436,
+          "reduction_pct": 42.11,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "policy_fit"
+          ],
+          "wall_ms": 6.04
+        }
+      },
+      "tool_turns": 1
+    },
+    {
+      "category": "logs",
+      "must_keep": [
+        "FAILED tests/test_parser.py::test_unicode_escape",
+        "FAILED tests/test_cache.py::test_eviction_order",
+        "2 failed, 298 passed"
+      ],
+      "name": "pytest_output",
+      "notes": "",
+      "paths": {
+        "python_proxy_anthropic": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 6534,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 3,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 3,
+          "path": "python_proxy_anthropic",
+          "raw_tokens": 6534,
+          "reduction_pct": 0.0,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "router:noop"
+          ],
+          "wall_ms": 18.4
+        },
+        "python_proxy_anthropic_wrap": {
+          "ccr_markers": 1,
+          "error": null,
+          "forwarded_tokens": 435,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 3,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 3,
+          "path": "python_proxy_anthropic_wrap",
+          "raw_tokens": 6534,
+          "reduction_pct": 93.34,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "tool_admission:test:test_log",
+            "router:protected:error_output"
+          ],
+          "wall_ms": 34.34
+        },
+        "rust_live_zone_responses": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 5933,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 3,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 3,
+          "path": "rust_live_zone_responses",
+          "raw_tokens": 5933,
+          "reduction_pct": 0.0,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "no_change:no_compressible_content"
+          ],
+          "wall_ms": 0.43
+        }
+      },
+      "tool_turns": 1
+    },
+    {
+      "category": "logs",
+      "must_keep": [
+        "ERROR [db.pool] connection refused: 10.0.3.17:5432"
+      ],
+      "name": "service_log",
+      "notes": "",
+      "paths": {
+        "python_proxy_anthropic": {
+          "ccr_markers": 1,
+          "error": null,
+          "forwarded_tokens": 384,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 1,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 1,
+          "path": "python_proxy_anthropic",
+          "raw_tokens": 13185,
+          "reduction_pct": 97.09,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "router:tool_result:log"
+          ],
+          "wall_ms": 31453.66
+        },
+        "python_proxy_anthropic_wrap": {
+          "ccr_markers": 1,
+          "error": null,
+          "forwarded_tokens": 421,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 1,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 1,
+          "path": "python_proxy_anthropic_wrap",
+          "raw_tokens": 13185,
+          "reduction_pct": 96.81,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "tool_admission:shell:shell_log",
+            "router:noop"
+          ],
+          "wall_ms": 52.55
+        },
+        "rust_live_zone_responses": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 6873,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 1,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 1,
+          "path": "rust_live_zone_responses",
+          "raw_tokens": 11974,
+          "reduction_pct": 42.6,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "policy_fit"
+          ],
+          "wall_ms": 16.03
+        }
+      },
+      "tool_turns": 1
+    },
+    {
+      "category": "json",
+      "must_keep": [
+        "E_QUOTA_4291",
+        "eu-west-2",
+        "9001"
+      ],
+      "name": "json_records",
+      "notes": "",
+      "paths": {
+        "python_proxy_anthropic": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 2492,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 3,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 3,
+          "path": "python_proxy_anthropic",
+          "raw_tokens": 8201,
+          "reduction_pct": 69.61,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "router:tool_result:mixed"
+          ],
+          "wall_ms": 39.58
+        },
+        "python_proxy_anthropic_wrap": {
+          "ccr_markers": 1,
+          "error": null,
+          "forwarded_tokens": 2758,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 3,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 3,
+          "path": "python_proxy_anthropic_wrap",
+          "raw_tokens": 8201,
+          "reduction_pct": 66.37,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "tool_admission:json:json_keyed_rows",
+            "router:protected:error_output"
+          ],
+          "wall_ms": 20.91
+        },
+        "rust_live_zone_responses": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 2455,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 3,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 3,
+          "path": "rust_live_zone_responses",
+          "raw_tokens": 7443,
+          "reduction_pct": 67.02,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "smart_crusher"
+          ],
+          "wall_ms": 4.82
+        }
+      },
+      "tool_turns": 1
+    },
+    {
+      "category": "diff",
+      "must_keep": [
+        "diff --git a/src/net/client.py b/src/net/client.py",
+        "-    timeout_ms = 1000",
+        "+    timeout_ms = 2500"
+      ],
+      "name": "git_diff",
+      "notes": "",
+      "paths": {
+        "python_proxy_anthropic": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 2410,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 3,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 3,
+          "path": "python_proxy_anthropic",
+          "raw_tokens": 2596,
+          "reduction_pct": 7.16,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "router:tool_result:lossless_diff"
+          ],
+          "wall_ms": 8.91
+        },
+        "python_proxy_anthropic_wrap": {
+          "ccr_markers": 1,
+          "error": null,
+          "forwarded_tokens": 1186,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 3,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 3,
+          "path": "python_proxy_anthropic_wrap",
+          "raw_tokens": 2596,
+          "reduction_pct": 54.31,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "tool_admission:git:git_diff_hunks",
+            "router:noop"
+          ],
+          "wall_ms": 14.39
+        },
+        "rust_live_zone_responses": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 2360,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 3,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 3,
+          "path": "rust_live_zone_responses",
+          "raw_tokens": 2360,
+          "reduction_pct": 0.0,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "no_change:rejected_by_safety_gate"
+          ],
+          "wall_ms": 0.81
+        }
+      },
+      "tool_turns": 1
+    },
+    {
+      "category": "reread",
+      "must_keep": [
+        "def compute_checksum(payload: bytes) -> str:",
+        "return hashlib.sha256(payload).hexdigest()"
+      ],
+      "name": "same_output_reread",
+      "notes": "identical Read output appears twice; dedup opportunity",
+      "paths": {
+        "python_proxy_anthropic": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 3750,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 2,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 2,
+          "path": "python_proxy_anthropic",
+          "raw_tokens": 7392,
+          "reduction_pct": 49.27,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "router:excluded:tool",
+            "router:excluded:tool",
+            "router:cross_turn_dedup:1"
+          ],
+          "wall_ms": 5.56
+        },
+        "python_proxy_anthropic_wrap": {
+          "ccr_markers": 1,
+          "error": null,
+          "forwarded_tokens": 6369,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 2,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 2,
+          "path": "python_proxy_anthropic_wrap",
+          "raw_tokens": 7392,
+          "reduction_pct": 13.84,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "tool_admission:read:read_outline",
+            "router:excluded:tool",
+            "router:excluded:tool",
+            "router:cross_turn_dedup:2"
+          ],
+          "wall_ms": 10.5
+        }
+      },
+      "tool_turns": 2
+    },
+    {
+      "category": "tool_error",
+      "must_keep": [
+        "PermissionError: [Errno 13] Permission denied: '/var/lib/app/state.db'"
+      ],
+      "name": "tool_error",
+      "notes": "",
+      "paths": {
+        "python_proxy_anthropic": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 1024,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 1,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 1,
+          "path": "python_proxy_anthropic",
+          "raw_tokens": 1024,
+          "reduction_pct": 0.0,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "router:protected:error_output"
+          ],
+          "wall_ms": 1.08
+        },
+        "python_proxy_anthropic_wrap": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 1024,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 1,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 1,
+          "path": "python_proxy_anthropic_wrap",
+          "raw_tokens": 1024,
+          "reduction_pct": 0.0,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "router:protected:error_output"
+          ],
+          "wall_ms": 7.19
+        },
+        "rust_live_zone_responses": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 918,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 1,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 1,
+          "path": "rust_live_zone_responses",
+          "raw_tokens": 918,
+          "reduction_pct": 0.0,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "no_change:below_plain_text_floor"
+          ],
+          "wall_ms": 0.18
+        }
+      },
+      "tool_turns": 1
+    },
+    {
+      "category": "conflict",
+      "must_keep": [
+        "version = \"1.4.2\"",
+        "name = \"widget\"\nversion = \"1.5.0\""
+      ],
+      "name": "conflicting_evidence",
+      "notes": "declared vs locked version disagree; both must survive",
+      "paths": {
+        "python_proxy_anthropic": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 4370,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 2,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 2,
+          "path": "python_proxy_anthropic",
+          "raw_tokens": 4370,
+          "reduction_pct": 0.0,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "router:excluded:tool",
+            "router:excluded:tool"
+          ],
+          "wall_ms": 3.02
+        },
+        "python_proxy_anthropic_wrap": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 4370,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 2,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 2,
+          "path": "python_proxy_anthropic_wrap",
+          "raw_tokens": 4370,
+          "reduction_pct": 0.0,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "router:excluded:tool",
+            "router:excluded:tool"
+          ],
+          "wall_ms": 5.18
+        }
+      },
+      "tool_turns": 2
+    },
+    {
+      "category": "cache",
+      "must_keep": [
+        "ERROR [db.pool] connection refused: 10.0.3.17:5432",
+        "2 failed, 298 passed"
+      ],
+      "name": "cache_hot_turn",
+      "notes": "first 3 messages are a cached prefix and must be byte-identical",
+      "paths": {
+        "python_proxy_anthropic": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 19695,
+          "frozen_prefix_identical": true,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 2,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 2,
+          "path": "python_proxy_anthropic",
+          "raw_tokens": 19695,
+          "reduction_pct": 0.0,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "router:noop"
+          ],
+          "wall_ms": 7.93
+        },
+        "python_proxy_anthropic_wrap": {
+          "ccr_markers": 1,
+          "error": null,
+          "forwarded_tokens": 13596,
+          "frozen_prefix_identical": true,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 2,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 2,
+          "path": "python_proxy_anthropic_wrap",
+          "raw_tokens": 19695,
+          "reduction_pct": 30.97,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "tool_admission:test:test_log",
+            "router:protected:error_output"
+          ],
+          "wall_ms": 39.17
+        }
+      },
+      "tool_turns": 2
+    },
+    {
+      "category": "streaming",
+      "must_keep": [
+        "src/core/budget.py:212:    raise TokenBudgetExceeded(limit)"
+      ],
+      "name": "native_streamed_turn",
+      "notes": "stream=true Responses body with reasoning item; ids/stream flag must survive",
+      "paths": {
+        "rust_live_zone_responses": {
+          "ccr_markers": 0,
+          "error": null,
+          "forwarded_tokens": 4884,
+          "frozen_prefix_identical": null,
+          "missing_facts": [],
+          "missing_recoverable_via_ccr": 0,
+          "must_keep_forwarded": 1,
+          "must_keep_recall": 1.0,
+          "must_keep_total": 1,
+          "path": "rust_live_zone_responses",
+          "raw_tokens": 8436,
+          "reduction_pct": 42.11,
+          "retrieval_tool_turns": 0,
+          "structure_valid": true,
+          "transforms": [
+            "policy_fit"
+          ],
+          "wall_ms": 5.11
+        }
+      },
+      "tool_turns": 1
+    }
+  ],
+  "jevk5": {
+    "acceptance_rate": 0.0,
+    "activation_ms": 0.01,
+    "advice_requests": 9,
+    "advice_used": 0,
+    "advisor_health": {
+      "advisor_detail": "HEADROOM_JEVK5=off",
+      "advisor_state": "disabled",
+      "breaker": "closed",
+      "endpoint_type": null,
+      "policy": "off"
+    },
+    "advisor_stats": {
+      "breaker_rejections": 0,
+      "budget_exhausted": 0,
+      "cache_hits": 0,
+      "calls": 0,
+      "context_overflow": 0,
+      "failures": 0,
+      "last_failure": null,
+      "last_latency_ms": null,
+      "low_confidence": 0,
+      "missing_letter_failures": 0,
+      "missing_letter_retries": 0,
+      "non_english": 0,
+      "successes": 0,
+      "timeouts": 0,
+      "unavailable": 0
+    },
+    "arbiter_jev": {
+      "applied": 0,
+      "calls": 9
+    },
+    "call_ms_p50": 0.01,
+    "call_ms_p95": 0.09,
+    "calls": [
+      {
+        "advice": false,
+        "confidence": null,
+        "family": "transform_arbiter",
+        "fixture": "file_read",
+        "ms": 0.01
+      },
+      {
+        "advice": false,
+        "confidence": null,
+        "family": "transform_arbiter",
+        "fixture": "large_search",
+        "ms": 0.09
+      },
+      {
+        "advice": false,
+        "confidence": null,
+        "family": "transform_arbiter",
+        "fixture": "pytest_output",
+        "ms": 0.01
+      },
+      {
+        "advice": false,
+        "confidence": null,
+        "family": "transform_arbiter",
+        "fixture": "service_log",
+        "ms": 0.01
+      },
+      {
+        "advice": false,
+        "confidence": null,
+        "family": "transform_arbiter",
+        "fixture": "json_records",
+        "ms": 0.01
+      },
+      {
+        "advice": false,
+        "confidence": null,
+        "family": "transform_arbiter",
+        "fixture": "git_diff",
+        "ms": 0.01
+      },
+      {
+        "advice": false,
+        "confidence": null,
+        "family": "transform_arbiter",
+        "fixture": "tool_error",
+        "ms": 0.01
+      },
+      {
+        "advice": false,
+        "confidence": null,
+        "family": "transform_arbiter",
+        "fixture": "conflicting_evidence",
+        "ms": 0.01
+      },
+      {
+        "advice": false,
+        "confidence": null,
+        "family": "transform_arbiter",
+        "fixture": "cache_hot_turn",
+        "ms": 0.01
+      }
+    ],
+    "mode": "off"
+  },
+  "known_failures": [],
+  "label": "jevk5_conf_off",
+  "schema_version": 1,
+  "summary": {
+    "python_proxy_anthropic": {
+      "errors": 0,
+      "fixtures": 10,
+      "forwarded_tokens": 53659,
+      "frozen_prefix_violations": 0,
+      "must_keep_recall": 1.0,
+      "must_keep_recall_with_ccr": 1.0,
+      "raw_tokens": 75997,
+      "reduction_pct": 29.39,
+      "retrieval_tool_turns": 0,
+      "structure_failures": 0,
+      "wall_ms": 51672.86,
+      "wall_ms_p50": 7.93,
+      "wall_ms_p95": 31453.66,
+      "wall_ms_warm_p50": 7.93,
+      "wall_ms_warm_p95": 31453.66
+    },
+    "python_proxy_anthropic_wrap": {
+      "errors": 0,
+      "fixtures": 10,
+      "forwarded_tokens": 33477,
+      "frozen_prefix_violations": 0,
+      "must_keep_recall": 1.0,
+      "must_keep_recall_with_ccr": 1.0,
+      "raw_tokens": 75997,
+      "reduction_pct": 55.95,
+      "retrieval_tool_turns": 0,
+      "structure_failures": 0,
+      "wall_ms": 20273.45,
+      "wall_ms_p50": 20.91,
+      "wall_ms_p95": 20049.31,
+      "wall_ms_warm_p50": 20.91,
+      "wall_ms_warm_p95": 52.55
+    },
+    "rust_live_zone_responses": {
+      "errors": 0,
+      "fixtures": 8,
+      "forwarded_tokens": 31664,
+      "frozen_prefix_violations": 0,
+      "must_keep_recall": 1.0,
+      "must_keep_recall_with_ccr": 1.0,
+      "raw_tokens": 48857,
+      "reduction_pct": 35.19,
+      "retrieval_tool_turns": 0,
+      "structure_failures": 0,
+      "wall_ms": 45.32,
+      "wall_ms_p50": 4.82,
+      "wall_ms_p95": 16.03,
+      "wall_ms_warm_p50": 4.82,
+      "wall_ms_warm_p95": 16.03
+    }
+  },
+  "total_wall_ms": 72248.98
+}
