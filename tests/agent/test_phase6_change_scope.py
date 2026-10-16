@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import threading
 import time
 from pathlib import Path
@@ -291,7 +290,9 @@ def test_hard_protection_blocks(env: _Env, rel: str, kind: str):
     env.instruct("Fix the crash in src/app.py")
     assert hard_protection(rel) == kind
     decision = env.authorize(env.path(rel))
-    assert decision.verdict is Verdict.BLOCK and decision.reason_code == f"scope.hard_protected.{kind}"
+    assert (
+        decision.verdict is Verdict.BLOCK and decision.reason_code == f"scope.hard_protected.{kind}"
+    )
 
 
 def test_hard_protection_negatives_and_user_approval(env: _Env):
@@ -315,7 +316,9 @@ def test_untrusted_workspace_never_gets_write_authority(project: Path):
     assert decision.authorization is None and decision.verdict is Verdict.WARN
     assert decision.reason_code == "scope.untrusted_workspace"
     # Even a forbidden-looking path is not "blocked" without a trusted workspace.
-    git = firewall.authorize(untrusted, PlannedChange("edit", str(project / ".git/config")), enforceable=True)
+    git = firewall.authorize(
+        untrusted, PlannedChange("edit", str(project / ".git/config")), enforceable=True
+    )
     assert git.verdict is not Verdict.BLOCK
     runtime.stop(timeout=1.0)
 
@@ -339,12 +342,16 @@ def test_effects_from_shell_and_git(env: _Env):
     rm = env.authorize(env.path("src/app.py"), "delete")
     assert rm.verdict is Verdict.BLOCK and rm.reason_code == "scope.forbidden_effect.delete"
     env.instruct("Fix src/app.py")
-    force = env.firewall.authorize(env.identity, PlannedChange("git_history_rewrite"), enforceable=True)
+    force = env.firewall.authorize(
+        env.identity, PlannedChange("git_history_rewrite"), enforceable=True
+    )
     assert force.verdict is Verdict.WARN
     assert force.reason_code == "scope.effect_not_permitted.git_history_rewrite"
     preview = planned_changes("Bash", {"command": "git clean -n -d"})
     assert preview[0].preview
-    assert env.firewall.authorize(env.identity, preview[0], enforceable=True).verdict is Verdict.ALLOW
+    assert (
+        env.firewall.authorize(env.identity, preview[0], enforceable=True).verdict is Verdict.ALLOW
+    )
     clean = planned_changes("Bash", {"command": "git clean -fd"})[0]
     assert not clean.preview  # never default-delete untracked files silently
     assert env.firewall.authorize(env.identity, clean, enforceable=True).verdict is Verdict.WARN
@@ -356,7 +363,10 @@ def test_planned_changes_cover_shell_writes():
     assert PlannedChange("edit", "app.py") in got
     assert PlannedChange("edit", "../out.txt") in got
     assert PlannedChange("delete", "old.py") in got
-    ps = planned_changes("PowerShell", {"command": "Set-Content -Path notes.txt -Value hi; Remove-Item -Recurse build"})
+    ps = planned_changes(
+        "PowerShell",
+        {"command": "Set-Content -Path notes.txt -Value hi; Remove-Item -Recurse build"},
+    )
     assert PlannedChange("edit", "notes.txt") in ps and PlannedChange("delete", "build") in ps
     patch = "*** Begin Patch\n*** Update File: src/a.py\n*** Add File: src/b.py\n*** End Patch"
     assert planned_changes("apply_patch", {"input": patch}) == [
@@ -520,7 +530,12 @@ UPSTREAM = {
     "content": [{"type": "text", "text": "ok"}],
     "stop_reason": "end_turn",
     "stop_sequence": None,
-    "usage": {"input_tokens": 5, "output_tokens": 1, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+    "usage": {
+        "input_tokens": 5,
+        "output_tokens": 1,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    },
 }
 
 
@@ -577,7 +592,11 @@ def _messages(project: Path, *extra):
 def _post(client, messages):
     resp = client.post(
         "/v1/messages",
-        headers={"x-api-key": "k", "anthropic-version": "2023-06-01", "x-headroom-session-token": "tok-wired"},
+        headers={
+            "x-api-key": "k",
+            "anthropic-version": "2023-06-01",
+            "x-headroom-session-token": "tok-wired",
+        },
         json={"model": "claude-sonnet-5", "max_tokens": 16, "messages": messages},
     )
     assert resp.status_code == 200, resp.text
@@ -606,19 +625,68 @@ def test_host_hook_endpoint_denies_forbidden_and_allows_scope(wired):
         _post(client, _messages(project))
         _drain(app)
         base = {"session_id": "c1", "cwd": str(project), "hook_event_name": "PreToolUse"}
-        denied = _hook(client, {**base, "tool_name": "Write", "tool_use_id": "t1", "tool_input": {"file_path": str(project / "config" / "secrets.yaml"), "content": "x"}})
+        denied = _hook(
+            client,
+            {
+                **base,
+                "tool_name": "Write",
+                "tool_use_id": "t1",
+                "tool_input": {
+                    "file_path": str(project / "config" / "secrets.yaml"),
+                    "content": "x",
+                },
+            },
+        )
         spec = denied["output"]["hookSpecificOutput"]
-        assert spec["permissionDecision"] == "deny" and "scope.user_forbidden" in spec["permissionDecisionReason"]
-        allowed = _hook(client, {**base, "tool_name": "Edit", "tool_use_id": "t2", "tool_input": {"file_path": str(project / "src" / "app.py"), "old_string": "a", "new_string": "b"}})
+        assert (
+            spec["permissionDecision"] == "deny"
+            and "scope.user_forbidden" in spec["permissionDecisionReason"]
+        )
+        allowed = _hook(
+            client,
+            {
+                **base,
+                "tool_name": "Edit",
+                "tool_use_id": "t2",
+                "tool_input": {
+                    "file_path": str(project / "src" / "app.py"),
+                    "old_string": "a",
+                    "new_string": "b",
+                },
+            },
+        )
         assert allowed["output"] is None  # prints nothing: permissions untouched
-        dep = _hook(client, {**base, "tool_name": "Edit", "tool_use_id": "t3", "tool_input": {"file_path": str(project / "src" / "util.py"), "old_string": "1", "new_string": "2"}})
+        dep = _hook(
+            client,
+            {
+                **base,
+                "tool_name": "Edit",
+                "tool_use_id": "t3",
+                "tool_input": {
+                    "file_path": str(project / "src" / "util.py"),
+                    "old_string": "1",
+                    "new_string": "2",
+                },
+            },
+        )
         assert dep["output"] is None
-        warned = _hook(client, {**base, "tool_name": "Bash", "tool_use_id": "t4", "tool_input": {"command": "echo hi > docs/notes.md"}})
+        warned = _hook(
+            client,
+            {
+                **base,
+                "tool_name": "Bash",
+                "tool_use_id": "t4",
+                "tool_input": {"command": "echo hi > docs/notes.md"},
+            },
+        )
         ctx = warned["output"]["hookSpecificOutput"]
         assert "permissionDecision" not in ctx and "additionalContext" in ctx
         health = client.get("/health").json()["agent_enforcement"]
         assert health["capabilities"]["claude"] == "host_pretool"
-        assert health["capabilities"]["codex"] == "observe_only" and health["proxy_path"] == "observe_only"
+        assert (
+            health["capabilities"]["codex"] == "observe_only"
+            and health["proxy_path"] == "observe_only"
+        )
         assert health["counters"]["host_prevented"] == 1
         assert health["change_scope"]["counters"]["blocked"] == 1
 
@@ -629,8 +697,23 @@ def test_proxy_only_path_observes_without_claiming_blocks(wired):
         _post(client, _messages(project))
         _drain(app)
         executed = [
-            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_w1", "name": "write_file", "input": {"path": str(project / "config" / "secrets.yaml"), "content": "x"}}]},
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_w1", "content": "wrote 1 file"}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_w1",
+                        "name": "write_file",
+                        "input": {"path": str(project / "config" / "secrets.yaml"), "content": "x"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_w1", "content": "wrote 1 file"}
+                ],
+            },
         ]
         _post(client, _messages(project, *executed))
         _drain(app)
@@ -647,6 +730,13 @@ def test_codex_client_hook_reports_unsupported(wired):
         got = client.post(
             "/v1/agent/host-hook",
             headers={"x-headroom-session-token": "tok-wired"},
-            json={"client": "codex", "payload": {"hook_event_name": "PreToolUse", "tool_name": "Write", "tool_input": {"file_path": str(project / ".git/config")}}},
+            json={
+                "client": "codex",
+                "payload": {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Write",
+                    "tool_input": {"file_path": str(project / ".git/config")},
+                },
+            },
         ).json()
         assert got["output"] is None and got["capability"] == "observational_or_proxy_only"

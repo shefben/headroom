@@ -175,6 +175,7 @@ def test_live_glob_partial_and_pre_tool_observation(live_proxy):
     updated = json.loads(proc.stdout)["hookSpecificOutput"]["updatedToolOutput"]
     assert updated["truncated"] is True and updated["numFiles"] == len(files)
     assert any("PARTIAL" in line for line in updated["filenames"])  # never "all files"
+    (project / "a.py").write_text("x = 1\n", encoding="utf-8")
     pre = {
         "session_id": "live-conv-1",
         "cwd": str(project),
@@ -186,6 +187,13 @@ def test_live_glob_partial_and_pre_tool_observation(live_proxy):
     proc = _run_hook(pre, proxy=live_proxy["url"])
     # Observation only: no permission decision, no output, exit 0.
     assert proc.returncode == 0 and proc.stdout == b""
+    # An edit of a missing file gets compact advice, never a permission decision.
+    missing = {**pre, "tool_use_id": "toolu_live_3b"}
+    missing["tool_input"] = {**pre["tool_input"], "file_path": str(project / "nope.py")}
+    proc = _run_hook(missing, proxy=live_proxy["url"])
+    spec = json.loads(proc.stdout)["hookSpecificOutput"]
+    assert proc.returncode == 0 and "permissionDecision" not in spec
+    assert "contract.input_missing" in spec["additionalContext"]
 
 
 def test_live_hook_fails_open(live_proxy, tmp_path):
