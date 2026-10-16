@@ -1048,7 +1048,8 @@ impl<'a> BlockCtx<'a> {
         policy: CompressionPolicy,
         ccr_store: Option<&'a dyn CcrStore>,
     ) -> Self {
-        let compressor_query = query.compressor_query();
+        // DecisionHints from Python widen the ranking query (never the gate).
+        let compressor_query = query.live_zone_query();
         BlockCtx {
             query,
             compressor_query,

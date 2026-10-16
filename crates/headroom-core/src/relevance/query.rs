@@ -17,6 +17,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::Value;
 
+use super::hints::DecisionHints;
+
 /// Hard cap on the query text handed to compressors (bytes). The Python
 /// builder caps at 512 tokens; ~3 bytes/token keeps the two in step.
 pub const QUERY_TEXT_MAX_BYTES: usize = 1536;
@@ -34,6 +36,10 @@ pub struct TaskQuery {
     pub active_error: String,
     /// Whether the task is a code task (graph neighbors were consulted).
     pub is_code: bool,
+    /// Advisory relevance hints from Python (`"hints"` in the query JSON).
+    /// Relevance-only: they widen [`TaskQuery::live_zone_query`] and are
+    /// never consulted by the safety gate's invariants.
+    pub hints: Option<DecisionHints>,
 }
 
 static BACKTICK: LazyLock<Regex> =
@@ -133,6 +139,7 @@ impl TaskQuery {
             exact_entities: entities,
             active_error: clip_bytes(active_error.trim(), 400).to_string(),
             is_code,
+            hints: None,
         }
     }
 
@@ -214,7 +221,13 @@ impl TaskQuery {
                 .join("\n")
             }
         };
-        Ok(TaskQuery::new(&text, entities, active_error, is_code))
+        let hints = match obj.get("hints") {
+            None | Some(Value::Null) => None,
+            Some(h) => Some(DecisionHints::from_json(h)?),
+        };
+        let mut query = TaskQuery::new(&text, entities, active_error, is_code);
+        query.hints = hints;
+        Ok(query)
     }
 
     /// Query string handed to compressors: the text, with the active
@@ -227,6 +240,38 @@ impl TaskQuery {
         } else {
             format!("{}\n{}", self.text, self.active_error)
         }
+    }
+
+    /// Query string for the live-zone compressors: [`Self::compressor_query`]
+    /// widened by the hint relevance terms it does not already contain
+    /// (bounded to [`QUERY_TEXT_MAX_BYTES`] extra bytes). Ranking only: the
+    /// safety gate keeps using `compressor_query` and the exact entities.
+    pub fn live_zone_query(&self) -> String {
+        let mut query = self.compressor_query();
+        let Some(hints) = &self.hints else {
+            return query;
+        };
+        let lower = query.to_ascii_lowercase();
+        let mut extra = String::new();
+        for term in hints.relevance_terms() {
+            if lower.contains(&term.to_ascii_lowercase()) {
+                continue;
+            }
+            if extra.len() + term.len() + 1 > QUERY_TEXT_MAX_BYTES {
+                break;
+            }
+            if !extra.is_empty() {
+                extra.push(' ');
+            }
+            extra.push_str(term);
+        }
+        if !extra.is_empty() {
+            if !query.is_empty() {
+                query.push('\n');
+            }
+            query.push_str(&extra);
+        }
+        query
     }
 }
 
@@ -269,6 +314,33 @@ mod tests {
         assert!(q.is_code);
         assert!(q.compressor_query().contains("KeyError: x"));
         assert!(TaskQuery::from_json(&serde_json::json!({"v": 9})).is_err());
+    }
+
+    #[test]
+    fn hints_cross_the_boundary_and_widen_only_the_live_zone_query() {
+        let v = serde_json::json!({
+            "v": 1, "text": "fix the parser", "exact_entities": [],
+            "hints": {
+                "v": 1, "family": "relevance_query", "source": "deterministic",
+                "query_terms": ["parser", "src/deep/config_loader.py"],
+                "advisory": {}, "choice": null, "confidence": 0.0, "weight": 0.0
+            }
+        });
+        let q = TaskQuery::from_json(&v).unwrap();
+        let hints = q.hints.as_ref().expect("hints parsed");
+        assert_eq!(hints.relevance_terms().len(), 2);
+        assert_eq!(q.compressor_query(), "fix the parser");
+        assert_eq!(
+            q.live_zone_query(),
+            "fix the parser\nsrc/deep/config_loader.py",
+            "terms already in the text are not repeated"
+        );
+        // A malformed hint is an error, never silently dropped.
+        let bad = serde_json::json!({"v": 1, "text": "x", "hints": {"v": 7}});
+        assert!(TaskQuery::from_json(&bad).is_err());
+        // Absent / null hints keep the old behavior.
+        let plain = TaskQuery::from_json(&serde_json::json!({"v": 1, "text": "x", "hints": null}));
+        assert!(plain.unwrap().hints.is_none());
     }
 
     #[test]

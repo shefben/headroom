@@ -123,7 +123,22 @@ class RelevanceQuery:
             out.setdefault(word, None)
         return tuple(list(out)[:64])
 
+    @property
+    def hints(self) -> DecisionHints | None:
+        """Deterministic relevance hints for the Rust live zone (FFI ``"hints"``).
+
+        The query terms the token-budgeted :attr:`text` could not carry —
+        typically exact entities past the budget. Relevance-only on the Rust
+        side; ``None`` when the text already holds every term.
+        """
+        text = self.text.lower()
+        extra = tuple(t for t in self.terms if t.lower() not in text)
+        if not extra:
+            return None
+        return DecisionHints(family="relevance_query", query_terms=extra)
+
     def to_dict(self) -> dict[str, Any]:
+        hints = self.hints
         return {
             "v": self.v,
             "explicit_user_goal": self.explicit_user_goal,
@@ -134,6 +149,7 @@ class RelevanceQuery:
             "is_code": self.is_code,
             "max_tokens": self.max_tokens,
             "text": self.text,
+            "hints": hints.to_dict() if hints is not None else None,
         }
 
     @classmethod

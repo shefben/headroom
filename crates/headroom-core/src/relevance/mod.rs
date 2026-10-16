@@ -27,6 +27,7 @@
 mod base;
 mod bm25;
 mod embedding;
+pub mod hints;
 mod hybrid;
 pub mod query;
 pub mod semantic;
@@ -35,6 +36,7 @@ pub use base::{default_batch_score, RelevanceScore, RelevanceScorer};
 pub use bm25::BM25Scorer;
 pub use embedding::EmbeddingScorer;
 pub use hybrid::{exact_identifier_terms, HybridScorer, EXACT_IDENTIFIER_FLOOR};
+pub use hints::{DecisionHints, HintSource};
 pub use query::TaskQuery;
 
 /// Factory mirroring Python's `relevance.create_scorer` (`__init__.py:72`).

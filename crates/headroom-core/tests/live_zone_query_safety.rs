@@ -330,3 +330,41 @@ fn openai_chat_and_responses_are_query_conditioned() {
     assert_ne!(c, d);
     assert!(c.contains("compute_invoice_total") && d.contains("refresh_session_token"));
 }
+
+#[test]
+fn decision_hints_at_the_ffi_boundary_steer_live_zone_relevance() {
+    // A vague goal plus Python DecisionHints naming the auth subsystem: the
+    // hint terms reach the dispatcher's ranking query and pull auth rows in,
+    // while an otherwise identical query without hints does not.
+    let out_text = search_output();
+    let body = anthropic_body("what is going on in these results?", &out_text);
+    let store = InMemoryCcrStore::new();
+    let base = json!({"v": 1, "text": "what is going on in these results?", "exact_entities": []});
+    let mut hinted = base.clone();
+    hinted["hints"] = json!({
+        "v": 1, "family": "relevance_query", "source": "deterministic",
+        "query_terms": ["refresh_session_token", "session"],
+        "advisory": {}, "choice": null, "confidence": 0.0, "weight": 0.0
+    });
+    let plain_q = TaskQuery::from_json(&base).unwrap();
+    let hinted_q = TaskQuery::from_json(&hinted).unwrap();
+    assert!(hinted_q.hints.is_some() && plain_q.hints.is_none());
+    let count = |s: &str, needle: &str| s.lines().filter(|l| l.contains(needle)).count();
+    let plain = compressed_text(&run_anthropic(&body, Some(&store), Some(plain_q)))
+        .unwrap_or_else(|| out_text.clone());
+    let steered = compressed_text(&run_anthropic(&body, Some(&store), Some(hinted_q)))
+        .expect("hinted query compresses");
+    assert!(
+        count(&steered, "refresh_session_token") > count(&plain, "refresh_session_token")
+            || count(&steered, "refresh_session_token") > count(&steered, "compute_invoice_total"),
+        "hint terms must raise the hinted rows"
+    );
+    // A JevK5-sourced hint is capped and still relevance-only.
+    let jev = TaskQuery::from_json(&json!({
+        "v": 1, "text": "x", "hints": {"v": 1, "source": "jevk5", "weight": 3.0,
+                                       "advisory": {"c0": 0.9, "c1": 0.1}, "choice": "c0",
+                                       "confidence": 0.9}
+    }))
+    .unwrap();
+    assert!(jev.hints.unwrap().weight() <= headroom_core::relevance::hints::MAX_ADVISOR_WEIGHT);
+}
