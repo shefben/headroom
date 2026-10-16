@@ -43,6 +43,14 @@ class ServiceError(RuntimeError):
     pass
 
 
+class BinaryLoadError(ServiceError):
+    """This llama-server binary could not serve the model (load, health or probe).
+
+    Specific to the binary: the manager may try the next discovered candidate
+    or a managed build. Port/lock problems are plain :class:`ServiceError`.
+    """
+
+
 @dataclass(frozen=True)
 class ServiceInfo:
     kind: str  # "managed" | "operator-llama" | "systemone" | "none"
@@ -66,6 +74,13 @@ def _intelligence_dir() -> Path:
     from headroom import paths
 
     return paths.intelligence_dir()
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def port_is_free(host: str, port: int) -> bool:
@@ -132,6 +147,7 @@ class ServiceManager:
             executable=str(manifest.get("executable") or ""),
             create_time=manifest.get("create_time"),
             model_path=manifest.get("model_path"),
+            port=_int_or_none(manifest.get("port")),
         )
 
     # -- status ----------------------------------------------------------------
@@ -232,16 +248,18 @@ class ServiceManager:
                 self._terminate_owned()
             elif existing.kind == "managed":
                 self.manifest_path.unlink(missing_ok=True)  # stale record; never signal
-            last_error = "llama-server did not start"
+            last: ServiceError = ServiceError("llama-server did not start")
             for _attempt in range(3):
                 port = pick_port(self.settings.host, self.settings.preferred_port)
                 try:
                     return self._spawn_and_wait(binary, model_path, model_sha256, port, log)
                 except ServiceError as exc:
-                    last_error = str(exc)
-                    if "port" not in last_error.lower() and "bind" not in last_error.lower():
+                    last = exc
+                    text = str(exc).lower()
+                    if "port" not in text and "bind" not in text:
                         break
-            raise ServiceError(last_error)
+                    # Lost a bind race for that port: retry on a fresh one.
+            raise last
 
     def _command(self, binary: LlamaBinary, model_path: Path, port: int) -> list[str]:
         settings = self.settings
@@ -296,15 +314,19 @@ class ServiceManager:
             proc = self._spawn(command, **kwargs)
         except OSError as exc:
             handle.close()
-            raise ServiceError(f"could not launch llama-server: {type(exc).__name__}") from exc
+            raise BinaryLoadError(
+                f"could not launch llama-server: {type(exc).__name__}"
+            ) from exc
         handle.close()
         url = f"http://{self.settings.host}:{port}"
         deadline = time.monotonic() + self.settings.load_timeout_s
         info = None
         while time.monotonic() < deadline:
             if proc.poll() is not None:
-                raise ServiceError(
-                    f"llama-server exited with {proc.returncode} during load: {self._log_tail(port)}"
+                tail = self._log_tail(port)
+                error_type = ServiceError if "bind" in tail.lower() else BinaryLoadError
+                raise error_type(
+                    f"llama-server exited with {proc.returncode} during load: {tail}"
                 )
             if info is None:
                 info = process_info(proc.pid)
@@ -314,14 +336,14 @@ class ServiceManager:
             time.sleep(0.5)
         else:
             terminate(proc.pid)
-            raise ServiceError("llama-server did not become healthy before the load timeout")
+            raise BinaryLoadError("llama-server did not become healthy before the load timeout")
         probe = self._probe(url, timeout=30.0)
         if not probe.ok:
             terminate(proc.pid)
-            raise ServiceError(f"llama-server failed capability probe: {probe.detail}")
+            raise BinaryLoadError(f"llama-server failed capability probe: {probe.detail}")
         if probe.n_ctx is not None and probe.n_ctx < self.settings.ctx_size:
             terminate(proc.pid)
-            raise ServiceError(
+            raise BinaryLoadError(
                 f"llama-server runs with n_ctx={probe.n_ctx}, below the required "
                 f"{self.settings.ctx_size}"
             )

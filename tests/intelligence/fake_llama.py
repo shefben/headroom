@@ -31,6 +31,9 @@ class FakeConfig:
         self.n_ctx = kw.get("n_ctx", 8192)
         self.health_status = kw.get("health_status", 200)
         self.tokens_per_char = kw.get("tokens_per_char", 0.25)
+        # Omit the favored letter (below ``missing_below`` n_probs) only for
+        # prompts containing this marker; None = every prompt.
+        self.missing_marker = kw.get("missing_marker")
         self.completions = 0
         self.n_probs_seen: list[int] = []
         self.lock = threading.Lock()
@@ -98,13 +101,17 @@ def make_handler(cfg: FakeConfig):
                         break
                 top = []
                 for i, _ in enumerate(options or ["x"]):
-                    if i == favored and n_probs < cfg.missing_below:
+                    if (
+                        i == favored
+                        and n_probs < cfg.missing_below
+                        and (cfg.missing_marker is None or cfg.missing_marker in prompt)
+                    ):
                         continue
                     top.append({"token": LETTERS[i], "logprob": -0.05 if i == favored else -4.0})
                 top.append({"token": " the", "logprob": -9.0})
                 self._send(200, {
                     "completion_probabilities": [{"top_logprobs": top}],
-                    "tokens_evaluated": len(prompt) // 4,
+                    "tokens_evaluated": max(1, int(len(prompt) * cfg.tokens_per_char)),
                     "timings": {"prompt_ms": 1.0, "predicted_ms": 1.0},
                 })
             else:

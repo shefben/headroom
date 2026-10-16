@@ -18,9 +18,14 @@ Per decision:
 * top-choice confidence below ``min_confidence`` (0.60) is ignored;
 * the utility weight is ``min(weight, weight_cap)`` (0.25, cap 0.40).
 
-Across decisions: a 30 s TTL cache, at most N calls per request
-(:class:`RequestBudget`), and a circuit breaker that opens for 60 s after 3
-consecutive failures. Raw state text is never logged or stored.
+Across decisions: a 30 s TTL cache (a cached answer is held to the same
+confidence floor as a fresh one), at most N calls per request — one
+:class:`RequestBudget` shared by every consumer that passes the same request
+key — and a circuit breaker that opens for 60 s after 3 consecutive failures.
+JevK5 is English-only: a decision whose text is mostly non-Latin script is not
+sent. A state that does not fit the running server's context is refused for
+that decision only (it says nothing about service health). Raw state text is
+never logged or stored.
 """
 
 from __future__ import annotations
@@ -54,6 +59,45 @@ log = logging.getLogger(__name__)
 # Rough upper bound used before tokenization: never send a state that cannot
 # fit the configured local-decision budget.
 _CHARS_PER_TOKEN = 3.0
+# Request-keyed budgets live this long (a request never takes longer) and the
+# table is bounded so abandoned keys cannot grow it.
+_BUDGET_TTL_S = 300.0
+_BUDGET_MAX_KEYS = 4096
+# English-only gate: at least this share of the letters must be Latin script.
+_MIN_LATIN_SHARE = 0.85
+_MIN_LETTERS_FOR_GATE = 12
+
+
+def english_enough(*texts: str) -> bool:
+    """Whether the decision text is predominantly Latin-script (JevK5 is English-only).
+
+    Code, paths and numbers carry few letters and pass; prose in a non-Latin
+    script (CJK, Cyrillic, Arabic, ...) does not. Accented Latin letters count
+    as Latin so names and loanwords in English text are not penalized.
+    """
+    latin = other = 0
+    for text in texts:
+        for ch in text:
+            if not ch.isalpha():
+                continue
+            if ch.isascii() or "À" <= ch <= "ɏ":
+                latin += 1
+            else:
+                other += 1
+    total = latin + other
+    if total < _MIN_LETTERS_FOR_GATE:
+        return True
+    return latin / total >= _MIN_LATIN_SHARE
+
+
+def _question_text(question: Mapping[str, Any]) -> list[str]:
+    parts = [str(question.get("instructions") or "")]
+    criteria = question.get("criteria")
+    if isinstance(criteria, Mapping):
+        parts.extend(str(v) for v in criteria.values())
+    elif isinstance(criteria, list):
+        parts.extend(str(v) for v in criteria)
+    return parts
 
 
 class MissingLetters(TransportError):
@@ -71,6 +115,10 @@ class Advice:
     source: str  # "llama-server" | "systemone"
     latency_ms: float
     cached: bool = False
+    # Metrics of THIS decision only, read from its own short-lived adapter.
+    input_tokens: int = 0
+    pass_tokens: int = 0
+    missing_retried: bool = False
 
     def to_hints(self, query_terms: Sequence[str] = ()) -> DecisionHints:
         return DecisionHints(
@@ -127,6 +175,10 @@ class _Breaker:
         self.opened_at = None
         self.trial_in_flight = False
 
+    def release_trial(self) -> None:
+        """End a half-open trial that said nothing about service health."""
+        self.trial_in_flight = False
+
     def failure(self, now: float) -> None:
         self.consecutive_failures += 1
         self.trial_in_flight = False
@@ -153,6 +205,8 @@ class AdvisorStats:
     budget_exhausted: int = 0
     breaker_rejections: int = 0
     unavailable: int = 0
+    non_english: int = 0
+    context_overflow: int = 0
     last_failure: str | None = None
     last_latency_ms: float | None = None
     by_family: dict[str, int] = field(default_factory=dict)
@@ -186,11 +240,30 @@ class DecisionAdvisor:
         self.stats = AdvisorStats()
         self.missing_letter_unhealthy = False
         self._executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._budgets: OrderedDict[str, tuple[float, RequestBudget]] = OrderedDict()
 
     # -- public typed API ----------------------------------------------------
 
-    def request_budget(self) -> RequestBudget:
-        return RequestBudget(self.settings.calls_per_request)
+    def request_budget(self, request_key: str | None = None) -> RequestBudget:
+        """The call allowance for one request.
+
+        Every consumer that passes the same ``request_key`` (the proxy request
+        id) draws from ONE budget, so all JevK5 consumers of a request together
+        make at most ``calls_per_request`` calls. Without a key the budget is
+        private to the caller (an off-request decision such as a host hook).
+        """
+        if not request_key:
+            return RequestBudget(self.settings.calls_per_request)
+        now = self._clock()
+        with self._lock:
+            entry = self._budgets.get(request_key)
+            if entry is None or now - entry[0] > _BUDGET_TTL_S:
+                entry = (now, RequestBudget(self.settings.calls_per_request))
+                self._budgets[request_key] = entry
+            self._budgets.move_to_end(request_key)
+            while len(self._budgets) > _BUDGET_MAX_KEYS:
+                self._budgets.popitem(last=False)
+            return entry[1]
 
     def noul(
         self, family: str, state: Any, instructions: str, *, budget: RequestBudget
@@ -282,9 +355,15 @@ class DecisionAdvisor:
         if problem:
             log.debug("advisor rejected malformed question (%s)", problem)
             return None
-        state_text = state if isinstance(state, str) else json.dumps(state, default=str)
+        state_text = state if isinstance(state, str) else json.dumps(
+            state, default=str, ensure_ascii=False
+        )
         if len(state_text) / _CHARS_PER_TOKEN > settings.max_state_tokens * 1.5:
             return None  # cannot fit the local-decision budget; do not send
+        if not english_enough(state_text, *_question_text(question)):
+            with self._lock:
+                self.stats.non_english += 1
+            return None  # JevK5 is English-only: no advice rather than noise
         key = self._cache_key(family, state, question)
         now = self._clock()
         with self._lock:
@@ -292,6 +371,9 @@ class DecisionAdvisor:
             if cached and now - cached[0] <= settings.cache_ttl_s:
                 self._cache.move_to_end(key)
                 self.stats.cache_hits += 1
+                if cached[1].confidence < settings.min_confidence:
+                    self.stats.low_confidence += 1
+                    return None  # the floor applies to a cached answer too
                 return _replace_cached(cached[1])
         if not budget.take():
             with self._lock:
@@ -310,15 +392,23 @@ class DecisionAdvisor:
             self.stats.by_family[family] = self.stats.by_family.get(family, 0) + 1
         deadline = Deadline(settings.decision_timeout_ms / 1000.0, clock=self._clock)
         try:
-            answer = self._call(endpoint, state, question, deadline)
+            answer, metrics = self._call(endpoint, state, question, deadline)
             latency = deadline.elapsed_ms()
             if deadline.remaining() <= 0:
                 raise DeadlineExceeded("result arrived after the decision deadline")
             advice = _advice_from_answer(
-                family, question, answer, endpoint[0], latency, settings.effective_weight
+                family, question, answer, endpoint[0], latency, settings.effective_weight,
+                metrics,
             )
         except DeadlineExceeded as exc:
             self._record_failure(exc, timeout=True)
+            return None
+        except ContextOverflow:
+            # This state is too large for the running context: refuse this one
+            # decision. It is not a service failure, so the breaker is untouched.
+            with self._lock:
+                self._breaker.release_trial()
+                self.stats.context_overflow += 1
             return None
         except MissingLetters as exc:
             with self._lock:
@@ -354,10 +444,12 @@ class DecisionAdvisor:
 
     def _call(
         self, endpoint: Endpoint, state: Any, question: Mapping[str, Any], deadline: Deadline
-    ) -> dict:
+    ) -> tuple[dict, dict[str, Any]]:
+        """One decision; returns ``(answer, this decision's own adapter metrics)``."""
         kind, url = endpoint
         if kind == "systemone":
-            return self._systemone_factory(url).decide(state, question, deadline=deadline)
+            answer = self._systemone_factory(url).decide(state, question, deadline=deadline)
+            return answer, {"input_tokens": int(answer.get("input_tokens") or 0)}
         ctx = self._effective_ctx() or self.settings.ctx_size
         max_prompt = min(ctx, self.settings.ctx_size)
         adapter = self._adapter_factory(
@@ -369,6 +461,7 @@ class DecisionAdvisor:
             max_prompt_tokens=max_prompt,
         )
         answer = adapter.decide(state, dict(question))
+        used = adapter
         if getattr(adapter, "missing", 0):
             with self._lock:
                 self.stats.missing_letter_retries += 1
@@ -381,11 +474,16 @@ class DecisionAdvisor:
                 max_prompt_tokens=max_prompt,
             )
             answer = retry.decide(state, dict(question))
+            used = retry
             if getattr(retry, "missing", 0):
                 raise MissingLetters("answer letters absent from top_logprobs after retry")
         with self._lock:
             self.missing_letter_unhealthy = False
-        return answer
+        return answer, {
+            "input_tokens": int(answer.get("input_tokens") or 0),
+            "pass_tokens": int(getattr(used, "last_pass_tokens", 0) or 0),
+            "missing_retried": used is not adapter,
+        }
 
     # -- diagnostics ---------------------------------------------------------
 
@@ -410,6 +508,8 @@ class DecisionAdvisor:
                     "budget_exhausted": stats.budget_exhausted,
                     "breaker_rejections": stats.breaker_rejections,
                     "unavailable": stats.unavailable,
+                    "non_english": stats.non_english,
+                    "context_overflow": stats.context_overflow,
                     "last_failure": stats.last_failure,
                     "last_latency_ms": stats.last_latency_ms,
                 },
@@ -449,6 +549,7 @@ def _advice_from_answer(
     source: str,
     latency_ms: float,
     weight: float,
+    metrics: Mapping[str, Any] | None = None,
 ) -> Advice:
     kind = str(question["type"])
     if answer.get("type") != kind:
@@ -483,6 +584,9 @@ def _advice_from_answer(
         weight=weight,
         source=source,
         latency_ms=latency_ms,
+        input_tokens=int((metrics or {}).get("input_tokens") or 0),
+        pass_tokens=int((metrics or {}).get("pass_tokens") or 0),
+        missing_retried=bool((metrics or {}).get("missing_retried")),
     )
 
 
@@ -493,4 +597,5 @@ __all__ = [
     "DecisionAdvisor",
     "MissingLetters",
     "RequestBudget",
+    "english_enough",
 ]

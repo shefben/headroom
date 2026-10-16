@@ -217,11 +217,14 @@ def model_status(
         return ModelStatus(
             str(path), True, False, actual, expected, False, info, "SHA-256 mismatch"
         )
-    try:
-        atomic_write_json(_sidecar(path), {"schema": 1, "sha256": actual, **key,
-                                           "verified_at": time.time()})
-    except OSError:
-        pass
+    from headroom.paths import persistence_allowed
+
+    if persistence_allowed("jevk5_model_verification"):  # stateless: verify, write nothing
+        try:
+            atomic_write_json(_sidecar(path), {"schema": 1, "sha256": actual, **key,
+                                               "verified_at": time.time()})
+        except OSError:
+            pass
     return ModelStatus(str(path), True, True, actual, expected, False, info, "verified")
 
 

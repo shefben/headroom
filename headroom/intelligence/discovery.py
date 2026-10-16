@@ -2,10 +2,14 @@
 
 Search order: ``HEADROOM_JEVK5_LLAMA_SERVER`` override → the binary recorded
 by a previous managed setup → ``PATH`` → common build directories under
-``LLAMA_CPP_HOME``. Each candidate is probed (``--version``, ``--help``,
-``--list-devices``) without modifying it; the first one that exposes the flags
-Headroom needs is reused. Model loading itself (Qwen3.5 hybrid layers) is
-proven later by starting the server and passing conformance.
+``LLAMA_CPP_HOME`` → common Linux/Windows install and build locations (a
+``llama.cpp`` checkout in the home directory, ``/usr/local/bin``,
+``/opt/llama.cpp``, ``%LOCALAPPDATA%/llama.cpp`` …) → a previous Headroom-managed
+build. Each candidate is probed (``--version``, ``--help``, ``--list-devices``)
+without modifying it, lazily and in that order. Model loading itself (Qwen3.5
+hybrid layers) is proven by starting the server and passing conformance; the
+manager moves on to the next compatible candidate when a binary cannot load
+the model, and builds a managed one only when none can.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -112,6 +117,49 @@ def probe_binary(path: str, source: str) -> LlamaBinary:
     )
 
 
+# Build sub-directories CMake produces for single- and multi-config generators.
+_BUILD_SUBDIRS = (
+    "",
+    "bin",
+    "build/bin",
+    "build/bin/Release",
+    "build/bin/RelWithDebInfo",
+    "build-cuda/bin",
+    "build-cuda/bin/Release",
+    "build/Release",
+)
+
+
+def common_install_roots() -> list[Path]:
+    """Usual places a user keeps llama.cpp (checkouts, prefixes), per platform."""
+    home = Path.home()
+    roots = [home / "llama.cpp", home / "src" / "llama.cpp", home / "git" / "llama.cpp"]
+    if sys.platform == "win32":
+        for var in ("LOCALAPPDATA", "PROGRAMFILES", "USERPROFILE"):
+            base = os.environ.get(var)
+            if base:
+                roots.append(Path(base) / "llama.cpp")
+        drive = os.environ.get("SYSTEMDRIVE", "C:")
+        roots.append(Path(drive + "\\") / "llama.cpp")
+    else:
+        roots += [
+            home / ".local",
+            Path("/usr/local"),
+            Path("/opt/llama.cpp"),
+            Path("/usr/local/llama.cpp"),
+        ]
+    return roots
+
+
+def _managed_build_root() -> Path | None:
+    try:
+        from headroom import paths
+
+        return paths.intelligence_dir() / "llama.cpp"
+    except Exception:  # noqa: BLE001 - workspace dir unresolvable: skip this source
+        return None
+
+
 def candidate_binaries(override: str | None, manifest_path: Path | None) -> list[tuple[str, str]]:
     seen: set[str] = set()
     out: list[tuple[str, str]] = []
@@ -138,18 +186,27 @@ def candidate_binaries(override: str | None, manifest_path: Path | None) -> list
     home = os.environ.get("LLAMA_CPP_HOME")
     if home:
         base = Path(home).expanduser()
-        for rel in (
-            "",
-            "bin",
-            "build/bin",
-            "build/bin/Release",
-            "build/bin/RelWithDebInfo",
-            "build-cuda/bin",
-            "build-cuda/bin/Release",
-            "build/Release",
-        ):
+        for rel in _BUILD_SUBDIRS:
             add(str(base / rel / _EXE), "LLAMA_CPP_HOME")
+    for root in common_install_roots():
+        for rel in _BUILD_SUBDIRS:
+            add(str(root / rel / _EXE), "common-dir")
+    managed = _managed_build_root()
+    if managed is not None:
+        for rel in ("build/bin/Release", "build/bin", "build/Release/bin"):
+            add(str(managed / rel / _EXE), "managed-build")
     return out
+
+
+def iter_llama_servers(override: str | None, manifest_path: Path | None) -> Iterator[LlamaBinary]:
+    """Probe candidates lazily, in discovery order (compatible or not).
+
+    An explicit override is authoritative: nothing else is probed after it.
+    """
+    for path, source in candidate_binaries(override, manifest_path):
+        yield probe_binary(path, source)
+        if source == "override":
+            return  # an explicit override is authoritative: do not silently swap it
 
 
 def discover_llama_server(
@@ -157,13 +214,10 @@ def discover_llama_server(
 ) -> tuple[LlamaBinary | None, list[LlamaBinary]]:
     """Return (first compatible binary, every probed candidate)."""
     probed: list[LlamaBinary] = []
-    for path, source in candidate_binaries(override, manifest_path):
-        info = probe_binary(path, source)
+    for info in iter_llama_servers(override, manifest_path):
         probed.append(info)
         if info.compatible:
             return info, probed
-        if source == "override":
-            break  # an explicit override is authoritative: do not silently swap it
     return None, probed
 
 

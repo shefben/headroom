@@ -34,7 +34,12 @@ from headroom.intelligence.conformance import (
     run_llama_conformance,
     run_systemone_conformance,
 )
-from headroom.intelligence.service import ServiceError, ServiceManager
+from headroom.intelligence.service import (
+    BinaryLoadError,
+    ServiceError,
+    ServiceInfo,
+    ServiceManager,
+)
 from headroom.intelligence.settings import (
     JEVK5_RUNTIME_VERSION,
     IntelligenceSettings,
@@ -42,6 +47,7 @@ from headroom.intelligence.settings import (
 )
 from headroom.log_safety import describe_exception
 from headroom.offline import is_offline
+from headroom.paths import persistence_allowed
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +99,7 @@ class IntelligenceManager:
         self._conformance: ConformanceReport | None = None
         self._thread: threading.Thread | None = None
         self._stopping = threading.Event()
+        self._last_start_problem = ""
         self.advisor = DecisionAdvisor(
             self.settings, self.ready_endpoint, effective_ctx=lambda: self._n_ctx
         )
@@ -176,23 +183,10 @@ class IntelligenceManager:
             return report
         if not self._ensure_client(report, log_fn):
             return report
-        binary, probed = self.discover()
-        if binary is None and allow_build:
-            if is_offline():
-                report.add("llama-server", False, "not found; HEADROOM_OFFLINE forbids building")
-                return report
-            log_fn("no compatible llama-server found; building a managed one from source")
-            try:
-                built = build_mod.build_llama_server(settings, log=log_fn)
-            except (build_mod.BuildError, OSError) as exc:
-                report.add("llama-server", False, f"build failed: {exc}")
-                return report
-            binary = discovery.probe_binary(str(built.binary), "managed-build")
-        if binary is None or not binary.compatible:
-            detail = "; ".join(f"{b.path}: {','.join(b.problems)}" for b in probed) or "not found"
-            report.add("llama-server", False, detail)
+        if not persistence_allowed("jevk5_setup"):
+            # Setup writes the model cache, manifests and service logs.
+            report.add("stateless", False, "HEADROOM_STATELESS is set: setup writes nothing")
             return report
-        report.add("llama-server", True, f"{binary.path} ({binary.source}, {binary.version})")
         status = self.model()
         if not status.verified:
             if status.expected_sha256 is None or settings.model_path_override:
@@ -212,16 +206,22 @@ class IntelligenceManager:
                 return report
         if not report.add("model", status.verified, f"{status.path} ({status.detail})"):
             return report
-        self._write_setup_manifest(binary, status)
         if not start_service:
+            binary, probed = self.discover()
+            if binary is None or not binary.compatible:
+                detail = "; ".join(f"{b.path}: {','.join(b.problems)}" for b in probed)
+                report.add("llama-server", False, detail or "not found")
+                return report
+            report.add("llama-server", True, f"{binary.path} ({binary.source}, {binary.version})")
+            self._write_setup_manifest(binary, status)
             return report
-        try:
-            info = self.service.ensure_started(
-                binary, Path(status.path), status.sha256 or status.expected_sha256, log=log_fn
-            )
-        except (ServiceError, OSError) as exc:
-            report.add("service", False, str(exc))
+        started = self._start_first_loadable(
+            status, log_fn=log_fn, allow_build=allow_build, report=report
+        )
+        if started is None:
             return report
+        binary, info = started
+        self._write_setup_manifest(binary, status)
         report.add("service", info.healthy or info.owned, f"{info.url} pid {info.pid}")
         conformance = self._conform("llama-server", str(info.url), settings.load_timeout_s)
         report.conformance = conformance
@@ -233,9 +233,89 @@ class IntelligenceManager:
         )
         return report
 
+    def _start_first_loadable(
+        self,
+        status: model_mod.ModelStatus,
+        *,
+        log_fn: LogFn,
+        allow_build: bool,
+        report: SetupReport | None = None,
+    ) -> tuple[discovery.LlamaBinary, ServiceInfo] | None:
+        """Start the managed service on the first binary that can load the model.
+
+        Discovered binaries are tried in discovery order; one that cannot load
+        the model (exits during load, never turns healthy, fails the endpoint
+        probe) is skipped for the next. Only when none can — and building is
+        allowed and online — is a separate managed llama-server built from
+        source. A port/lock problem is not the binary's fault and stops here.
+        """
+        model_path = Path(status.path)
+        sha = status.sha256 or status.expected_sha256
+        problems: list[str] = []
+
+        fatal: list[bool] = []
+
+        def attempt(binary: discovery.LlamaBinary) -> ServiceInfo | None:
+            try:
+                info = self.service.ensure_started(binary, model_path, sha, log=log_fn)
+            except BinaryLoadError as exc:
+                problems.append(f"{binary.path}: {exc}")
+                log_fn(f"{binary.path} cannot serve the model ({exc}); trying the next candidate")
+                return None
+            except (ServiceError, OSError) as exc:
+                problems.append(f"service: {exc}")
+                fatal.append(True)
+                return None
+            if report is not None:
+                report.add(
+                    "llama-server", True, f"{binary.path} ({binary.source}, {binary.version})"
+                )
+            return info
+
+        for binary in discovery.iter_llama_servers(
+            self.settings.llama_server_override, self.setup_manifest_path
+        ):
+            if self._stopping.is_set():
+                return None
+            if not binary.compatible:
+                problems.append(f"{binary.path}: {','.join(binary.problems)}")
+                continue
+            info = attempt(binary)
+            if info is not None:
+                return binary, info
+            if fatal:
+                break
+        if allow_build and not fatal and not self.settings.llama_server_override:
+            if is_offline():
+                problems.append("HEADROOM_OFFLINE forbids building llama-server")
+            else:
+                log_fn("no installed llama-server can serve the model; building a managed one")
+                try:
+                    built = build_mod.build_llama_server(self.settings, log=log_fn)
+                except (build_mod.BuildError, OSError) as exc:
+                    problems.append(f"build failed: {exc}")
+                else:
+                    binary = discovery.probe_binary(str(built.binary), "managed-build")
+                    if binary.compatible:
+                        info = attempt(binary)
+                        if info is not None:
+                            return binary, info
+                    else:
+                        problems.append(f"{binary.path}: {','.join(binary.problems)}")
+        detail = "; ".join(problems) or "no llama-server found"
+        if report is not None:
+            report.add("llama-server", False, detail)
+        self._last_start_problem = detail
+        return None
+
     def _ensure_client(self, report: SetupReport, log_fn: LogFn) -> bool:
         if discovery.jevk5_client_compatible():
             return report.add("jevk5-client", True, f"jevk5 {JEVK5_RUNTIME_VERSION}")
+        if not persistence_allowed("jevk5_client_install"):
+            # Installing into the venv is a new filesystem write.
+            return report.add(
+                "jevk5-client", False, "HEADROOM_STATELESS is set: not installing the JevK5 client"
+            )
         log_fn(f"installing JevK5 GGUF client {JEVK5_RUNTIME_VERSION} (--no-deps)")
         ok, detail = discovery.install_jevk5_client()
         return report.add("jevk5-client", ok, detail)
@@ -344,18 +424,22 @@ class IntelligenceManager:
                     return
                 self._accept(kind, url, self._conform(kind, url, settings.load_timeout_s))
                 return
-            if not settings.autostart:
+            if not settings.autostart or not persistence_allowed("jevk5_service"):
+                # No autostart, or stateless (starting a service writes its
+                # ownership manifest and log): reuse a running one only.
                 endpoint = self.service.configured_endpoint()
                 if endpoint is None:
-                    self._set_state("unavailable", "autostart disabled and no service running")
+                    reason = (
+                        "autostart disabled" if not settings.autostart else "HEADROOM_STATELESS"
+                    )
+                    self._set_state("unavailable", f"{reason} and no service running")
                     return
                 self._accept(endpoint[0], endpoint[1],
                              self._conform(endpoint[0], endpoint[1], settings.load_timeout_s))
                 return
-            binary, _ = self.discover()
             status = self.model()
-            ready = binary is not None and status.verified and discovery.jevk5_client_compatible()
-            if not ready:
+            client_ok = discovery.jevk5_client_compatible()
+            if not (status.verified and client_ok):
                 if is_offline():
                     self._set_state(
                         "unavailable", "offline: needs an installed llama-server and verified model"
@@ -363,6 +447,7 @@ class IntelligenceManager:
                     return
                 if self._stopping.is_set():
                     return
+                # First run, online: full setup on this background thread only.
                 report = self.setup(log_fn=lambda m: log.info("jevk5 setup: %s", m))
                 if not report.ok:
                     failed = [s for s in report.steps if not s.ok]
@@ -373,9 +458,20 @@ class IntelligenceManager:
                 return
             if self._stopping.is_set():
                 return
-            info = self.service.ensure_started(
-                binary, Path(status.path), status.sha256 or status.expected_sha256
+            started = self._start_first_loadable(
+                status,
+                log_fn=lambda m: log.info("jevk5: %s", m),
+                allow_build=not is_offline(),
             )
+            if started is None:
+                if not self._stopping.is_set():
+                    self._set_state("unavailable", self._last_start_problem)
+                    if settings.policy is ServicePolicy.ON:
+                        log.warning("JevK5 advisor unavailable (HEADROOM_JEVK5=on): %s",
+                                    self._last_start_problem)
+                return
+            binary, info = started
+            self._write_setup_manifest(binary, status)
             self._accept(
                 "llama-server", str(info.url),
                 self._conform("llama-server", str(info.url), settings.load_timeout_s),

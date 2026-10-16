@@ -2,7 +2,8 @@
 
 Before Headroom stops a process it must prove the PID still belongs to the
 llama-server it started: same executable, same start time, and a command line
-naming the same model. PIDs are reused, ports are shared — neither alone is
+naming the same model and port. A process whose command line cannot be read
+is never treated as owned. PIDs are reused, ports are shared — neither alone is
 proof. Uses ``psutil`` when installed, else ``/proc`` on Linux and the Win32
 API (``QueryFullProcessImageNameW`` / ``GetProcessTimes``) on Windows.
 """
@@ -120,9 +121,55 @@ def _windows_info(pid: int) -> ProcessInfo | None:
         ):
             ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
             created = ticks / 1e7 - 11644473600.0
-        return ProcessInfo(pid, exe, None, created)
+        return ProcessInfo(pid, exe, _windows_cmdline(handle), created)
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _windows_cmdline(handle: int) -> tuple[str, ...] | None:
+    """The process command line via ``NtQueryInformationProcess`` (class 60).
+
+    ``ProcessCommandLineInformation`` (Windows 8.1+) needs only
+    ``PROCESS_QUERY_LIMITED_INFORMATION``, the access the caller already holds.
+    Returns ``None`` when the OS does not expose it.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class _UnicodeString(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.USHORT),
+            ("MaximumLength", wintypes.USHORT),
+            ("Buffer", ctypes.c_void_p),
+        ]
+
+    ntdll = ctypes.windll.ntdll  # type: ignore[attr-defined]
+    query = ntdll.NtQueryInformationProcess
+    query.restype = ctypes.c_long
+    query.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.ULONG,
+        ctypes.POINTER(wintypes.ULONG),
+    ]
+    needed = wintypes.ULONG(0)
+    query(handle, 60, None, 0, ctypes.byref(needed))
+    if not needed.value or needed.value > 1 << 20:
+        return None
+    buffer = ctypes.create_string_buffer(needed.value)
+    if query(handle, 60, buffer, needed, ctypes.byref(needed)) != 0:
+        return None
+    header = _UnicodeString.from_buffer(buffer)
+    if not header.Buffer or not header.Length:
+        return None
+    text = ctypes.wstring_at(header.Buffer, header.Length // 2)
+    import shlex
+
+    try:
+        return tuple(shlex.split(text, posix=False))
+    except ValueError:
+        return tuple(text.split())
 
 
 def _linux_info(pid: int) -> ProcessInfo | None:
@@ -176,6 +223,7 @@ def matches_owned(
     executable: str,
     create_time: float | None,
     model_path: str | None,
+    port: int | None = None,
 ) -> tuple[bool, str]:
     """Whether ``info`` is provably the owned process. Returns (ok, reason)."""
     if info is None:
@@ -188,10 +236,13 @@ def matches_owned(
         return False, "process start time unavailable; refusing to treat as owned"
     if abs(info.create_time - create_time) > 2.0:
         return False, "start time differs (PID reused)"
-    if info.cmdline is not None and model_path:
-        joined = " ".join(info.cmdline)
-        if os.path.normcase(model_path) not in os.path.normcase(joined):
-            return False, "command line does not reference the recorded model"
+    if info.cmdline is None:
+        return False, "process command line unavailable; refusing to treat as owned"
+    joined = os.path.normcase(" ".join(part.strip('"') for part in info.cmdline))
+    if model_path and os.path.normcase(model_path) not in joined:
+        return False, "command line does not reference the recorded model"
+    if port is not None and f"--port {port}" not in joined:
+        return False, "command line does not use the recorded port"
     return True, "owned"
 
 
