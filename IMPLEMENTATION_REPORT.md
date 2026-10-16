@@ -1,232 +1,180 @@
 # Unified-21 Implementation Report
 
-Spec: `HEADROOM_WRAP_UNIFIED_21_FEATURE_IMPLEMENTATION_PLAN_OPUS_5_5.md`. One short section per phase.
-
-## Phase 0: safety, sync, inventory, baseline
-
-**Checkout and sync.** `feature/unified-21` starts at upstream tag `v0.41.0` (`76133cff`), which matches the plan's SHA. The remote `origin` is the upstream `headroomlabs-ai/headroom` repo only, with tags fetched. The old HEAD `d13e1966` (the 0.39.1 release) had no local commits ahead of `origin/main`. Basing the branch on v0.41.0 therefore counts as the merge: a fast-forward with no conflicts in tracked code.
-
-**Safety refs.**
-Branch `backup/main-pre-unified21` at `d13e1966`. Stash `stash@{0}` "pre-unified21 user changes", kept. Copies of `.claude/.headroom_wrap_settings.lock` and `.serena/project.yml` are in `../_safety_backup_20261014_main/`. The lock file was deleted upstream in 0.41. The user's copy is restored on disk as an untracked, ignored file. These user files are untouched: `AGENTS.md`, the plan, `.clinerules-*`, `.claude/*` and the modified `.serena/project.yml`.
-
-**No Paritok/Jev code here.** This checkout is plain upstream. It has no Paritok, JevK5 or llama-server code. The user's shell does export about 40 Paritok-era `HEADROOM_*` variables, for example `HEADROOM_FEATURES=…,paritok_content_compress,paritok_history_summarize`, `HEADROOM_ROLLOUT_CHANNEL=beta`, `HEADROOM_SYSTEM_ONE_MODEL=alibiserikbay/JevK5` and `HEADROOM_SYSTEM_ONE_ENDPOINT=http://127.0.0.1:8090`. Most name features that v0.41 does not have. Tests and evals must run with them unset.
-
-**Environment** (Windows 10 19045): repo venv Python 3.12.10 (uv 0.7.9; `uv pip install -e ".[dev,proxy,code,relevance,mcp,reports]" pytest-xdist pytest-timeout`), Headroom 0.41.1-dev editable with maturin-built `headroom/_core.pyd`, rustc/cargo 1.95.0 (pinned), MSVC 19.29/19.44, WinGet llama-server `3 (44da65e)`, RTX A4000 16 GB, tree-sitter and fastembed importable.
-
-**Disk space blocker.** The C: drive is full, with 65 MB free. That caused MSVC `LNK1108` link failures and SQLite "database or disk is full" errors under the default `%TEMP%`. Point TMP and TEMP at `target/tmp/t` on the F: drive (gitignored) before building or testing.
-
-**Commands that work.**
-Python: `env -u <every HEADROOM_*/ANTHROPIC_*/OPENAI_API_KEY> TMP=… TEMP=… .venv/Scripts/python.exe -m pytest -p no:cacheprovider -n 8 --timeout=300 -o addopts="" <paths>`; Rust: `CARGO_TARGET_DIR=$PWD/target cargo test -p headroom-core --lib` and `cargo test -p headroom-proxy --lib`;
-
-**Inventory.** At v0.41.0, features 1, 6, 8, 9, 11, 15, 16, 17, 19, 20, 23, 24 and JevK5 had no code; 2, 3, 4, 5, 7, 10, 12, 13 and 14 were partial (BM25-only hybrid scorer, hash-only CCR, post-admission compression, line-level dedup, lossless-only verify, auth/cache-only policy, Read-outline-only interceptor). Reused anchors: `proxy/turn_hooks.py`, `proxy/extensions.py`, `rollout.py` (`FEATURES`, `RolloutSnapshot`), `proxy/server.py` (`anthropic_pipeline`), Rust `proxy.rs` compression calls and the `headroom-py` module.
-
-**Smoke tests** (targeted; clean env; TMP on F:): Rust: `headroom-core --lib` 976 passed / 0 failed / 1 ignored. `headroom-proxy --lib` 340 passed / 0 failed. Python (wrap claude/codex/opencode, live zone and PyO3, compression policy, CCR, byte fidelity and prefix cache, tool deferral, memory, output shaping, eval harness): 30 files, `-n 8`: **831 passed, 3 failed, 12 skipped** (skips = live-API tests without keys). Pre-existing failures are listed in `../_safety_backup_20261014_main/phase0_preexisting_failures.txt`. The 3 failures are xdist worker crashes in `test_memory_system.py` under 8-way load; that file alone passes 104/104 both serially and with `-n 8`. In the user's raw shell, 2 live tests return 401 (invalid exported `OPENAI_API_KEY`). With C:-based TEMP, the disk-full errors were SQLite and link failures.
-
-**Baseline** (`benchmarks/unified21_eval.py` produced `benchmarks/results/baseline.json`; offline, stateless, 11 fixtures):
-
-| Path | Raw tokens | Forwarded tokens | Reduction | Must-keep recall | Errors / structure / prefix issues |
-|---|---|---|---|---|---|
-| Python proxy `anthropic_pipeline` (coding profile) | 75,997 | 53,659 | 29.39% | 1.00 | 0 / 0 / 0 |
-| Rust live zone (Responses, via headroom-py) | 48,857 | 14,323 | 70.68% | 1.00 | 0 / 0 / 0 |
-
-The Python path saves nothing on file reads, pytest output, tool errors, conflicting reads or the cache-hot delta. Large search output is excluded, by tool type, from compression. The service log drops 97%, JSON 70% and the same-output reread 49%. Rust leaves pytest output and file reads unchanged. It cuts search and log output by about 98% and the diff by 50%. No `headroom_retrieve` turns were needed.
-
-## Phase 1: runtime foundation and JevK5 (commits f8db3eed, 6d2e75a2, this entry)
-
-**1A runtime (`headroom/agent/`).** The plan's v1 kinds are reserved as `AgentEvent`s. Events store only digests, and the idempotency key is (session, source, kind, index, digest). Normalization is read-only and covers Anthropic, OpenAI chat, OpenAI Responses and Google. A message counts as authentic USER input only after harness wrappers are stripped. Identity: a session is trusted only when its wrap token matches a live marker and the registered cwd still exists. `workspace_id` hashes the principal plus the worktree root, so linked worktrees are distinct scopes. `session_id` is a hash of the token. The SQLite store runs in WAL mode under `paths.agent_state_db_path()`. It has a schema version, inserts events and their projection in one transaction, uses CAS on revisions, rebuilds by replay and salvages corrupt files read-only. In stateless mode an equivalent bounded in-memory store is used and nothing is written to disk. A background worker with a bounded queue keeps SQLite off the event loop. One stream-safe TurnHook at priority 80 is installed once from `create_app`, gated by the new opt-in rollout feature `agent_runtime`. With the feature off, no hook is registered. `/health` reports the effective rollout, whether the hook is installed, the trusted-marker count, runtime counters and advisor state. When wrap reuses a proxy, it reports mismatches in `agent_runtime` and `HEADROOM_JEVK5`.
-
-**Phase 2+ extension APIs.** In `headroom.agent.registry`: `register_request_stage`, `register_projector`, `register_commit_listener`, `register_component`. In `headroom.agent.events`: `register_event_kind`, `make_event`. In `headroom.agent.interfaces`: `TaskContext`, `DecisionHints`, `ToolResultEnvelope`, `ActionAuthorization`. On the runtime: `AgentRuntime.authorize_action`, which returns an authorization only for trusted identities. From a TurnContext: `headroom.agent.hook.task_context_for(ctx)` and `identity_for(ctx)`. For JevK5: `IntelligenceManager.advisor`, i.e. `DecisionAdvisor.choose|noul|score|adecide` plus `request_budget()`.
-
-**1B JevK5 (`headroom/intelligence/`).**
-Typed settings: policy `HEADROOM_JEVK5=auto|on|off`; calibration T=1.22, knockout T=0.93; ctx 8192; deadline 1200 ms; 4 calls per request; cache 30 s; minimum confidence 0.60; weight 0.25 capped at 0.40; circuit breaker opens after 3 failures for 60 s. Setup checks GGUF metadata and SHA-256 and resumes downloads from `.part` files. A custom model must supply its own hash or be marked operator-managed. llama-server is discovered in this order: override, manifest, PATH, `LLAMA_CPP_HOME`. If none is found, setup builds a managed one with CMake. The managed service starts or is reused on 127.0.0.1 (port 8091 preferred). Before any stop, Headroom checks PID, executable and start time, and it never kills a foreign process. Every request in a decision shares one monotonic deadline. A fresh adapter is created per decision. If answer letters are missing, it retries once with n_probs=128. A separate typed client handles `/v1/systemone`. CLI: `headroom intelligence setup|status|doctor|stop`. The JevK5 transport has an operator-endpoint entry in the egress allowlist.
-
-**Tests.**
-New: 62 passed in `tests/agent` and `tests/intelligence`, using a fake llama-server. Live run (`HEADROOM_JEVK5_LIVE_TEST=1`, RTX A4000, cached verified 4B Q8_0 model, WinGet llama-server b44da65e): setup OK and conformance passed. Refund gave noul 0.06, i.e. no. Parcel gave misdelivered at 0.95. Decisions took about 140–156 ms. An 8-way concurrency isolation run passed, and the service stopped cleanly. Existing targeted suites: wrap/CLI/rollout 749 passed; paths/stateless/workspace 265 passed; hooks/health/CCR slice 416 passed. Pre-existing failures, which also fail on the clean Phase 0 worktree: `test_turn_hook_usage` (4), `test_anthropic_buffered_ccr_usage` (6) and 2 `TestHeadroomCloudCompressionOffline` cases, all from an unmocked litellm price fetch.
-
-**Eval** (`benchmarks/results/phase1.json`): identical to baseline. Python is 29.39%, Rust 70.68%, recall 1.0, 0 errors. Warm wall time is 2900 ms against 2888 ms in the baseline.
-
-## Phase 2: task state, evidence, code graph, query model (commits 63a1ca94, 70933fb8, this entry)
-
-**Wiring.** `headroom/agent/builtin.py` is installed from `install_agent_runtime` (so from `create_app`). Each component has its own rollout feature: `agent_task_state`, `agent_evidence` and `agent_code_graph`. They are opt-in for a bare proxy. `headroom wrap` adds them, plus `agent_runtime`, through `rollout.apply_wrap_feature_defaults`. `HEADROOM_DISABLE_FEATURES` still turns any of them off. The services are registered on `runtime.services` as `task_state`, `evidence`, `code_graph` and `ledger`, and `/health` reports their counters. Relational state lives in `agent_ledger.db`, which sits beside the event store and is in memory when stateless. Request stages never touch SQLite: when a snapshot is missing, they queue a warm-up read with `runtime.submit_task`.
-
-**2A Task state (#16).** Atoms are typed and carry their origin, authority, source events, evidence ids and supersession link. Corrections supersede only the atom they target. JevK5 `choose` may pick only among existing atoms, and an unknown id is ignored. An agent's "done" stays PROPOSED. Completion needs user acceptance, or acceptance criteria satisfied by test evidence. A truncated result never counts. Transitions apply through projection CAS, with one retry on a stale revision, then rejection and a counter. They are written as digest-only `TASK_STATE_CHANGE` events; atom text sits content-addressed in the ledger, so replay rebuilds state exactly. Only trusted (`ws_`) scopes are compiled, and state persists across trimmed history. A priority-80 stage (order 50) appends one stable, hash-tagged block after the live turn. On Anthropic it is a mid-conversation `system` message, sent only to models that support one (the shared `anthropic_supports_mid_conversation_system`). On Responses it is a trailing `developer` item. The system prompt, cached prefix and latest user message are never modified. The budget is min(900 tokens, 2% of the window, the tag `agent_state_budget_tokens`); user constraints and blockers fill it first. The block is omitted when it is unchanged in context, when the request is untrusted, or when the current turn is a correction or a new task.
-
-**2B Evidence (#17).** Facts are extracted from test, exit, error, file, hash, git, tool-availability, port and user-statement events. Negative facts are first-class. Values are scrubbed of secrets and bounded at 160 characters, and no whole files are stored. Claim keys are normalized; a newer observation supersedes an older one, and corroboration raises confidence by source type. A conflict between a user statement and an observation is labelled CONTRADICTED until resolved. Volatile facts have a TTL, after which they go STALE. File edits stale facts tied to the old content, and git mutations stale git state. Retraction is supported. `EVIDENCE_CHANGE` events allow replay. Indexes cover (ws, claim_key, status), (task, status), source_event_id and time, and every read is scoped by workspace and session.
-
-**2C Code graph (#11).** It reuses the compression tree-sitter parser cache, the ast-grep runner (only through `binaries.which`, so it never downloads) and the watcher's extension and ignore tables. When a language is unsupported, it falls back to lexical extraction. Nodes and edges are file/module/class/function and imports/includes/calls/references/inherits/contains/defines. Each worktree keeps incremental hashes, persisted in `graph_files`. Updates come from `FILE_CHANGE` events and a stat rescan limited to once every 60 s. Vendor, generated and gitignored paths are skipped. Indexing runs on one background thread.
-
-**2D Query model.** `TaskContext` was extended with optional fields; it is not replaced. `RelevanceQuery` holds goal, intent, exact entities, active error and graph neighbors (graph only for code tasks). It is capped at 512 tokens with entities budgeted first. It is built in the hook from authentic user text only.
-
-**Tests.** `tests/agent`: 75 passed: 43 new, 32 pre-existing; the new tests are in `test_task_state`, `test_evidence`, `test_code_graph`, `test_query` and `test_phase2_integration`. 780 passed and 1 skipped across nearby suites: agent, intelligence, turn hooks, handler helpers, rollout, agent savings, proxy env, byte-faithful forwarding and the wrap CLI.
-
-**Eval** (`benchmarks/results/phase2.json`): identical to Phase 1. Python is 29.39%, Rust 70.68%, recall 1.0, 0 errors. The eval exercises compression only, and Phase 2 has no lossy transforms. Warm wall time was 4456 ms against 2900 ms, measured right after a large test run; the eval path contains no agent code.
-
-## Phase 3: SafetyGate, policy, semantic relevance, query-conditioned live zone, indexed CCR (commits 2eafd618, 93eb47a8, b0f4dc8d, 8dd4bb61, fbaf87e1, this entry)
-
-**3A SafetyGate (#7, #13).** One implementation, `headroom_core::safety_gate` (`check`, `select`), exposed as `headroom._core.safety_gate_*` and wrapped by `headroom/transforms/safety_gate.py`. Hard invariants: user-named entities, failure lines and traceback `file:line` (search hits and JSON excepted, but a non-hit failure line in "search" output is protected), exit codes, test counts (changed counts reject), definitions of named symbols, diff headers, existing CCR ids, truncation boundaries, JSON syntax/bool/key facts. New markers must be verified (stored payload read back) and a retrieval tool must exist. `max_lossy_ratio` bounds *irreversible* loss; `wire_drop_ratio` is separate, so exact CCR externalization may drop more. `volatile_token_threshold` bounds volatile tokens a candidate introduces. Missing/invalid policy, no token savings, or a frozen-prefix block all reject. Ladder: aggressive → conservative (bias re-run, then policy-fit line selection) → lossless (JSON minify / router fold, verified reversible compaction) → CCR exact stub → original; a lossy rung no smaller than an admissible lossless rung is skipped. Enforced on every Rust live-zone block and every Python router candidate (string, block, cache hit, Responses unit and batch). Rust proxy passes the resolved policy. Shared fixtures: `tests/fixtures/safety_gate_parity.json`.
-
-**3B Semantics (#2).** `relevance::semantic`: lazy once-per-process background init, cache-only (Xenova/bge-small-en-v1.5 from `HEADROOM_FASTEMBED_CACHE_DIR`/HF caches), intra-op threads ≤4, 4096-entry embedding LRU, batched. `HybridScorer::default()` fuses it with an exact-identifier floor (0.75) and stays on boosted BM25 until ready; no `ml`, offline-without-cache, no ORT, no AVX2 or a miss → BM25, never retried per request. `semantic_relevance_prefetch` is the only download path and refuses without an operator directory. Verified both ways: fallback, and a real model in `target/fastembed` (F:) loads once (~0.4 s) with paraphrase ranking.
-
-**3C Query-conditioned live zone (#1).** `EMPTY_QUERY` is gone. `LiveZoneOptions{query, policy, ccr_store}` and `compress_*_live_zone_with_options`. The query is the agent `RelevanceQuery` or is derived from the request's latest user text. It reaches SmartCrusher, search, diff and code; newest user prose is excluded; CCR originals are stored and verified before a marker. Python handlers build the RelevanceQuery before compression (`agent.hook.compression_relevance_query`, reused by the hook via `TurnContext.request_id`). The Responses unit cache key excludes the query so history stays prefix-stable (cached forms are re-gated).
-
-**3D Indexed CCR (#3).** `headroom/ccr/indexed.py` adds spans for JSON rows, logs, traces, search hits, code symbols, diff hunks and paragraphs. Each span keeps exact byte ranges. Lookup uses FTS5 BM25, or lexical BM25 when FTS5 is unavailable; semantic and graph scores are hints. Cursors are HMAC-bound to (workspace, entry, generation, mode, query). Spans follow the parent entry's TTL and deletion. Selective modes serve only hashes reachable in the conversation. The tool schema adds optional `mode/query/top_k/cursor/start/end`; `hash` alone stays byte-exact. These modes are wired into the response handler (mixed calls), MCP, `/v1/retrieve*` and proactive expansion, which now returns selected spans ≤1200 tokens.
-
-**Tests.** Rust: core lib 994 passed / 1 ignored; 16 live-zone/CCR/gate integration binaries pass, including the new `live_zone_query_safety`, `safety_gate_parity` and `relevance_semantic`; proxy lib 340 and proxy compression/Responses integration 41 pass. Python: new `test_safety_gate` (25) and `test_ccr_indexed` (10); targeted suites 2167 passed. Plumbing tests with fabricated summaries opt into `conftest.permissive_lossy_budget`. Pre-existing failures, reproduced on the pre-change tree: xdist-flaky `test_ccr_inline_resolve_handlers`/`test_ccr_row_drop_store_bridge`, `test_kompress…thread_caps`, `test_wrap_code_memory` serena ×3.
-
-**Eval** (`benchmarks/results/phase3.json`): Python 29.39% (unchanged), Rust 35.19% (phase 2: 70.68%), recall 1.0, 0 errors/structure/prefix violations. The Rust drop is the policy working: the binding has no retrieval path, so PAYG caps irreversible loss at 45% (search/log 98% → 42%; the context-trimming diff is rejected; lossless JSON compaction still 67%). One eval run stalled at 0% CPU and was not reproduced in four reruns.
-
-## Phase 4: host admission, structured delta, tool-family interceptors (commits 421dc838, 06751097, c1e9f097, this entry)
-
-**Envelope (#4).** `ToolResultEnvelope` v2 extends the Phase-1 type (v1 still deserializes): `tool_family`, `session`, `workspace`, stable `resource_id`, `version_hash`, `content`, `stderr`, `source_metadata`, plus `call_id`/`truncation_reason`/`is_complete`. `resource_id` is a digest of the canonical key: workspace-relative path + range, normalized command + cwd, query + scope, or API args. The tool-call id is never part of it. Explicit partiality comes from range reads, pipes into `head`/`tail`, result limits and host flags, and is never inferred as complete. `to_metadata()` stays content-free.
-
-**Dispatcher and storage sequence (`headroom/agent/tool_admission/`).** One `ToolAdmissionDispatcher` runs: completeness → version hash → exact original into CCR → read-back self-test → delta and family-view candidates → `SafetyGate.select` → replace only when a candidate is admitted. Any failure forwards the original (store error, failed self-test, no store, interceptor crash, gate reject, unknown policy). Outcomes are memoized per (scope, call, content), so later requests render the same bytes (prefix-stable).
-
-**Interceptors (#14).** One per family, all reusing existing code: Read: code-graph/ast-grep outline that keeps the client's own line numbers and keeps user-named definitions whole. Edit targets, range reads and small reads stay exact. A reread after a lossy view is exact (progressive disclosure). Search: Rust `SearchCompressor`, grouped by file. Listing: grouped by directory; PARTIAL is stated. Shell and test: Rust `LogCompressor`, plus pinning of failures, exit codes, summaries and failing ids. Git: `DiffCompressor` hunks; status grouping keeps every path. A request for an applyable patch stays exact. JSON: SmartCrusher keyed rows.
-
-**Delta (#5).** `ResourceVersionStore` keeps the last version per (scope, resource): hash, CCR hash, unit identities, complete flag and presented-exact flag. It is bounded and persisted to `tool_resource_versions` in the agent ledger on the runtime worker. `compute_delta` covers lines, keyed JSON rows, search rows, listing entries and test outcomes, and states base/current hashes and exact +/−/~/unchanged counts. A partial base or current is never compared. An unchanged reread becomes a reference only after the new version's exact bytes verify. A base must be visible in the same request (same call id and bytes), so no delta crosses conversations.
-
-**Host adapter.** `wrap claude` installs `PreToolUse` (observe edit targets; prints nothing, so no permission effect) and `PostToolUse` (`hookSpecificOutput.updatedToolOutput` in the tool's own shape: Bash/PowerShell stdout, Grep/Glob filenames or content, MCP text blocks). A normal launch passes the hooks through `--settings` and touches no file; a user `--settings` wins and the session reports observational. `--project-settings` writes them under the settings lock with holder tracking; the last session and `unwrap` remove them. Read is left to the proxy, because Claude Code renumbers Read content. The hook command `python -m headroom.host_hook` is stdlib-only, loopback-only and fail-open (prints nothing, exit 0) and posts to `/v1/agent/host-hook`. Every other client reports `observational_or_proxy_only`. The proxy fallback `ToolAdmissionTransform` is the first pipeline transform and never touches the frozen prefix; `/health.tool_admission` reports both. Rollout feature `agent_tool_admission`: wrap default, opt-in for a bare proxy.
-
-**Tests.**
-New: `tests/agent/test_tool_admission.py` (44), `test_tool_admission_wrap_proxy.py` (5: settings preservation, real `/v1/messages` fallback with exact `/v1/retrieve`) and `test_host_hook_live.py` (3). The live tests run the real hook subprocess against a uvicorn proxy with real hook JSON; host-visible Bash bytes are cut more than 3× and the original is recovered exactly. Targeted: 346 passed in agent/interceptors/rollout/gate/CCR/wrap-settings; 512 passed in wrap CLI; 204 passed in prefix/CCR-marker/pipeline. Failures that predate Phase 4 (both reproduce on a clean `ff3f18c9` worktree): `test_unwrap_claude_removes_mcp_purges_retired_hook_and_stops_proxy` and `test_wrap_stale_marker::test_signal_handler_unwinds…`. `test_ccr_marker_resolution` fails only under xdist.
-
-**Eval** (`benchmarks/results/phase4.json`): Python bare proxy 29.39% (unchanged; admission is off there), Rust 35.19% (unchanged), recall 1.0, 0 errors/structure/prefix violations. A new path, `python_proxy_anthropic_wrap` (wrap rollout), reaches **56.91%** with recall 1.0. Read, search, pytest, tool_error and git_diff go from 0–7% to 26–94%. `same_output_reread` drops from 49% to 14%: the reread is now exact by design. Not covered: Windows was tested, Linux was not run in this phase, and the native Rust proxy has no admission (it is a separate runtime).
-
-## Phase 5: budget + arbiter, progressive catalog, complexity routing, feedback, speculation (commits 8b5ccb95, 58506ed8, 03f9631b, this entry)
-
-**5A Budget and arbiter (#8, #6).** `headroom/agent/budget.py` computes the live-zone budget from the handler's context-guard effective limit (learned cap honoured; `context-1m` honoured only for models with a real 1M window; `HEADROOM_CONTEXT_GUARD=0` keeps the registry window), minus frozen prefix, system/tools, `max_tokens` (else 10%, ≤32k) and a margin (max(1024, 2%)). `x-headroom-keep-last-turns` is recorded; task state is not in trimmed history. The allocator is order-independent: each unit's smallest invariant-safe candidate first, then optional tokens by (relevance + novelty + anomaly + 1−recoverability)/token after a 15% per-source diversity share; an unfittable floor marks `insufficient`. `headroom/agent/arbiter.py` (`TransformArbiter`) takes over from the ladder in the dispatcher (`prepare → allocate → decide`). Candidates are original, lossless, type_specific, query_aware (`SafetyGate.fit`), structural, delta and indexed_externalization (CCR stub). Hard filters run first: SafetyGate check, then billed cost after cache multiplier (1.25×/2× on write) plus expected retrieval overhead. Survivors are scored with the spec weights (.28/.20/.16/.14/.10/.07/.05). Latency uses a deterministic estimate, so the winner never depends on scheduling. Ties go to less loss, then lower cost, then the original. JevK5 sees at most 16 finalists, only when the task is ambiguous or the margin is under .15, with weight min(w, .40); with no advice, w = 0. `RequestLimits` caps candidates and views per request. Memoized units stay byte-identical across requests.
-
-**5B Progressive catalog (#9).** `headroom/agent/tool_catalog.py` runs after server-side tool search, only when the tools array does not defer (client `ENABLE_TOOL_SEARCH`/`defer_loading` or Headroom deferral untouched), never on tool-free requests, and on ≥12 tools. Resident tools (core set, `ToolRegistry` residents such as `headroom_retrieve`, strict schemas, typed server tools) and the top 5 ranked tools keep their full compacted schema. The rest become callable stubs: purpose + `name(req: type, opt?: type)` with required/types/enums and `cache_control` kept. Ranking: lexical, Rust hybrid scorer, graph neighbours, recent successful use, feedback prior; JevK5 breaks ambiguous top-16 ties. The set is sticky per (session, tool digest) and never shrinks on a hot prefix. It grows only for `tool_choice`, a user-named tool (introspection) or a call to a stubbed tool (a miss, fed back). Wired for Anthropic `/v1/messages` and OpenAI chat; savings are booked to `tool_catalog`.
-
-**5C Complexity routing (#10).** `headroom/agent/complexity.py` decides effort and verbosity independently, treatment arm of `HEADROOM_OUTPUT_HOLDOUT` only. Effort: only a client-sent `output_config.effort` / `reasoning.effort` / `reasoning_effort` is ever lowered (floor `medium`); nothing is injected and `thinking` is untouched. New asks, errors, novel errors, failed retries, contradicted evidence, open acceptance gates and explicit deep-thinking requests are protected. Otherwise score 0–4 from unknown requirements, new symbols, multi-file scope and uncertainty; JevK5 scores only the middle (2). Verbosity: the shaper's conversation-stable level stays in the system tail. A complex new ask can relax it for one reply via a trailing turn block, only on models that accept mid-conversation system. Wired in the Anthropic, chat and Responses paths.
-
-**5D Feedback and speculation (#12, #15).** `RetentionFeedback` keeps pending observations per lossy decision, keyed by (family, content type, task class, strategy, model family, language, workspace hash), never raw text. They resolve once: negative on CCR retrieval (`IndexedCCR.retrieve` and `CompressionStore.retrieve`), reread/re-search, failed edit repair or user correction; 0.25 on a test failure; positive after 3 quiet requests. The EWMA applies only after 5 observations, clamped to .1–.9; there is revert/reset, a neutral prior when off, and ledger persistence. `RequestSpeculation` gives one lane per request under a process cap (≤4). View previews run while the current unit is gated, and CCR span indexes build after admission while the request awaits the model. `take` never blocks, late results are discarded, `close` never waits, and store writes and selection stay authoritative. `/health.tool_admission` reports arbiter (decisions, rejections, confidence bins, cache mix, p50/p95 overhead, realized tokens/cost apart from estimated avoided turns), feedback and speculation.
-
-**Tests.** New: `tests/agent/test_phase5_{arbiter,catalog,complexity,feedback_speculation}.py` (56), including e2e `/v1/messages` through the wrap rollout, arbitrary tool ordering, cache/policy decisions, tool-free and introspection cases, bounded and reversible feedback, and speculation on/off giving identical bytes. `tests/agent` 183 passed. Targeted CCR/gate/prefix/pipeline/wrap: 997 passed (1 failure that predates Phase 5, `test_canonical_pipeline::…compresses_tool_outputs`, also on clean HEAD). Proxy/handler/output/tool suites: 2485 passed. Their 7 failures reproduce on clean HEAD (loopback gating ×2, client-decision ×4, fsync). `test_proxy_anthropic_cache_stability` failed once under xdist and passes on rerun. Live JevK5 (llama-server, 4B Q8_0): arbiter blend applied (w .25, conf .81); catalog and effort advice were low-confidence and correctly ignored.
-
-**Eval** (`benchmarks/results/phase5.json`): Python bare 29.39% and Rust 35.19%, both unchanged. Wrap path 55.95% (Phase 4: 56.91%), recall 1.0, 0 errors/structure/prefix violations. The only move is `tool_error`, 71% → 0%: the arbiter keeps the full traceback because the folded view shows only 19% of the traceback facts (they were recoverable, not visible).
-
-## Phase 6: change scope, then tool contracts (commits 21aa81b7, 95782ebb, 741b1eb3, 928f1725, 7a69d701, this entry)
-
-**6A Change-Scope / Drift Firewall (#23), `headroom/agent/change_scope.py`.** A `ChangeContract` is built per (workspace, session) from four inputs: live USER-origin TaskState atoms, live negative test/error evidence that names files, the task's recorded writes, and writes the firewall authorized. Reads never feed it.
-User text, clause by clause: named files, directories and globs become expected paths; "do not touch / leave … alone / off-limits / exclude" make paths forbidden; "only edit … / nothing else" sets FROZEN; "don't push / commit / delete files" forbids an effect. The latest instruction wins per path. Modes are LEARNING, ACTIVE and FROZEN. Classes are IN_SCOPE, DEPENDENCY_SCOPE, GENERATED_EFFECT, UNRELATED and FORBIDDEN. A dependency must be traceable: a direct import (code graph, or a lexical fallback), a shared interface (callers or subclasses), failing evidence (fact id), a config or package file on the anchor's path, or a related test. The reason is recorded on the contract, which bumps its revision. JevK5 is never an input. Hard-protected: `.git` internals (never approvable), private keys, credentials and `.env*` (templates excepted), AI-client provider config and `.headroom/`. Unknown and untrusted workspaces never get authority. Untracked deletion (`git clean -f`), push and history rewrite only warn unless the user permitted them. Dry runs pass. Each decision carries a revision-pinned `ActionAuthorization` (task, scope and resource revision; the resource revision comes from recorded writes plus stat changes). It is verified right before the hook returns. On a mismatch the call is re-evaluated once; if it still mismatches, the call is denied with `scope.stale_revision`. Paths are canonicalized: relative paths resolve against cwd and `cd` preludes; MSYS, `\?\` and `\?\UNC\` forms are unwrapped; symlinks are resolved, and a symlink that escapes the worktree warns; UNC paths are flagged; case folds only on Windows and macOS. Relative mentions written from a subdirectory are matched on path components. Shell writes are parsed into planned changes: redirections, rm, mv, cp, `Set-Content`, `sed -i`, apply_patch and git operations. The policy is `HEADROOM_CHANGE_SCOPE_MODE=observe|warn|protect`, default warn. FORBIDDEN is blocked only at a trusted host. `protect` also blocks UNRELATED edits under FROZEN.
-
-**6B Tool Contract + Argument Validator (#19), `headroom/agent/tool_contracts.py`.**
-`ToolContract` and `Decision` (ALLOW, WARN, BLOCK, REPAIR_SUGGEST) cover the Read, Edit/Write, exec, search, Git, test/build and HTTP families. The Claude, Codex and OpenCode names map to them with provider schemas left untouched. Unknown tools are observed and never certified. Checks: client JSON schema when the proxy has it (else the documented required arguments), types, enums, mutually exclusive arguments, no-op edits; cwd and `cd` targets; input existence; UNC; command availability (built-ins, PowerShell cmdlets and aliases); cmd.exe switches in Bash and `rm -rf` in PowerShell; git ref names (`check-ref-format`); privilege escalation the user didn't ask for (blocked at the host); malformed pytest, npm and cargo calls. Writes go through the firewall. Repairs (typo paths and commands, learned recoveries) are suggestions only. The input is never rewritten. Learned recovery reuses `TrafficLearner._build_recovery_pattern` and `classify_error`. A recovery is promoted after 3 distinct corroborations and is bound to an environment fingerprint, with a 7-day TTL. It is invalidated when the suggested form fails or the failing form succeeds. JevK5 only reorders already-safe repairs. An invented option or a hard scope decision cannot be overridden. The policy is `HEADROOM_TOOL_CONTRACTS_MODE`, default warn. The OpenAI extractor now also returns `call_id`.
-
-**Interception matrix (`agent/enforcement.py`).** `wrap claude` adds a separate PreToolUse `Bash|PowerShell` entry; the earlier entries are unchanged. The proxy returns one of three outputs: `permissionDecision: "deny"`, only for BLOCK at a trusted workspace. `additionalContext` with a compact diagnostic and reason code, for WARN or REPAIR_SUGGEST. Nothing otherwise.
-
-No other permission field is ever set. User permissions and hooks are kept, and `--settings` carries hooks only. The proxy and TurnHook path (stage order 60) is observe-only: it records the calls a client already executed, failures (kept apart from prevention and warnings), the after-edit and `git.changed_paths` diff check, and learning observations. It never reports anything as blocked. `/health.agent_enforcement` reports capabilities (claude `host_pretool`, others `observe_only`) and counters. Wrap prints one honest line per client. Rollout features `agent_change_scope` and `agent_tool_contracts` are wrap defaults and opt-in for a bare proxy. Also fixed from Phase 1: the intelligence subprocess calls now go through `headroom._subprocess`.
-
-**Tests.**
-New tests, 66 in total: `test_phase6_change_scope` (33), `test_phase6_tool_contracts` (27), `test_phase6_gate_host` (6). These run the real hook subprocess against a uvicorn proxy, with the instructions sent through `/v1/messages`. Results: a forbidden write is denied and the file stays untouched; an edit and an import dependency produce no output; a typo gets a suggestion and nothing is created; the user narrowing scope denies the next write, including 4 concurrent hooks; codex and proxy-only report observe; permissions are byte-identical. `test_host_hook_live` is extended. Targeted suites (agent, intelligence, CLI and wrap, rollout, traffic learner, health, handler helpers, turn hooks, CCR, SafetyGate, tool, byte-faithful, canonical pipeline): 2531 passed. All 7 failures predate this phase: 5 are on the known list; `TestProjectForPattern` ×2 also fails on clean 98ba36b1. Live JevK5 (4B Q8_0): the advisor was ready but repair ranking was low-confidence, so the deterministic order was kept. A forbidden write stayed BLOCK with the advisor attached. The service was stopped.
-
-**Eval** (`benchmarks/results/phase6.json`): identical to Phase 5. Python bare 29.39%, Rust 35.19%, wrap 55.95%, recall 1.0, 0 errors/structure/prefix violations. Phase 6 adds no transforms.
-
-## Phase 7: verification planner, then learned workflow macros (commits 7843b8e5, 34745209, 6dee0e31, 877bd030, 6cd36ae3, this entry)
-
-**7A Test Impact and Verification Planner (#24), `headroom/agent/test_impact.py`.** `TestImpactPlanner` (`runtime.services["test_impact"]`) builds a `VerificationPlan(workspace_id, task_id, task_revision, scope_revision, changeset_hash, plan_revision, frameworks, tier1/2/3, required_checks, risk_score, reason_codes)` plus argv `TestCommand`s and an avoided-work *estimate*.
-Inputs: `git status --porcelain -z` + content hashes (recorded writes when there is no Git), TaskState acceptance/proposed completion, negative test evidence, code-graph `affected_resources` (bounded lexical import index while the graph is not ready), coverage.py per-test contexts when a `.coverage` exists, and run history. Pinned to (task, scope, changeset, runner-config fingerprint); `is_current` refuses a stale plan and any change bumps `plan_revision`. Adapters keep the project's runner: pytest (static node ids; `--collect-only` validation only inside an authorized run), Cargo (`cargo metadata --no-deps --offline`, `-p crate --lib module::` / `--test`, path-dependents in Tier 2), CTest (`--show-only=json-v1` in an *existing* configured build dir, `-C <config>` for multi-config trees; never configures), Jest/Vitest (npm/pnpm/yarn/bun from `packageManager`/lockfile). Otherwise `make test`/`go test ./...`/`tox`/`<pm> test`, else explicit `framework.unknown`. Order: exact failure regressions, direct scope (changed test, coverage, naming, import, module filter, acceptance), dependency/interface neighbours, smoke. Risk counts public API, security, build config, provider wire, platform, history, breadth, uncertain evidence, size, drift, uncovered changes and flaky tests. MANDATORY_FULL classes and final completion require the full suite. Runs come in through normal ingestion: a projector parses every `TEST_RESULT` (ANSI stripped), and a commit listener refreshes the plan first and then records. A fail-then-pass on the same changeset is **flaky**, reported separately, and never green. Each run emits one `VERIFICATION_DECISION` (status, overall, exit, ids, platform, runner version, test event id). Evidence turns it into a `verification.status` fact; TaskState keeps a `verification` blocker for failed, flaky, or required checks still missing. History persists in `verification_runs` in the agent ledger. Stage order 65 adds one hash-tagged `<headroom_verification>` block (rationale, commands, required checks, flaky, estimate) after the live turn. It shares the task-state placement rules and is omitted when unchanged in context.
-
-**7B Workflow Macro Compiler (#20), `headroom/agent/workflow_macros.py`.** `WorkflowMacroRegistry` (`runtime.services["workflow_macros"]`).
-Observation and promotion: stage order 62 cuts closed segments between authentic user turns. A clean observation is 2–8 successful calls, with no host WARN/BLOCK, no UNRELATED/FORBIDDEN scope and no following correction. It is recorded once per segment id (persisted). Calls normalize to typed families/slots; credential/URL/write/network/install/deploy/elevation/delete steps keep no argv. Promotion needs ≥3 occurrences, ≥90% success, ≥2 sessions or 3 in one, no violation and ≥2 turns saved. Only read-only/verification macros auto-promote; the rest become `manual_only` and never run. IDs are `wf_` + digest(workspace, template). Caps: 32 active (LRU retired), 8 steps, 120 s total and 90 s per step. The env fingerprint covers executables, runner config, policy and tool schemas; a change invalidates the macro, which is re-learned in a new epoch. The `headroom_workflow(macro_id, typed_inputs, dry_run)` tool is registered in `tool_catalog.REGISTRY` (new `REGISTRY.get` resolves `mcp__headroom__` names) and served by the Headroom MCP server. That server lists it only when the proxy reports the feature, and it forwards with the wrap token to `POST /v1/agent/workflow` (cancel: `/v1/agent/workflow/cancel`). Host boundary: `wrap claude` adds a PreToolUse entry `mcp__headroom__headroom_workflow`. The hook validates the call and issues a single-use ticket pinned to (task id, revision, scope revision, live user atoms) and the macro version; invalid calls are denied. Without a ticket the result is `fallback` with the ordinary steps. Execution: verification steps take Tier-1 targets from the current plan. Before every step the planner re-compares pins, checks plan currency, the ToolContract decision and ChangeScope `authorize` + `verify`. Steps run via `exec_runner.run_argv`: `shell=False`, own process group (`taskkill /T /F` on Windows, `killpg` on POSIX), a deadline, a cancel event, bounded output and a scrubbed environment. Before/after worktree digests catch side effects and disable the macro. Execution stops on the first failure. Large outputs go to CCR (verified) plus the span index. Each step is ingested once as TOOL_CALL/TOOL_RESULT; the aggregate workflow result is ignored by evidence and TaskState, so nothing is double-counted. Rollout features `agent_test_impact` and `agent_workflow_macros` are wrap defaults and opt-in for a bare proxy. `/health.agent_verification` reports the planner and workflow counters. Wrap prints one honest workflow line.
-
-**Tests.**
-New: `test_phase7_test_impact` (12): pytest (real run + collect), Cargo (real `cargo test` selecting only `math::`), CTest (real `ctest`), Jest (pnpm), Vitest (yarn; real run with vitest 3.2.4 provisioned in `target/tmp/js_runner`); escalation; invalidation; flaky. `test_phase7_workflow_macros` (16): normalization safety, promotion/sessions/parallel turns, mutating never promotes, 32/8 caps, ticketed shell-free argv, plan consumption, stale/mid-run/step-violation cancellation, side-effect and environment invalidation, deadline tree kill, grandchild cleanup, cancel. `test_phase7_gate_live` (3): real uvicorn proxy + host-hook subprocess + MCP handler. One workflow call replaces 3 model tool turns (estimate 2 avoided); a stale scope cancels with 0 steps run. Targeted (agent, intelligence, CLI/wrap, rollout, health, handler helpers, turn hooks, MCP server/registry, CCR, SafetyGate, byte-faithful, canonical, traffic learner, interceptors, tool search, proxy env): 2251 passed, 25 skipped, 4 failed. Three are on the known list; `test_phase5_arbiter::…recovers` failed only under 8-way load and passes alone. `test_phase5_feedback_speculation::…stale_futures` (a timing bound) fails on clean b4e5cceb too.
-
-**Eval** (`benchmarks/results/phase7.json`): identical to Phase 6. Python bare 29.39%, Rust 35.19%, wrap 55.95%, recall 1.0, 0 errors/structure/prefix violations. Phase 7 adds no transforms.
-
-## Phase 7 follow-up: host adapters, search parity, coverage, Linux (commits d8d74222, 8f562ed7, 5cb9dfef, be690a29, 59d0a692, this entry)
-
-**Client-independent engine.** Everything that depends on the client now lives in `headroom/agent/workflow_hosts.py`. `workflow_macros` (observe, promote, ticket, compile, `exec_runner`, `/v1/agent/workflow*`) names no client.
-`WorkflowHost` records whether a client has a pre-tool permission boundary, parses its hook payload and renders a refusal. The engine's `authorize_call` decides and issues the ticket. `StepDialect` holds a host's built-in Read/Grep/Glob semantics. A learned host-tool step keeps its dialect, which is part of the macro id, and re-executes only through it. A search step without a dialect never compiles. The MCP server offers `headroom_workflow` only to MCP clients that map to a ticketing host. Wrap prints an accurate workflow line for every client, and `/health.agent_verification.workflows.hosts` reports this table:
-
-| Client | Workflow capability | Basis in this repo's wrap integration |
-|---|---|---|
-| Claude Code | `host_pretool_ticket` (executes) | The PreToolUse hook for `mcp__headroom__headroom_workflow` issues a single-use ticket. The MCP call runs only after Claude Code's own permission check. |
-| Codex | `observe_only` | `wrap codex` writes only the MCP server and base URL. No pre-tool hook reaches Headroom. |
-| OpenCode | `observe_only` | The wrap plugin registers `headroom_retrieve`, the transport and `shell.env`. It has no pre-tool permission callback. |
-| Copilot, Cursor, Aider, Gemini, others | `observe_only` | No host hook integration. |
-
-**Grep/Glob equivalence.** The old Python `re`/`fnmatch` walker was not equivalent: it used a different regex flavour, ignored `.gitignore`, `type` and `multiline`, and ordered and capped results differently. It has been removed. Claude Code Grep/Glob steps now run ripgrep as argv (`shell=False`, `--no-config`) with the flags the host was observed to use. `tests/agent/test_workflow_search_parity.py` checks the output against results recorded from the real Claude Code 2.1.301 tools on the same fixture tree.
-
-| Dimension | Host (observed) | Verdict |
-|---|---|---|
-| Regex | Rust regex; look-around rejected | Equivalent: same engine, and its error is surfaced |
-| Glob | Basename at any depth, case-sensitive. A slash glob without a leading `**/` depends on how the host roots the search (`src/*.py` finds nothing) | Equivalent; prefix-dependent slash globs are ineligible |
-| Include/exclude | `glob`, `type` | Equivalent; `-A/-B/-C` and unverified options are ineligible |
-| Hidden/ignored | Grep: hidden files included, `.gitignore` honoured, VCS dirs excluded. Glob: hidden and ignored files included | Equivalent |
-| Case | Case-sensitive unless `-i` | Equivalent |
-| Binary | Skipped in a walk; an explicit file reports "binary file matches" | Equivalent |
-| Ordering | Files mode newest first, Glob oldest first; content/count order unspecified | Equivalent where the host defines an order; path order otherwise |
-| Paths | Relative to cwd, native separators | Workspace-relative with `/` (presentation only) |
-| Limits | `head_limit` 250, `offset`, lines over 500 columns elided; Glob capped at 100; 20 s timeout | Equivalent; truncation is marked partial |
-| Symlinks/boundary | Not followed; path arguments stay in the workspace | Equivalent |
-
-If `rg` is missing, or `RIPGREP_CONFIG_PATH` is set, Grep/Glob steps are ineligible; there is no fallback matcher. The `rg` binary is part of the macro fingerprint. These steps run only on a verified host series, read from `AI_AGENT` passed by the hook (2.1 is verified). Any other version gets `workflow.host_semantics_unverified`. Read/search tools of other hosts are never generalized.
-
-**Coverage robustness (existing coverage.py data only).** `load_coverage` uses `.coverage` only when all of these hold: schema version 7; per-test contexts, from line or arc data; measured files inside this worktree; HEAD was not committed after the data was written; no measured file outside the diff is newer than the data.
-
-Otherwise the plan records `coverage.unavailable.{schema|unreadable|no_test_contexts|foreign_workspace|stale_revision|stale_sources}`, and selection falls back to imports, naming, history and test layout. Usable data is recorded as `coverage.used`. No LCOV or framework-native reader was added, because the repo has no infrastructure for one.
-
-**Also fixed.** The egress audit was already failing on clean `8dae5ec3`. The Phase 7 workflow loopback calls in `ccr/mcp_server.py` and the Phase 3 cache-only `semantic.rs` init are now recorded in it.
-
-**Tests (Windows).** New: `test_workflow_hosts` (4), `test_workflow_search_parity` (13), coverage (1), case folding (1). Targeted set under `-n 8`: 2885 passed, 14 failed. Every failure is either on the known list or an xdist-load flake that passes serially. **Eval** (`phase7b.json`): identical to Phase 7: 29.39% / 35.19% / 55.95%, recall 1.0, 0 violations.
-
-### Linux qualification results (WSL2 Ubuntu 22.04, Python 3.10.12, rustc 1.95.0)
-
-All tooling, caches, the venv, the cargo target, ripgrep 14.1.1 and llama.cpp b11681 are under `/mnt/f/.../target/linux/`. The GGUF model is referenced through a symlink, and nothing was written on the Windows side.
-
-**Rust.** `headroom-core --lib`: 993 passed, 1 ignored. `headroom-proxy --lib`: 340 passed.
-
-**Python, same targeted set as Windows.** With basetemp on ext4: 2894 passed, 29 failed under `-n 8`. A serial rerun of every failure from both runs left 7: Three `tomllib` failures and the `test_mcp_dependency_contract` collection error. These tests need Python 3.11 and the venv runs 3.10; production code has a `tomli` fallback. `canonical_pipeline`, which is on the known list. `mcp_reconcile`, because the venv's `bin` was not on PATH. It passes with it. Two real bugs, both fixed: **Path case:** a worktree on drvfs is case-insensitive, but scope compared paths case-sensitively, so writing `CONFIG/Secrets.yaml` bypassed a forbidden `config/secrets.yaml`. Case sensitivity is now probed per filesystem (be690a29). **Process liveness:** a stopped managed llama-server stayed a zombie, so `stop()` timed out and reported failure. It is now reaped (59d0a692).
-
-The vitest test now also requires `node`.
-
-**drvfs (`/mnt/f`) run.** 21 extra failures, all caused by one of: mode bits; FIFOs and AF_UNIX sockets; 100 ns timestamp resolution; temp projects nested inside the 9p-hosted repo, where the parent repo's `git status` exceeds the 5 s flush bound.
-
-They pass on ext4 or with the temp dir outside the repo. pytest's output capture fails when `TMPDIR` is on 9p, so these runs kept `TMPDIR` on `/tmp`.
-
-**`fsprobe.py`.**
-
-| Check | ext4 | drvfs |
-|---|---|---|
-| SQLite WAL, 4 writer processes × 150 transactions | 600/600 rows, 2.1 s | 600/600 rows, 3.9 s |
-| `flock` across processes | blocks | blocks |
-| Owner-only modes (0700/0600) | enforced | 0777 |
-| AF_UNIX socket | works | EOPNOTSUPP |
-| Symlink escape | refused | refused |
-
-`start_new_session` plus `killpg` kills grandchild processes on Linux, and no `taskkill` call or creationflags are used.
-
-**CLI/wrap smoke test** (fake `claude`/`codex` binaries, temp HOME): `wrap claude` passes all four hook entries via `--settings`, plus the session token and base URL. `/health` shows the capability table. The real `headroom.host_hook` subprocess got `deny` for an inactive workflow. `wrap codex` prints the observe-only reason.
-
-The stateless and offline suites pass.
-
-**JevK5 on CPU.**
-Discovery works through the override and through `LLAMA_CPP_HOME`. Offline status makes no network calls. `setup --no-build` verified the model and started a managed server on :8091. Answers were correct (refund 0.057, parcel "misdelivered" 0.95), but took 2.6–2.9 s against the 1200 ms limit, so conformance disabled the advisor. `status` and `doctor` agree, server reuse works, and `stop` left no llama-server running. The live test fails on CPU latency alone.
-
-Not run on Linux: GPU, and the managed CMake build.
+Spec: `HEADROOM_WRAP_UNIFIED_21_FEATURE_IMPLEMENTATION_PLAN_OPUS_5_5.md`. Branch `feature/unified-21`.
+
+## Refs and state
+
+| Item | Value |
+|---|---|
+| Upstream merged | tag `v0.41.0`, `76133cff` (matches the plan). The old checkout `d13e1966` (0.39.1) had no local commits, so the merge was a fast-forward with no conflicts. |
+| Start / end of work | `76133cff` → HEAD of `feature/unified-21` (the commit carrying this report) |
+| Safety refs | branch `backup/main-pre-unified21` (`d13e1966`); `stash@{0}` kept; backups of `.claude/.headroom_wrap_settings.lock` and `.serena/project.yml` in `../_safety_backup_20261014_main/` |
+| User files never committed | `AGENTS.md`, the plan, `.clinerules-*`, `.claude/*`, `.serena/*` |
+| Paritok/JevK5 code before | none; this checkout was plain upstream. The shell's ~40 Paritok-era `HEADROOM_*` exports name features v0.41 lacks, so every test and eval runs with them unset. |
+| Environment | Windows 10 19045, Python 3.12.10, rustc 1.95.0, RTX A4000 16 GB, WinGet llama-server b44da65e. TMP/TEMP on F: (C: is nearly full). |
+
+**Completion status.** Phases 0–8 are implemented and committed. Under the plan's definition the job is done only once the full suite passes. **The full suite was not run, at the user's direction** ("do not run the unified tester script"), so final completion is pending that run. Command, from the repo root with the Paritok-era variables unset:
+
+```
+env $(cat target/tmp/unset_args.txt) TMP=$PWD/target/tmp/t TEMP=$PWD/target/tmp/t .venv/Scripts/python.exe -m pytest -p no:cacheprovider -n 8 --timeout=300 -o addopts="" tests
+CARGO_TARGET_DIR=$PWD/target cargo test --workspace
+```
+
+## Feature status (all 21 reach a production runtime path)
+
+Wrap defaults are enabled by `headroom wrap` through `rollout.apply_wrap_feature_defaults`. They are opt-in for a bare proxy, and `HEADROOM_DISABLE_FEATURES` disables any of them.
+
+| ID | Feature | Owner (path) | Runtime path | Status |
+|---|---|---|---|---|
+| 1 | Task-conditioned live-zone compression | `headroom_core` live zone, `agent/hook.compression_relevance_query` | Python handlers → Rust `compress_*_live_zone_with_options` | Done |
+| 2 | Rust hybrid semantic relevance | `relevance::semantic`, `HybridScorer` | live zone, catalog, CCR span ranking; cache-only model, BM25 fallback | Done |
+| 3 | Indexed/selective CCR, exact full retrieval | `ccr/indexed.py` | response handler, MCP, `/v1/retrieve*`, proactive expansion | Done |
+| 4 | Pre-context admission/externalization | `agent/tool_admission/`, `host_hook` | Claude PostToolUse hook; proxy fallback transform | Done (host pre-context: Claude only) |
+| 5 | Cross-turn semantic/structural deltas | `tool_admission/delta.py` | dispatcher | Done |
+| 6 | Transform Arbiter | `agent/arbiter.py` | dispatcher `prepare → allocate → decide` | Done |
+| 7 | Semantic invariants + automatic backoff | `headroom_core::safety_gate`, `transforms/safety_gate.py` | every Rust block, every router/admission candidate | Done |
+| 8 | Global token allocator | `agent/budget.py` | proxy transform | Done |
+| 9 | Progressive tool catalog | `agent/tool_catalog.py` | Anthropic `/v1/messages`, OpenAI chat | Done |
+| 10 | Effort/verbosity routing | `agent/complexity.py` | Anthropic, chat, Responses (holdout treatment arm) | Done |
+| 11 | Graph/symbol-scoped coding context | `agent/code_graph.py` | relevance query, Read outline, scope dependencies | Done |
+| 12 | Retrieval feedback / retention adaptation | `agent/feedback.py` | arbiter prior, CCR retrieval hook; Phase 8 holdout + family revert | Done |
+| 13 | Enforced lossy-risk / volatile policy | `CompressionPolicy` via SafetyGate | all compression paths | Done |
+| 14 | Read/Grep/Glob/Bash/test/diff/JSON interceptors | `tool_admission/views.py` | dispatcher | Done |
+| 15 | Bounded speculation | `agent/speculation.py` | one lane per request | Done |
+| 16 | Task State Compiler | `agent/task_state.py` | TurnHook stage 50 | Done |
+| 17 | Evidence Ledger | `agent/evidence.py` | event projector | Done |
+| 19 | Tool Contract validator | `agent/tool_contracts.py` | Claude PreToolUse (Bash/PowerShell); proxy observe | Done (enforced on Claude only) |
+| 20 | Workflow Macro Compiler | `agent/workflow_macros.py`, `workflow_hosts.py` | `headroom_workflow` MCP tool + PreToolUse ticket | Done (executes on Claude only) |
+| 23 | Change-Scope firewall | `agent/change_scope.py` | Claude PreToolUse; proxy observe | Done (enforced on Claude only) |
+| 24 | Test Impact planner | `agent/test_impact.py` | stage 65 + `TEST_RESULT` projector | Done |
+| — | JevK5 setup/management/advisor | `headroom/intelligence/` | `IntelligenceManager` in `create_app`; arbiter, catalog, complexity, task-state, repair ranking | Done |
+
+## Per-phase summary (condensed)
+
+- **0** Eval harness `benchmarks/unified21_eval.py` (11 offline fixtures, real Python pipeline and Rust live zone) and baseline.
+- **1** `headroom/agent/` runtime: digest-only `AgentEvent`s, trusted identity (wrap token + live marker), WAL SQLite store or a stateless memory store, one stream-safe TurnHook at priority 80. JevK5: typed settings, GGUF+SHA-256 verification, llama-server discovery or a managed CMake build, a 127.0.0.1 service that never kills foreign processes (PID+exe+start-time check), a shared monotonic deadline, an n_probs=128 retry, a circuit breaker, distinct llama-server and `/v1/systemone` clients, and `headroom intelligence setup|status|doctor|stop`.
+- **2** Task state (#16), evidence (#17) and code graph (#11) on the ledger. Atoms are CAS-projected and replayable. The state block is appended after the live turn and never touches the cached prefix.
+- **3** One SafetyGate in Rust with Python parity fixtures, a lossy budget separate from the wire drop, a candidate ladder, the semantic scorer, query-conditioned live zone and indexed CCR with HMAC cursors.
+- **4** Envelope v2, admission dispatcher (exact original into CCR, read-back self-test, gate, replace), per-family interceptors, structured deltas, Claude PostToolUse `updatedToolOutput`.
+- **5** Budget + arbiter, progressive catalog, effort/verbosity routing, retention feedback, speculation.
+- **6** Change scope (#23), then tool contracts (#19), with honest enforce-vs-observe per host.
+- **7** Verification planner (pytest/Cargo/CTest/Jest/Vitest), then safe learned workflows (ticketed, argv `shell=False`, process-group kill, side-effect digests). Follow-up: client-independent engine with host adapters, ripgrep Grep/Glob parity with Claude Code 2.1, coverage-data robustness, Linux qualification.
+- **8** (this phase) The plan item 8 holdout, plus automatic revert of a regressing transform family. `headroom agent status|doctor`. A JevK5 OFF/ON harness mode. Live baseline on v0.41.0. Four upstream tests aligned. This report.
+
+**Phase 8 code.** `HEADROOM_TRANSFORM_HOLDOUT` is a fraction, default 0, max 0.5, read live. A scope-stable share of sessions gets exact originals. The arbiter's would-be lossy choice registers a *control* observation on the same reread/retrieval/repair/correction signals, and its savings count as forgone, never realized. Per tool family: once the treatment arm has ≥8 resolved observations and its negative rate exceeds control by 0.25 (or reaches 0.5 without control data), the arbiter admits only reversible forms for that family. The feature stays on and safe; `reinstate()` or `reset()` clears it. Control observations never move strategy priors. `/health.tool_admission.feedback` reports arms and reverted families. `headroom agent status` summarizes `/health`: effective rollout of all 14 agent features (new `/health.agent_runtime.rollout`), host-enforcing vs observe-only capabilities, trusted workspaces, the store, JevK5 state, policies, holdout and counters. `doctor` adds read-only local checks. Neither command writes state.
+
+## Files changed
+
+171 files, +57,001/−321 against `76133cff`. Main components:
+
+- `headroom/agent/` (31 modules + `tool_admission/` 8) and `headroom/intelligence/` (11).
+- `headroom/ccr/indexed.py`, `ccr/mcp_server.py`, `transforms/safety_gate.py`, `transforms/content_router.py`.
+- `proxy/server.py`, `proxy/handlers/{anthropic,openai}.py`, `rollout.py`, `paths.py`, `host_hook.py`.
+- `cli/{agent,intelligence,wrap,main}.py`, `providers/claude` hook wiring.
+- Rust: `crates/headroom-core/src/{safety_gate.rs,relevance/semantic.rs,transforms/live_zone*}`, `crates/headroom-py/src`, `crates/headroom-proxy/src/compression`.
+- Tests: `tests/agent/` (Phase 1–8 gates and live host-hook tests), `tests/intelligence/`, `tests/test_safety_gate.py`, `tests/test_ccr_indexed.py`, Rust `live_zone_query_safety`, `safety_gate_parity`, `relevance_semantic`.
+- Bench: `benchmarks/unified21_eval.py`, `benchmarks/results/*.json`.
+
+## Tests (Phase 8, Windows; targeted, not the full suite)
+
+| Set | Result |
+|---|---|
+| Rust `headroom-core --lib` | 994 passed, 0 failed, 1 ignored |
+| Rust `headroom-proxy --lib` | 340 passed, 0 failed (an earlier run with the shell's `HEADROOM_FEATURES` exported failed 2 rollout tests; the clean env passes) |
+| A: `tests/agent`, `intelligence`, `cli`, `test_cli`, `test_mcp_registry`, `test_install` | 1976 passed, 4 failed, 18 skipped |
+| B: `test_proxy`, `test_cache`, `test_transforms`, `test_compression`, `test_providers`, `test_tokenizers`, `test_learn`, `test_storage`, `gateway`, `parity` | 2278 passed, 9 failed, 17 skipped |
+| C: 323 top-level files (wrap, rollout, health, CCR, SafetyGate, byte-faithful, prefix/cache, Responses/Codex/OpenCode, streaming, tool search, output shaping, savings, offline/stateless/egress, pipeline, interceptors) | 5743 passed, 25 failed, 50 skipped |
+| New in Phase 8 | `test_phase8_holdout_revert` (7), `test_phase8_agent_cli` (3), eval harness (+2): all pass |
+| Live host-hook gates (real hook subprocess + uvicorn proxy) | Phase 4/6/7 gates: 12 passed, including "one workflow call replaces 3 model tool turns" |
+| After the CLI commit: agent, intelligence, CLI, health, eval (`-n 8`) | 1542 passed, 4 failed (2 known; `test_phase7_test_impact` real-pytest run and the eval subset failed under load and pass serially) |
+
+**Failure triage.** All 38 distinct failures were rerun serially, then on clean worktrees of `1ca86bef` (pre-Phase 8) and `76133cff` (upstream v0.41.0, its own `_core` built), both since removed.
+
+- **7 failed only on this branch, fixed in tests** (e4bd3c8c). The upstream tests had not been updated for earlier phases' intended interface changes. Two client-decision tests (×2 params) now also assert that the resolved `CompressionPolicy` is passed. Two plumbing tests with fabricated summaries use the existing `permissive_lossy_budget` fixture. The buffered-timeout CCR double gains the real handler's `workspace` kwarg. No assertion was removed.
+- **Also failing on upstream v0.41.0 in this environment (25):** `test_context_tool_cleanup` ×7, `test_wrap_code_memory` serena ×3, `test_unwrap_claude…`, `test_wrap_stale_marker` signal handler, kompress `thread_caps`, `test_install` planner/runtime, `test_learn` ×2 (Windows paths), `test_storage` sqlite init, orphan watchdog, fsync, TCP keepalive proxy mounts, ast-grep slice, cache breakpoint diagnostics log, ML stage deadline, Codex init config. These are Windows/host-environment failures, all also failing on clean v0.41.0.
+- **Order- or flake-dependent, same on both trees:** `gateway/test_parity_proxy_vs_gateway` (an unmocked litellm price fetch; fails standalone on both trees), `test_cc_switch_reconciler` (1 of 3 fails on both), `test_savings_ledger_offload` concurrent append (fails 3 of 3 on HEAD, 2 of 3 on `1ca86bef`; Phase 8 does not touch the savings ledger).
+
+**Platform.** Linux (WSL2 Ubuntu 22.04, Python 3.10, ext4) was qualified in the Phase 7 follow-up. Results: Rust 993 + 340 passed. Python targeted set 2894 passed; after serial rerun, 7 remained: 3 `tomllib` tests needing Python 3.11, 1 MCP collection error needing 3.11, `canonical_pipeline` (fixed now), and an environment PATH case. Two real bugs were fixed: drvfs case folding and zombie reaping. JevK5 on CPU is correct but takes 2.6–2.9 s, so the advisor correctly disables itself. Phase 8 changes no platform-sensitive code (holdout arithmetic, a `/health` field, a read-only CLI), so Linux was not rerun. Not covered on Linux: GPU llama-server, managed CMake build, real Claude/Codex/OpenCode binaries, JS runners.
+
+## Benchmarks (`benchmarks.unified21_eval`; offline, stateless, 10 Anthropic + 8 Responses fixtures)
+
+Same harness for every row. The baseline row is a live run on a temporary v0.41.0 worktree (`baseline_v0410_live.json`); it matches the recorded Phase 0 `baseline.json` to the token. Upstream has no wrap rollout, so the wrap path did not exist there. Latency is per-request pipeline time, nearest-rank p50/p95 over the fixtures. The bare-Python p95 includes the first fixture's one-time warm-up, roughly 2.7 s in every configuration.
+
+| Config | Path | Tokens before → after | Reduction | Must-keep recall | Errors / structure / prefix | p50 / p95 ms |
+|---|---|---|---|---|---|---|
+| Baseline v0.41.0 | Python bare | 75,997 → 53,659 | 29.39% | 1.00 | 0 / 0 / 0 | 7.3 / 2737 (warm p95 80) |
+| Baseline v0.41.0 | Rust live zone | 48,857 → 14,323 | 70.68% | 1.00 | 0 / 0 / 0 | 1.2 / 6.9 |
+| JevK5 OFF | Python bare | 75,997 → 53,659 | 29.39% | 1.00 | 0 / 0 / 0 | 8.9 / 2772 (warm p95 52) |
+| JevK5 OFF | **Python wrap** | 75,997 → **33,477** | **55.95%** | 1.00 | 0 / 0 / 0 | 22.1 / 55.2 |
+| JevK5 OFF | Rust live zone | 48,857 → 31,664 | 35.19% | 1.00 | 0 / 0 / 0 | 4.7 / 15.5 |
+| JevK5 ON | **Python wrap** | 75,997 → **31,817** | **58.13%** | 1.00 | 0 / 0 / 0 | 256.5 / 301.3 |
+| JevK5 ON | Python bare / Rust | unchanged from OFF | 29.39% / 35.19% | 1.00 | 0 / 0 / 0 | 7.4 / 2786; 4.2 / 14.5 |
+
+**JevK5 ON** (`phase8_jevk5_on.json`). Real managed llama-server started by `headroom intelligence setup --no-build --no-download`: 4B v0.3 Q8_0, SHA verified, RTX A4000, conformance passed; activation took 1.6 s. Per-request advisor budget: 10 arbiter advice requests, 10 successes, 0 timeouts or failures. **5 of 10 cleared the 0.60 confidence floor and were blended in, an acceptance rate of 50%.** Advisor call latency: p50 236 ms, p95 263 ms. A repeat run gave identical tokens and the same 5/10. The service was stopped afterwards (`stopped managed llama-server`), and none was left running.
+
+**Is JevK5 ON better?** Tokens: modestly, −1,660 forwarded tokens (+2.18 pp), with recall unchanged at 1.0. The gain is not uniform:
+
+- On `same_output_reread`, the advice picked a smaller safe form: 6,369 → 3,750.
+- On `file_read`, it shifted the blend to the exact original: 2,747 → 3,706, a loss.
+- The other 8 fixtures were byte-identical.
+
+The cost is about +235 ms of local latency per advised unit. A 10-fixture offline eval cannot show a quality or task-success gain from JevK5, so none is claimed.
+
+**Upgraded vs baseline.**
+
+- The wrap path saves 55.95% against 29.39% for the same pipeline without the wrap rollout. That is 20,182 fewer forwarded tokens, at recall 1.0.
+- The Rust live zone falls from 70.68% to 35.19%. This is the enforced irreversible-loss budget, because the binding has no retrieval path: search and log output now cut about 42% instead of 98%, and a context-trimming diff is rejected.
+- Phase 5's arbiter keeps a full traceback (`tool_error` 71% → 0%) because the folded view lost visible facts.
+
+**Workflow turns** (Phase 7 live gate, rerun this phase): one `headroom_workflow` call replaced 3 model tool turns, an estimated 2 turns avoided per run. A stale scope cancelled the run with 0 steps executed.
+
+**Not measured:**
+
+- Provider-billed savings, cache-hit/write costs and task success. The eval is offline and makes no provider calls.
+- Live re-reads and retrievals. The harness records 0 `headroom_retrieve` turns in every configuration.
+- The holdout itself: its fraction defaults to 0, and the revert logic is verified by tests, not by traffic.
+
+## Provider/platform coverage (plan 8)
+
+| Surface | Verified here |
+|---|---|
+| Claude Code `wrap` | Proxy live zone and caching, tool catalog, PreToolUse (scope, contracts, workflow ticket) and PostToolUse (admission) via `--settings`, state and evidence, tests and macros. Live hook-subprocess gates pass. Real 2.1.301 Grep/Glob parity is recorded. |
+| Codex `wrap` | Responses HTTP/streaming/WS contract tests, exact call ids, state and evidence. Pre-tool effects are `observe_only` (no host API). |
+| OpenCode 2.x `wrap` | Current plugin path (`headroom_retrieve`, transport, `shell.env`) and routing tests. Observe-only. |
+| Python proxy | First-party hooks, exact CCR, typed advisor, savings attribution, tool-free requests stay tool-free. |
+| Native Rust proxy | v0.41 `/stats` and dashboard unchanged (proxy lib 340 pass). It shares the SafetyGate and live zone through the core. It does not run Python hooks, and the report does not claim it does. |
+| Windows / Linux | Windows: everything above. Linux: see Platform. No Docker or root required, and no console windows (`CREATE_NO_WINDOW`). |
+
+## Configuration, disable and rollback (documented once, here)
+
+- **Rollout names:** `agent_runtime`, `agent_task_state`, `agent_evidence`, `agent_code_graph`, `agent_tool_admission`, `agent_arbiter`, `agent_tool_catalog`, `agent_complexity_routing`, `agent_feedback`, `agent_speculation`, `agent_change_scope`, `agent_tool_contracts`, `agent_test_impact`, `agent_workflow_macros`. Disable with `HEADROOM_DISABLE_FEATURES=a,b`. `agent_runtime` off removes the hook entirely.
+- **Enforcement policies** are separate from rollout: `HEADROOM_CHANGE_SCOPE_MODE` and `HEADROOM_TOOL_CONTRACTS_MODE`, each `observe|warn|protect`, default `warn`. Blocking happens only at a trusted host pre-tool hook.
+- **JevK5:** `HEADROOM_JEVK5=auto|on|off` is the service policy. `HEADROOM_JEVK5_LLAMA_URL` points at an operator-managed llama-server (`/health`, `/tokenize`, `/completion`). `HEADROOM_JEVK5_SYSTEMONE_URL` points at a `/v1/systemone` service. One API is never inferred from the other. Model override: `HEADROOM_JEVK5_MODEL` plus `HEADROOM_JEVK5_MODEL_SHA256`, or `…_OPERATOR_MANAGED=1`. Limits: `HEADROOM_JEVK5_DECISION_TIMEOUT_MS` (1200), `…_CALLS_PER_REQUEST` (4), `…_MIN_CONFIDENCE` (0.60), `…_WEIGHT` (0.25, cap 0.40). Stop the service with `headroom intelligence stop`.
+- **Holdout:** `HEADROOM_TRANSFORM_HOLDOUT` (0–0.5) for transforms and `HEADROOM_OUTPUT_HOLDOUT` for effort/verbosity.
+- **Offline and stateless:** `HEADROOM_OFFLINE=1` means no Headroom-initiated egress; JevK5 then needs an installed binary and a verified model. `HEADROOM_STATELESS=1` means memory stores only and no new files. Data lives under `HEADROOM_WORKSPACE_DIR` (default `~/.headroom`): `agent/agent_state.db`, `agent/agent_ledger.db`, `intelligence/`.
+- **Retention** (`agent/retention.py`): events 30 days (`HEADROOM_AGENT_EVENT_RETENTION_DAYS`); per-session projections, evidence facts and resource versions 30 days after the session's last update (`…_SESSION_RETENTION_DAYS`); workspace aggregates (verification runs, workflow observations and macros, feedback priors, graph index) 90 days (`…_WORKSPACE_RETENTION_DAYS`). A commit listener starts at most one prune every 6 h on its own daemon thread; it never runs on the runtime worker, `flush` or a request. Stateless memory stores keep only their count bounds. The in-memory learned-recovery table (7-day TTL) is not persisted, so there is nothing to prune there. CCR keeps its own TTL; at most 32 active macros per workspace. `headroom agent purge --workspace <dir>` deletes one workspace's rows from the two agent databases only.
+- **Host hooks:** `wrap claude` passes them through `--settings` and edits no file. `--project-settings` writes them under the lock and they are removed on the last session or by `unwrap`. User `--settings` win.
+- **Restore / rollback:** disable features as above, or check out `backup/main-pre-unified21`. Inspect with `headroom agent status|doctor` and `headroom intelligence status|doctor`.
 
 ## Open issues
 
 ### Intentional design choices
-- Phase 7 never consults JevK5. Test selection, escalation, macro promotion, authorization, scope and macro safety are all deterministic. No measured case exists where an ambiguous but already-safe choice would improve with advice.
-- Coverage uses existing coverage.py data only. Stale or foreign data is reported as unavailable and never used as evidence.
-- Workflow Grep output in content/count mode is sorted by path, because the host leaves that order unspecified.
-- Read/search tools of hosts without a dialect are never generalized into steps.
+- Phase 7 (test selection, macro promotion, authorization) is deterministic and never consults JevK5.
+- Coverage uses existing coverage.py data only; stale or foreign data is reported as unavailable.
+- A reverted family falls back to reversible forms, not to "off". Reverts are process-local, so a restart re-measures.
+- Workflow Grep content/count output is path-ordered, because the host leaves that order unspecified. Read/search tools of hosts without a verified dialect are never generalized.
 
 ### Host capability limitations
-- Codex, OpenCode and the other clients expose no Headroom pre-tool boundary. Workflows, change scope and tool contracts are therefore observe-only for them.
-- Grep/Glob steps are pinned to the verified Claude Code 2.1 series.
-- Claude Code's bundled `rg` may differ from the operator's `rg`. The regex and glob semantics relied on are stable across ripgrep 13–14.
-- Prefix-dependent slash globs and Grep context options are ineligible.
+- Codex, OpenCode, Copilot, Cursor, Aider and Gemini expose no Headroom pre-tool boundary, so scope, contracts and workflows only observe for them. Pre-context admission is Claude-only; the others use the proxy fallback.
+- Grep/Glob workflow steps are pinned to Claude Code 2.1. Prefix-dependent slash globs and context options are ineligible. The bundled `rg` may differ from the operator's.
+- The native Rust proxy has no Python hooks or admission (separate runtime).
 
 ### Verified platform limitations
-- WSL drvfs/9p has no POSIX modes, no AF_UNIX sockets or FIFOs, 100 ns timestamp resolution, and pytest capture fails with `TMPDIR` there. Keep `HEADROOM_WORKSPACE_DIR` on a native filesystem; the default `~/.headroom` is one.
-- JevK5 on CPU only exceeds the 1200 ms limit, and the advisor is correctly disabled.
-- Python 3.10 cannot run 3 upstream tests that import `tomllib`.
+- WSL drvfs/9p: no POSIX modes, no AF_UNIX sockets or FIFOs, 100 ns timestamps. Keep the workspace on a native filesystem.
+- JevK5 on CPU exceeds 1200 ms, so the advisor disables itself. Python 3.10 cannot run 3 upstream `tomllib` tests.
+- 25 targeted Windows tests also fail on clean upstream v0.41.0 in this environment (listed above).
 
 ### Actual unfinished implementation
-- Phase 8 has not started: end-to-end qualification, the benchmark and coverage tables, and the final report.
-- Not covered on Linux: a GPU llama-server, the managed CMake build, the real Claude/Codex/OpenCode binaries, and the JS test runners (WSL has no `node`).
+- **The full test suite has not been run** (user direction); final completion per the plan awaits it (command above).
+- Benchmarks are offline. Provider-billed savings, cache costs, task success and live holdout outcomes still need real traffic.
+- Not covered on Linux: GPU llama-server, managed CMake build, real client binaries, JS runners.
