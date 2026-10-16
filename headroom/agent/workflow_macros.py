@@ -2040,6 +2040,14 @@ class WorkflowMacroRegistry:
                 "fallback": dict(fallback),
             }
         plan = planner.plan(identity) if planner is not None else None
+        if (
+            plan is not None
+            and "tests" not in typed
+            and any(s.kind == "verify" and s.framework == "pytest" for s in macro.steps)
+        ):
+            plan = planner.collect_validate(
+                identity, plan, timeout_s=min(20.0, MAX_MACRO_SECONDS / 4), cancel=cancel
+            )
         try:
             steps = self.compile(identity, macro, typed, plan=plan)
         except WorkflowError as exc:
@@ -2072,8 +2080,11 @@ class WorkflowMacroRegistry:
                 result.update(status="timeout", reason="workflow.deadline")
                 self.counters["timeouts"] += 1
                 break
-            # Fresh revision compare immediately before the step.
-            if self._pins(identity) != baseline:
+            # Fresh revision compare immediately before the step: the user's
+            # task (id + live user atoms) must be exactly what the host approved,
+            # and nothing else may have moved since our previous step settled.
+            pins = self._pins(identity)
+            if (pins[0], pins[3]) != (ticket.pins[0], ticket.pins[3]) or pins != baseline:
                 entry["status"] = "not_run"
                 result.update(status="cancelled", reason="workflow.stale_revision")
                 self.counters["cancelled_stale"] += 1

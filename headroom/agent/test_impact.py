@@ -661,6 +661,9 @@ _VITEST_VERSION = re.compile(r"\bRUN\s+v(\d+\.\d+\.\d+)")
 _JEST_PASSED_FILE = re.compile(r"^PASS\s+(\S+)", re.M)
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
 def _counts(text: str) -> dict[str, int]:
     out: dict[str, int] = {}
     for number, label in re.findall(r"(\d+)\s+(passed|failed|skipped|todo|errors?)", text):
@@ -673,6 +676,7 @@ def parse_output(
     framework: str, text: str, exit_code: int | None, *, targets: Sequence[str] = ()
 ) -> RunOutcome:
     """Parse a runner's output into counts and test identities."""
+    text = _ANSI.sub("", text)
     tail = text[-200_000:]
     passed_ids: tuple[str, ...] = ()
     version = ""
@@ -1956,6 +1960,68 @@ class TestImpactPlanner:
         if "full_suite" in plan.required_checks:
             self.counters["full_suite_required"] += 1
         return plan
+
+    def collect_validate(
+        self,
+        identity: Any,
+        plan: VerificationPlan,
+        *,
+        timeout_s: float = DISCOVERY_TIMEOUT_S,
+        cancel: threading.Event | None = None,
+    ) -> VerificationPlan:
+        """Validate pytest Tier-1 node ids with ``--collect-only`` (authorized runs only).
+
+        Collection imports project code, so it runs only inside a
+        host-authorized verification run, never as casual discovery. Ids the
+        collector does not report are dropped (their file is kept when none
+        of its ids survive); a failed collection leaves the plan unchanged.
+        """
+        from headroom.agent.exec_runner import run_argv
+
+        ids = [t.id for t in plan.tier1 if t.framework == Framework.PYTEST.value]
+        if not ids or "pytest.collected" in plan.reason_codes:
+            return plan
+        ctx = ProjectContext(
+            identity.root, history_commands=self._commands.get(plan.workspace_id, {})
+        )
+        adapter = PytestAdapter()
+        argv = adapter.collect_argv(ctx, ids)
+        if argv is None:
+            return plan
+        run = run_argv(argv, cwd=identity.root, timeout_s=timeout_s, cancel=cancel)
+        if not run.ok:
+            return replace(plan, reason_codes=(*plan.reason_codes, "pytest.collect_failed"))
+        collected = {ln.strip() for ln in run.output.splitlines() if "::" in ln}
+        kept: list[TestTarget] = []
+        for target in plan.tier1:
+            if (
+                target.framework != Framework.PYTEST.value
+                or "::" not in target.id
+                or target.id in collected
+            ):
+                kept.append(target)
+        dropped = [t for t in plan.tier1 if t not in kept]
+        for target in dropped:
+            if target.file and not any(k.file == target.file for k in kept):
+                kept.append(replace(target, id=target.file))
+        kept = sorted(dict.fromkeys(kept), key=TestTarget.sort_key)
+        commands = [
+            c for c in plan.commands if not (c.tier == 1 and c.framework == Framework.PYTEST.value)
+        ]
+        commands[0:0] = adapter.commands(
+            ctx, 1, [t for t in kept if t.framework == Framework.PYTEST.value]
+        )
+        refined = replace(
+            plan,
+            tier1=tuple(kept),
+            commands=tuple(sorted(commands, key=lambda c: (c.tier, c.framework))),
+            reason_codes=(*plan.reason_codes, "pytest.collected"),
+        )
+        with self._lock:
+            key = (identity.workspace_id, identity.session_id)
+            if self._plans.get(key) is plan:
+                self._plans[key] = refined
+        return refined
 
     @staticmethod
     def _final_completion(snap: Any) -> bool:
