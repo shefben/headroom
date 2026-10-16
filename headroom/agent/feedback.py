@@ -22,6 +22,19 @@ Reversible: :meth:`RetentionFeedback.revert` restores earlier priors from a
 bounded history, :meth:`reset` forgets a key (or everything), and disabling
 the ``agent_feedback`` rollout feature makes every prior the neutral 0.5.
 Persistence (optional) goes through the agent ledger on the runtime worker.
+
+Holdout and automatic family revert (Phase 8). ``HEADROOM_TRANSFORM_HOLDOUT``
+(a fraction, default 0, at most .5, read live) holds a scope-stable share of
+sessions out of lossy admission: they get the exact original, and the lossy
+form the arbiter *would* have used registers a ``control`` observation that
+resolves on the same signals. Per tool family, once the treatment arm has
+:data:`REVERT_MIN_OBSERVATIONS` resolved observations and its negative rate
+exceeds the control arm's by :data:`REVERT_MARGIN` (or, without enough control
+observations, reaches :data:`REVERT_ABSOLUTE`), the family is *reverted*: the
+arbiter still evaluates it but admits only reversible forms, so the feature
+stays available and safe. Control observations never move the strategy
+priors. :meth:`RetentionFeedback.reinstate` (or :meth:`reset`) clears a
+revert; reverts are process-local and a restart re-measures.
 """
 
 from __future__ import annotations
@@ -56,6 +69,35 @@ MAX_PENDING = 8192
 OUTCOME_NEGATIVE = 0.0
 OUTCOME_FALSE_CANDIDATE = 0.25
 OUTCOME_POSITIVE = 1.0
+
+ARM_TREATMENT = "treatment"
+ARM_CONTROL = "control"
+HOLDOUT_ENV = "HEADROOM_TRANSFORM_HOLDOUT"
+HOLDOUT_MAX = 0.5
+REVERT_MIN_OBSERVATIONS = 8
+REVERT_MARGIN = 0.25
+REVERT_ABSOLUTE = 0.5
+
+
+def transform_holdout_fraction() -> float:
+    """``HEADROOM_TRANSFORM_HOLDOUT`` clamped to [0, .5]; unset/invalid is 0."""
+    from headroom.proxy import runtime_env
+
+    try:
+        value = float(runtime_env.getenv(HOLDOUT_ENV, "0") or "0")
+    except ValueError:
+        return 0.0
+    if value != value:  # NaN
+        return 0.0
+    return max(0.0, min(HOLDOUT_MAX, value))
+
+
+def transform_arm(scope: str) -> str:
+    """Scope-stable treatment/control assignment for lossy tool admission."""
+    from headroom.proxy.output_savings_policy import assign_arm
+
+    return assign_arm("transform:" + (scope or ""), transform_holdout_fraction())
+
 
 _TABLE = (
     "CREATE TABLE IF NOT EXISTS agent_feedback_priors ("
@@ -135,6 +177,7 @@ class _Pending:
     ccr_hash: str = ""
     resource_id: str = ""
     path: str = ""
+    arm: str = ARM_TREATMENT
 
 
 def _clamp(x: float) -> float:
@@ -167,7 +210,12 @@ class RetentionFeedback:
             "corrections": 0,
             "updates": 0,
             "reverts": 0,
+            "control_registered": 0,
+            "family_reverts": 0,
         }
+        #: (tool family, arm) -> [resolved, negative]
+        self._arms: dict[tuple[str, str], list[int]] = {}
+        self._reverted: dict[str, dict[str, Any]] = {}
 
     # -- persistence ------------------------------------------------------------
 
@@ -259,19 +307,23 @@ class RetentionFeedback:
         ccr_hash: str = "",
         resource_id: str = "",
         path: str = "",
+        arm: str = ARM_TREATMENT,
     ) -> None:
-        """One lossy decision now awaits its outcome."""
+        """One lossy decision (or, for ``arm="control"``, a held-out one) awaits its outcome."""
         if not self.enabled:
             return
+        arm = ARM_CONTROL if arm == ARM_CONTROL else ARM_TREATMENT
         with self._lock:
             seq = self._seq.get(scope, 0)
-            obs_id = f"{scope}|{ccr_hash or resource_id}|{seq}"
+            obs_id = f"{scope}|{arm}|{ccr_hash or resource_id}|{seq}"
             # A newer decision on the same resource supersedes the old pending one.
             if resource_id:
                 old = self._by_resource.get((scope, resource_id))
                 if old is not None:
                     self._drop(old)
-            self._pending[obs_id] = _Pending(key, scope, seq, ccr_hash, resource_id, path)
+            self._pending[obs_id] = _Pending(key, scope, seq, ccr_hash, resource_id, path, arm)
+            if arm == ARM_CONTROL:
+                self.counters["control_registered"] += 1
             if ccr_hash:
                 self._by_hash[ccr_hash] = obs_id
             if resource_id:
@@ -364,10 +416,74 @@ class RetentionFeedback:
             OUTCOME_FALSE_CANDIDATE: "resolved_false_candidate",
         }.get(outcome, "resolved_negative")
         self.counters[name] += 1
-        keys: Iterable[FeedbackKey] = (p.key, p.key.global_key()) if p.key.workspace else (p.key,)
-        for key in keys:
-            self.observe(key, outcome)
+        if p.arm != ARM_CONTROL:
+            # Control observations measure the baseline only; the strategy was not shown.
+            keys: Iterable[FeedbackKey] = (
+                (p.key, p.key.global_key()) if p.key.workspace else (p.key,)
+            )
+            for key in keys:
+                self.observe(key, outcome)
+        self._note_arm(p.key.family, p.arm, outcome < OUTCOME_POSITIVE)
         return True
+
+    # -- holdout comparison and family revert -------------------------------------
+
+    def _note_arm(self, family: str, arm: str, negative: bool) -> None:
+        reverted: dict[str, Any] | None = None
+        with self._lock:
+            stats = self._arms.setdefault((family, arm), [0, 0])
+            stats[0] += 1
+            stats[1] += int(negative)
+            if family in self._reverted:
+                return
+            treat = self._arms.get((family, ARM_TREATMENT))
+            if not treat or treat[0] < REVERT_MIN_OBSERVATIONS:
+                return
+            treat_rate = treat[1] / treat[0]
+            control = self._arms.get((family, ARM_CONTROL))
+            control_rate = (
+                control[1] / control[0]
+                if control and control[0] >= REVERT_MIN_OBSERVATIONS
+                else None
+            )
+            if control_rate is not None:
+                regressing = treat_rate >= control_rate + REVERT_MARGIN
+            else:
+                regressing = treat_rate >= REVERT_ABSOLUTE
+            if not regressing:
+                return
+            reverted = {
+                "treatment_negative_rate": round(treat_rate, 4),
+                "control_negative_rate": None if control_rate is None else round(control_rate, 4),
+                "treatment_resolved": treat[0],
+                "control_resolved": control[0] if control else 0,
+                "at": time.time(),
+            }
+            self._reverted[family] = reverted
+            self.counters["family_reverts"] += 1
+        control_text = reverted["control_negative_rate"]
+        log.info(
+            "tool family %s reverted to reversible-only admission (negative rate %.2f vs %s)",
+            family,
+            reverted["treatment_negative_rate"],
+            "n/a" if control_text is None else control_text,
+        )
+
+    def family_reverted(self, family: str) -> bool:
+        """True when ``family`` regressed: only reversible forms may be admitted."""
+        if not self.enabled or not family:
+            return False
+        with self._lock:
+            return family in self._reverted
+
+    def reinstate(self, family: str | None = None) -> None:
+        """Clear a family revert (or all) and restart its arm comparison."""
+        with self._lock:
+            families = [family] if family is not None else list(self._reverted)
+            for fam in families:
+                self._reverted.pop(fam, None)
+                self._arms.pop((fam, ARM_TREATMENT), None)
+                self._arms.pop((fam, ARM_CONTROL), None)
 
     def observe(self, key: FeedbackKey, outcome: float) -> float:
         """Record one independent observation; returns the (possibly unchanged) prior."""
@@ -418,6 +534,8 @@ class RetentionFeedback:
                     self._drop(oid)
                 self._seq.clear()
                 self._last_user.clear()
+                self._arms.clear()
+                self._reverted.clear()
             else:
                 self._priors.pop(key.ident(), None)
             db, submit = self._db, self._submit
@@ -443,6 +561,12 @@ class RetentionFeedback:
                 "learned_keys": learned,
                 "pending": len(self._pending),
                 "persistent": self._db is not None,
+                "holdout_fraction": transform_holdout_fraction(),
+                "arms": {
+                    f"{fam}:{arm}": {"resolved": s[0], "negative": s[1]}
+                    for (fam, arm), s in sorted(self._arms.items())
+                },
+                "reverted_families": {k: dict(v) for k, v in sorted(self._reverted.items())},
                 "re_retrieval_rate": round(self.counters["retrievals"] / total_resolved, 4)
                 if total_resolved
                 else 0.0,
@@ -481,6 +605,8 @@ def note_ccr_retrieval(ccr_hash: str) -> None:
 
 
 __all__ = [
+    "ARM_CONTROL",
+    "ARM_TREATMENT",
     "FEATURE_FEEDBACK",
     "FeedbackKey",
     "MIN_OBSERVATIONS",
@@ -489,5 +615,7 @@ __all__ = [
     "note_ccr_retrieval",
     "opaque",
     "reset_feedback",
+    "transform_arm",
+    "transform_holdout_fraction",
     "workspace_hash",
 ]

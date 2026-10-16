@@ -363,6 +363,8 @@ class _Telemetry:
         self.insufficient = 0
         self.allocations = 0
         self.last_allocation: dict[str, Any] | None = None
+        self.holdout_units = 0
+        self.holdout_forgone_tokens = 0
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -382,6 +384,10 @@ class _Telemetry:
                     "cost_units_saved": round(self.realized_cost_units, 2),
                 },
                 "estimated": {"avoided_turns": round(self.estimated_avoided_turns, 3)},
+                "holdout": {
+                    "units": self.holdout_units,
+                    "forgone_tokens": self.holdout_forgone_tokens,
+                },
                 "jev": {"calls": self.jev_calls, "applied": self.jev_applied},
                 "pressured_units": self.pressured,
                 "insufficient_budget_units": self.insufficient,
@@ -433,6 +439,11 @@ class TransformArbiter:
                         )
                     )
                 pool = pool[:grant]
+        reverted = bool(
+            ctx.feedback is not None
+            and ctx.feedback_key is not None
+            and ctx.feedback.family_reverted(ctx.feedback_key.family)
+        )
         for cand in pool:
             tokens = _tokens(ctx.tokenizer, cand.text)
             rec = CandidateRecord(
@@ -445,6 +456,12 @@ class TransformArbiter:
                 est_latency_ms=estimated_latency_ms(cand.kind, original),
                 candidate=cand,
             )
+            if reverted and not cand.reversible:
+                # Phase 8: this family regressed against the holdout; only
+                # reversible forms are admitted until it is reinstated.
+                rec.reasons = ("family_reverted",)
+                records.append(rec)
+                continue
             try:
                 decision = SafetyGate.check(
                     original,
@@ -517,7 +534,10 @@ class TransformArbiter:
         pressure: float = 0.0,
         insufficient: bool = False,
         family: str = "",
+        holdout: bool = False,
     ) -> ArbiterDecision:
+        """Pick the winner. ``holdout``: the caller forwards the original instead
+        (control arm), so the winner's savings are counted as forgone, not realized."""
         import time
 
         started = time.perf_counter()
@@ -580,7 +600,9 @@ class TransformArbiter:
             insufficient=insufficient,
             cache_mode=ctx.cache_mode,
         )
-        self._record(decision, family, evaluation, (time.perf_counter() - started) * 1000.0)
+        self._record(
+            decision, family, evaluation, (time.perf_counter() - started) * 1000.0, holdout
+        )
         return decision
 
     def _jev_blend(
@@ -629,7 +651,14 @@ class TransformArbiter:
             self.telemetry.jev_applied += 1
         return w, float(getattr(advice, "confidence", 0.0) or 0.0)
 
-    def _record(self, d: ArbiterDecision, family: str, evaluation: Evaluation, ms: float) -> None:
+    def _record(
+        self,
+        d: ArbiterDecision,
+        family: str,
+        evaluation: Evaluation,
+        ms: float,
+        holdout: bool = False,
+    ) -> None:
         t = self.telemetry
         with t.lock:
             t.decisions[d.winner.kind] += 1
@@ -647,7 +676,11 @@ class TransformArbiter:
             if d.insufficient:
                 t.insufficient += 1
             orig = evaluation.records[0]
-            if d.winner.kind != "original":
+            if holdout:
+                t.holdout_units += 1
+                if d.winner.kind != "original":
+                    t.holdout_forgone_tokens += max(0, orig.tokens - d.winner.tokens)
+            elif d.winner.kind != "original":
                 t.realized_tokens += max(0, orig.tokens - d.winner.tokens)
                 t.realized_cost_units += max(0.0, orig.net_cost - d.winner.net_cost)
 

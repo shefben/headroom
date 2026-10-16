@@ -129,6 +129,10 @@ class AdmissionRequest:
     advisor_budget: Any = None
     cache_mode: str = "none"
     cache_ttl_seconds: int | None = None
+    #: Phase 8 holdout arm (``headroom.agent.feedback.transform_arm``). ``control``
+    #: forwards the original and registers the would-be lossy decision as a
+    #: control observation.
+    arm: str = "treatment"
 
 
 @dataclass
@@ -358,9 +362,11 @@ class ToolAdmissionDispatcher:
             base = None  # the record is this very call
         if base is not None and request.base_visible is not None and not request.base_visible(base):
             base = None
-        if base is not None and not base.presented_exact and request.feedback is not None:
+        if base is not None and request.feedback is not None:
             # Retention feedback (#12): re-reading / re-searching a resource the
-            # model was shown lossy is a negative outcome for that decision.
+            # model was shown lossy is a negative outcome for that decision. A
+            # held-out (control) presentation resolves the same way, giving the
+            # baseline reread rate; exact treatment presentations register none.
             request.feedback.signal_reread(request.scope, str(envelope.resource_id or ""))
 
         # (3) index the exact original, (4) retrieval self-test.
@@ -659,6 +665,9 @@ class ToolAdmissionDispatcher:
             )
 
         assert request.arbiter is not None and prepared.arbiter_ctx is not None
+        from headroom.agent.feedback import ARM_CONTROL
+
+        holdout = request.arm == ARM_CONTROL and request.feedback is not None
         decision = request.arbiter.choose(
             prepared.evaluation,
             prepared.arbiter_ctx,
@@ -666,6 +675,7 @@ class ToolAdmissionDispatcher:
             pressure=pressure,
             insufficient=insufficient,
             family=family.value,
+            holdout=holdout,
         )
         reasons = decision.rejections
         winner = decision.candidate
@@ -679,26 +689,19 @@ class ToolAdmissionDispatcher:
             exact = bool(base is not None and base.presented_exact)
         else:
             exact = winner.reversible
-        self._finish(prepared, exact)
         fkey = prepared.arbiter_ctx.feedback_key
+        if holdout:
+            # Control arm: the model sees the exact original; a would-be lossy
+            # choice is observed against the same signals for the comparison.
+            self._finish(prepared, True)
+            if not exact and fkey is not None:
+                self._register_feedback(prepared, fkey, winner.kind, key, ARM_CONTROL)
+            return out(
+                "holdout_original", reasons=reasons, ccr_hash=key, arbiter=decision.to_dict()
+            )
+        self._finish(prepared, exact)
         if not exact and request.feedback is not None and fkey is not None:
-            from headroom.agent.tool_admission.families import path_of
-
-            args = (
-                request.context.tool_input if isinstance(request.context.tool_input, Mapping) else {}
-            )
-            raw = path_of(args) if family is ToolFamily.READ else None
-            request.feedback.register(
-                request.scope,
-                replace(fkey, strategy=winner.kind),
-                ccr_hash=key or "",
-                resource_id=str(envelope.resource_id or ""),
-                path=(
-                    workspace_relative(raw, root=request.context.root, cwd=request.context.cwd)
-                    if raw
-                    else ""
-                ),
-            )
+            self._register_feedback(prepared, fkey, winner.kind, key, "treatment")
         return out(
             "admitted",
             text=text,
@@ -709,6 +712,28 @@ class ToolAdmissionDispatcher:
             tier=winner.tier,
             delta=used_delta,
             arbiter=decision.to_dict(),
+        )
+
+    @staticmethod
+    def _register_feedback(
+        prepared: PreparedAdmission, fkey: Any, strategy: str, key: str | None, arm: str
+    ) -> None:
+        from headroom.agent.tool_admission.families import path_of
+
+        envelope, family, request = prepared.envelope, prepared.family, prepared.request
+        args = request.context.tool_input if isinstance(request.context.tool_input, Mapping) else {}
+        raw = path_of(args) if family is ToolFamily.READ else None
+        request.feedback.register(
+            request.scope,
+            replace(fkey, strategy=strategy),
+            ccr_hash=key or "",
+            resource_id=str(envelope.resource_id or ""),
+            path=(
+                workspace_relative(raw, root=request.context.root, cwd=request.context.cwd)
+                if raw
+                else ""
+            ),
+            arm=arm,
         )
 
     def _finish(self, prepared: PreparedAdmission, presented_exact: bool) -> None:

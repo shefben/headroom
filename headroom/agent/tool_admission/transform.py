@@ -262,6 +262,7 @@ class ToolAdmissionTransform(Transform):
             advisor_budget=advisor_budget,
             cache_mode=budget_inputs.cache_mode,
             cache_ttl_seconds=budget_inputs.cache_ttl_seconds,
+            arm=_arm(scope) if arbiter is not None and feedback is not None else "treatment",
         )
         applyable = bool(_APPLYABLE.search(query or ""))
         replacements: dict[tuple[int, int | None], tuple[str, str]] = {}
@@ -625,6 +626,12 @@ def _signal_new_result(feedback: Any, unit: _Unit) -> None:
         return
     if family == "test" and (env.is_error or env.exit_code not in (None, 0) or _TEST_FAILED.search(env.content)):
         feedback.signal_test_failure(scope)
+
+
+def _arm(scope: str) -> str:
+    from headroom.agent.feedback import transform_arm
+
+    return transform_arm(scope)
 
 
 def _advisor() -> Any:
