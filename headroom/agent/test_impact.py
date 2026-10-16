@@ -897,6 +897,130 @@ def _history_prefix(
     return None
 
 
+COVERAGE_USED = "coverage.used"
+#: coverage.py schema versions whose ``file``/``context``/``line_bits``/``arc``
+#: layout this reader understands (coverage.py 5.x-7.x).
+_COVERAGE_SCHEMAS = frozenset({7})
+_COVERAGE_MAX_FILES = 20_000
+
+
+@dataclass(frozen=True)
+class CoverageData:
+    """Existing coverage.py data, judged for this workspace and revision.
+
+    ``status`` is :data:`COVERAGE_USED` or ``coverage.unavailable.<reason>``:
+    ``schema`` (not coverage.py data / unknown schema), ``unreadable``,
+    ``no_test_contexts`` (measured without ``--cov-context=test`` /
+    ``dynamic_context = test_function``), ``foreign_workspace`` (no measured
+    file inside this worktree), ``stale_revision`` (HEAD was committed after
+    the data was written), ``stale_sources`` (a measured file outside the
+    current diff changed after the data was written). ``absent`` means there
+    is no data at all.
+    """
+
+    status: str
+    contexts: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    measured_at: float = 0.0
+    detail: str = ""
+
+
+def _coverage_unavailable(reason: str, detail: str = "") -> CoverageData:
+    return CoverageData(f"coverage.unavailable.{reason}", detail=detail)
+
+
+def load_coverage(ctx: ProjectContext, changed: Sequence[str] | None = None) -> CoverageData:
+    """Judge ``<root>/.coverage`` once per planning pass (see :class:`CoverageData`)."""
+    cached = ctx.cache.get("coverage")
+    if isinstance(cached, CoverageData):
+        return cached
+    data = _load_coverage(ctx, set(changed or ctx.cache.get("changed_files") or ()))
+    ctx.cache["coverage"] = data
+    return data
+
+
+def _load_coverage(ctx: ProjectContext, changed: set[str]) -> CoverageData:
+    import sqlite3
+
+    path = os.path.join(ctx.root, ".coverage")
+    if not os.path.isfile(path):
+        return CoverageData("coverage.absent")
+    try:
+        measured_at = os.stat(path).st_mtime
+    except OSError:
+        return _coverage_unavailable("unreadable")
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)
+    except sqlite3.Error:
+        return _coverage_unavailable("unreadable")
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not {"coverage_schema", "file", "context"} <= tables or not (
+            {"line_bits", "arc"} & tables
+        ):
+            return _coverage_unavailable("schema")
+        row = conn.execute("SELECT version FROM coverage_schema").fetchone()
+        if row is None or int(row[0]) not in _COVERAGE_SCHEMAS:
+            return _coverage_unavailable("schema", f"version {row[0] if row else None}")
+        files = conn.execute("SELECT id, path FROM file LIMIT ?", (_COVERAGE_MAX_FILES,)).fetchall()
+        in_tree: dict[int, str] = {}
+        for fid, fpath in files:
+            rel = _workspace_rel(ctx.root, str(fpath))
+            if rel is not None:
+                in_tree[int(fid)] = rel
+        if not in_tree:
+            return _coverage_unavailable("foreign_workspace")
+        head_time = (_git(ctx.root, "log", "-1", "--format=%ct", "HEAD") or "").strip()
+        if head_time.isdigit() and int(head_time) > measured_at:
+            return _coverage_unavailable("stale_revision")
+        changed_lower = {c.lower() for c in changed}
+        for rel in sorted(in_tree.values()):
+            if rel.lower() in changed_lower:
+                continue  # the current diff is what the plan is about
+            try:
+                if os.stat(os.path.join(ctx.root, rel)).st_mtime > measured_at:
+                    return _coverage_unavailable("stale_sources", rel)
+            except OSError:
+                continue  # deleted since: its edges simply do not apply
+        table = "line_bits" if "line_bits" in tables else "arc"
+        rows = conn.execute(
+            f"SELECT DISTINCT t.file_id, c.context FROM {table} t "  # noqa: S608 - fixed name
+            "JOIN context c ON c.id = t.context_id"
+        ).fetchall()
+    except (sqlite3.Error, ValueError, TypeError) as exc:
+        log.debug("coverage read failed: %s", describe_exception(exc))
+        return _coverage_unavailable("unreadable")
+    finally:
+        conn.close()
+    contexts: dict[str, set[str]] = {}
+    for fid, context in rows:
+        rel = in_tree.get(int(fid))
+        node = str(context or "").split("|", 1)[0].strip()
+        if rel is None or "::" not in node:
+            continue
+        contexts.setdefault(rel.lower(), set()).add(node)
+    if not contexts:
+        return _coverage_unavailable("no_test_contexts")
+    return CoverageData(
+        COVERAGE_USED,
+        {k: tuple(sorted(v)) for k, v in contexts.items()},
+        measured_at,
+    )
+
+
+def _workspace_rel(root: str, measured: str) -> str | None:
+    """A measured path as a worktree-relative path, or None when it is elsewhere."""
+    path = measured.replace("\\", "/")
+    if not os.path.isabs(measured) and not re.match(r"^[A-Za-z]:/", path):
+        rel = os.path.normpath(path).replace("\\", "/")
+        return None if rel == ".." or rel.startswith("../") else rel
+    try:
+        rel = os.path.relpath(os.path.realpath(measured), os.path.realpath(root))
+    except ValueError:  # another drive on Windows
+        return None
+    rel = rel.replace("\\", "/")
+    return None if rel == ".." or rel.startswith("../") or os.path.isabs(rel) else rel
+
+
 class PytestAdapter(Adapter):
     framework = Framework.PYTEST
     _FN = re.compile(r"^(?:async\s+)?def\s+(test\w*)\s*\(", re.M)
@@ -951,53 +1075,26 @@ class PytestAdapter(Adapter):
         return [TestTarget(i, self.framework.value, reason, source, rel) for i in ids]
 
     def coverage_targets(self, ctx: ProjectContext, changed: Sequence[str]) -> list[TestTarget]:
-        """Tests whose recorded coverage context touched a changed file (coverage.py)."""
-        path = os.path.join(ctx.root, ".coverage")
-        if not os.path.isfile(path) or not changed:
-            return []
-        import sqlite3
+        """Tests whose recorded coverage context touched a changed file.
 
+        Only existing coverage.py data that :func:`load_coverage` accepts as
+        belonging to this workspace and revision is used; anything else is
+        unavailable (its reason code lands on the plan) and selection falls
+        back to imports, naming, history and the project's test layout.
+        """
+        data = load_coverage(ctx)
+        if data.status != COVERAGE_USED or not changed:
+            return []
         out: list[TestTarget] = []
-        try:
-            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)
-        except sqlite3.Error:
-            return []
-        try:
-            tables = {
-                r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            }
-            if not {"file", "context", "line_bits"} <= tables:
-                return []
-            files = conn.execute("SELECT id, path FROM file").fetchall()
-            wanted = {}
-            for fid, fpath in files:
-                norm = str(fpath).replace("\\", "/")
-                for rel in changed:
-                    if norm.lower().endswith("/" + rel.lower()) or norm.lower() == rel.lower():
-                        wanted[int(fid)] = rel
-            for fid, rel in sorted(wanted.items()):
-                rows = conn.execute(
-                    "SELECT DISTINCT c.context FROM line_bits lb JOIN context c "
-                    "ON c.id = lb.context_id WHERE lb.file_id=?",
-                    (fid,),
-                ).fetchall()
-                for (context,) in rows:
-                    node = str(context or "").split("|", 1)[0].strip()
-                    if "::" in node and self.is_test_file(node.split("::", 1)[0]):
-                        out.append(
-                            TestTarget(
-                                node,
-                                self.framework.value,
-                                Reason.COVERAGE.value,
-                                rel,
-                                node.split("::", 1)[0],
-                            )
+        for rel in changed:
+            for node in data.contexts.get(rel.lower(), ()):
+                test_file = node.split("::", 1)[0]
+                if self.is_test_file(test_file) and ctx.exists(test_file):
+                    out.append(
+                        TestTarget(
+                            node, self.framework.value, Reason.COVERAGE.value, rel, test_file
                         )
-        except sqlite3.Error as exc:
-            log.debug("coverage read failed: %s", describe_exception(exc))
-            return []
-        finally:
-            conn.close()
+                    )
         return out
 
     def prefix(self, ctx: ProjectContext) -> list[str]:
@@ -1823,6 +1920,7 @@ class TestImpactPlanner:
             "full_suite_required": 0,
             "unknown_framework": 0,
             "stale_plan_refused": 0,
+            "coverage_rejected": 0,
         }
 
     # -- identity -----------------------------------------------------------
@@ -2056,6 +2154,7 @@ class TestImpactPlanner:
             if isinstance(adapter, CTestAdapter) and adapter.build_dir(ctx) is None:
                 unknown.append("ctest.no_configured_build_dir")
         changed = [f for f in changeset.files if f not in changeset.deleted]
+        ctx.cache["changed_files"] = tuple(changed)
         tier1: dict[tuple[str, str], TestTarget] = {}
         tier2: dict[tuple[str, str], TestTarget] = {}
 
@@ -2182,6 +2281,13 @@ class TestImpactPlanner:
                 tier3.append(TestTarget(f"{fw}:full", fw, Reason.FULL_SUITE.value, "project"))
         if not t1 and not t2 and changed and not tier3:
             unknown.append("plan.no_runnable_selection")
+        coverage_reason: list[str] = []
+        coverage = ctx.cache.get("coverage")
+        if isinstance(coverage, CoverageData) and coverage.status != "coverage.absent":
+            # Stale/incompatible coverage is never evidence; say why it was not used.
+            coverage_reason = [coverage.status]
+            if coverage.status != COVERAGE_USED:
+                self.counters["coverage_rejected"] += 1
 
         # (4) risk and staged escalation.
         uncertain = bool(
@@ -2215,6 +2321,7 @@ class TestImpactPlanner:
         if not changed and not t1:
             reasons.append("plan.no_changes")
         reasons += unknown
+        reasons += coverage_reason
         total = sum(a.count_tests(ctx) for a in active) if active else 0
         selected = len(t1)
         estimate = {

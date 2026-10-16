@@ -171,17 +171,9 @@ def test_direct_import_coverage_and_failure_regressions_rank_first(pyproj: Path)
         "from src.calc import add\n\n\ndef total(x):\n    return add(x, 2) - 1\n", encoding="utf-8"
     )
     # Existing coverage.py data with per-test contexts (read-only use).
-    cov = sqlite3.connect(pyproj / ".coverage")
-    cov.executescript(
-        "CREATE TABLE file (id INTEGER PRIMARY KEY, path TEXT);"
-        "CREATE TABLE context (id INTEGER PRIMARY KEY, context TEXT);"
-        "CREATE TABLE line_bits (file_id INTEGER, context_id INTEGER, numbits BLOB);"
+    _write_coverage(
+        pyproj, {"tests/test_unrelated.py::test_other|run": [str(pyproj / "src" / "service.py")]}
     )
-    cov.execute("INSERT INTO file VALUES (1, ?)", (str(pyproj / "src" / "service.py"),))
-    cov.execute("INSERT INTO context VALUES (1, 'tests/test_unrelated.py::test_other|run')")
-    cov.execute("INSERT INTO line_bits VALUES (1, 1, x'01')")
-    cov.commit()
-    cov.close()
     planner, identity, _ = _planner(pyproj)
     planner.history.record(
         identity.workspace_id, "pytest", "tests/test_calc.py::test_add", "older", False, 1.0
@@ -192,6 +184,85 @@ def test_direct_import_coverage_and_failure_regressions_rank_first(pyproj: Path)
     assert reasons["tests/test_service.py::test_total"] in ("naming", "direct_import")
     assert reasons["tests/test_unrelated.py::test_other"] == "coverage"
     assert plan.tier1[0].id == "tests/test_calc.py::test_add"  # exact regression first
+
+
+def _write_coverage(root: Path, contexts: dict[str, list[str]]) -> Path:
+    """Real coverage.py data (``coverage.CoverageData``), one context per test."""
+    coverage = pytest.importorskip("coverage")
+    data = coverage.CoverageData(basename=str(root / ".coverage"))
+    for context, files in contexts.items():
+        data.set_context(context)
+        data.add_lines({f: [1, 2] for f in files})
+    data.write()
+    return root / ".coverage"
+
+
+def _coverage_reasons(plan) -> list[str]:
+    return [r for r in plan.reason_codes if r.startswith("coverage.")]
+
+
+def test_coverage_is_used_only_when_it_belongs_to_this_workspace_and_revision(
+    pyproj: Path, tmp_path: Path
+):
+    service = pyproj / "src" / "service.py"
+    calc = pyproj / "src" / "calc.py"
+    edge = {"tests/test_unrelated.py::test_other|run": [str(service), str(calc)]}
+    service.write_text(service.read_text() + "# touched\n", encoding="utf-8")
+
+    def selected(plan) -> dict[str, str]:
+        return {t.id: t.reason for t in plan.tier1}
+
+    # Current data: the coverage edge is evidence.
+    cov = _write_coverage(pyproj, edge)
+    planner, identity, _ = _planner(pyproj)
+    plan = planner.plan(identity)
+    assert selected(plan)["tests/test_unrelated.py::test_other"] == "coverage"
+    assert _coverage_reasons(plan) == ["coverage.used"]
+
+    def replan() -> object:
+        fresh, ident, _ = _planner(pyproj)
+        return fresh.plan(ident), fresh
+
+    # A measured file outside the current diff changed after measurement.
+    old = cov.stat().st_mtime
+    os.utime(calc, (old + 60, old + 60))
+    plan, fresh = replan()
+    assert "tests/test_unrelated.py::test_other" not in selected(plan)
+    assert _coverage_reasons(plan) == ["coverage.unavailable.stale_sources"]
+    assert fresh.counters["coverage_rejected"] == 1
+    # Fallback still selects by naming/imports for the changed file.
+    assert "tests/test_service.py::test_total" in selected(plan)
+    os.utime(calc, (old - 60, old - 60))
+
+    # HEAD was committed after the data was written (another revision).
+    os.utime(cov, (old - 3600, old - 3600))
+    plan, _ = replan()
+    assert _coverage_reasons(plan) == ["coverage.unavailable.stale_revision"]
+    cov.unlink()
+
+    # Data measured in another checkout: no measured file inside this worktree.
+    other = tmp_path / "elsewhere" / "src" / "service.py"
+    _write_coverage(pyproj, {"tests/test_unrelated.py::test_other|run": [str(other)]})
+    plan, _ = replan()
+    assert _coverage_reasons(plan) == ["coverage.unavailable.foreign_workspace"]
+    cov.unlink()
+
+    # Measured without per-test contexts: nothing to map tests from.
+    _write_coverage(pyproj, {"": [str(service)]})
+    plan, _ = replan()
+    assert _coverage_reasons(plan) == ["coverage.unavailable.no_test_contexts"]
+    cov.unlink()
+
+    # Not coverage.py data at all.
+    conn = sqlite3.connect(cov)
+    conn.execute("CREATE TABLE file (id INTEGER PRIMARY KEY, path TEXT)")
+    conn.commit()
+    conn.close()
+    plan, _ = replan()
+    assert _coverage_reasons(plan) == ["coverage.unavailable.schema"]
+    cov.unlink()
+    plan, _ = replan()
+    assert _coverage_reasons(plan) == []  # no data: nothing claimed either way
 
 
 def test_risky_changes_escalate_to_the_full_suite(pyproj: Path):
