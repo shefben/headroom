@@ -11,10 +11,12 @@ the JSON the proxy returns (if any) on stdout.
 
 Fail-open by construction: a missing/unreachable proxy, a non-loopback proxy
 URL, a timeout, malformed input or any error prints nothing and exits 0, so
-Claude Code proceeds exactly as if no hook were installed. It never blocks a
-tool (no exit code 2, no permission decision) and never sends tool output to
-a non-loopback address. Standard library only, so the per-call start-up cost
-stays small.
+Claude Code proceeds exactly as if no hook were installed. The hook itself
+never decides anything (never exit code 2): the only permission field it can
+ever print is the proxy's ``deny`` for an explicitly forbidden or
+hard-protected change in a trusted wrap workspace (unified-21 Phase 6). It
+never sends tool data to a non-loopback address. Standard library only, so
+the per-call start-up cost stays small.
 """
 
 from __future__ import annotations
@@ -35,8 +37,13 @@ MAX_STDIN_BYTES = 64 * 1024 * 1024
 MIN_RESULT_CHARS = 1500
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 _POST_TOOLS = frozenset({"Bash", "PowerShell", "Grep", "Glob"})
-_PRE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
-_URL_ENVS = (PROXY_ENV, "ANTHROPIC_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL", "ANTHROPIC_FOUNDRY_BASE_URL")
+_PRE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "PowerShell"})
+_URL_ENVS = (
+    PROXY_ENV,
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+)
 
 
 def _debug(message: str) -> None:

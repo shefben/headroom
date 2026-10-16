@@ -36,6 +36,8 @@ FEATURE_EVIDENCE = "agent_evidence"
 FEATURE_CODE_GRAPH = "agent_code_graph"
 FEATURE_TOOL_ADMISSION = "agent_tool_admission"
 FEATURE_FEEDBACK = "agent_feedback"
+FEATURE_CHANGE_SCOPE = "agent_change_scope"
+FEATURE_TOOL_CONTRACTS = "agent_tool_contracts"
 
 STAGE_TASK_STATE = "task_state"
 LISTENER_SNAPSHOTS = "task_state_snapshots"
@@ -113,7 +115,17 @@ def install_builtin_components(runtime: Any, config: Any) -> Callable[[], None]:
     graph_on = _enabled(config, FEATURE_CODE_GRAPH)
     admission_on = _enabled(config, FEATURE_TOOL_ADMISSION)
     feedback_on = _enabled(config, FEATURE_FEEDBACK)
-    if not (task_on or evidence_on or graph_on or admission_on or feedback_on):
+    scope_on = _enabled(config, FEATURE_CHANGE_SCOPE)
+    contracts_on = _enabled(config, FEATURE_TOOL_CONTRACTS)
+    if not (
+        task_on
+        or evidence_on
+        or graph_on
+        or admission_on
+        or feedback_on
+        or scope_on
+        or contracts_on
+    ):
         return lambda: None
 
     ledger = open_ledger(runtime.store)
@@ -192,7 +204,13 @@ def install_builtin_components(runtime: Any, config: Any) -> Callable[[], None]:
             log.warning("feedback persistence unavailable: %s", describe_exception(exc))
         runtime.services["feedback"] = feedback
 
+    enforcement_names = _install_enforcement(runtime, scope_on=scope_on, contracts_on=contracts_on)
+
     def teardown() -> None:
+        for name in enforcement_names:
+            registry.unregister(name)
+        for key in ("change_scope", "tool_contracts"):
+            runtime.services.pop(key, None)
         if feedback_on:
             from headroom.agent.feedback import get_feedback
 
@@ -214,3 +232,30 @@ def install_builtin_components(runtime: Any, config: Any) -> Callable[[], None]:
             log.debug("agent ledger close failed: %s", describe_exception(exc))
 
     return teardown
+
+
+def _install_enforcement(runtime: Any, *, scope_on: bool, contracts_on: bool) -> list[str]:
+    """Phase 6: change-scope firewall (#23) first, then tool contracts (#19).
+
+    The firewall owns change contracts and revision-pinned write
+    authorization; executed writes (``FILE_CHANGE``) bump its resource
+    revisions. The observe-only request stage classifies calls the client
+    already executed (every client); enforcement happens only at the host
+    pre-tool hook (:mod:`headroom.agent.enforcement`).
+    """
+    if not (scope_on or contracts_on):
+        return []
+    from headroom.agent.change_scope import ChangeScopeFirewall, EnforcementPolicy
+    from headroom.agent.enforcement import LISTENER_WRITES, STAGE_OBSERVE, observe_stage
+
+    policy = EnforcementPolicy.from_env()
+    names: list[str] = []
+    firewall = None
+    if scope_on:
+        firewall = ChangeScopeFirewall(runtime, policy=policy)
+        runtime.services["change_scope"] = firewall
+        registry.register_commit_listener(LISTENER_WRITES, firewall.on_commit)
+        names.append(LISTENER_WRITES)
+    registry.register_request_stage(STAGE_OBSERVE, observe_stage, order=60)
+    names.append(STAGE_OBSERVE)
+    return names

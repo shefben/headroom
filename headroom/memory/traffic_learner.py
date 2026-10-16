@@ -1684,6 +1684,8 @@ class TrafficLearner:
                     "input": tool_input,
                     "output": output,
                     "is_error": _is_error(output),
+                    # Same stable per-turn identity as the Anthropic extractor.
+                    "call_id": msg.get("tool_call_id", ""),
                 }
             )
 

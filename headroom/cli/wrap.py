@@ -2072,22 +2072,61 @@ _CLAUDE_TOOL_HOOK_MARKER = "headroom.host_hook"
 _CLAUDE_TOOL_HOOK_CLAIM = "hooks:headroom_tool_admission"
 _CLAUDE_TOOL_HOOK_PROXY_ENV = "HEADROOM_HOOK_PROXY_URL"
 _CLAUDE_TOOL_HOOK_EVENTS: dict[str, tuple[str, int]] = {
-    # Observation only (edit targets); never a permission decision.
+    # Edit targets: admission observes them; change scope (Phase 6) decides
+    # them. Only an explicit forbidden write ever gets a permission decision.
     "PreToolUse": ("Edit|Write|MultiEdit|NotebookEdit", 5),
     # Shape-safe result rewrites (Read stays with the proxy fallback).
     "PostToolUse": ("Bash|PowerShell|Grep|Glob|mcp__.*", 30),
 }
+#: Unified-21 Phase 6: extra pre-tool entries for the enforcement features
+#: (shell calls can mutate files too). Kept as separate entries so the
+#: admission entries above stay byte-identical.
+_CLAUDE_ENFORCEMENT_HOOK_EVENTS: dict[str, tuple[str, int]] = {
+    "PreToolUse": ("Bash|PowerShell", 5),
+}
 
 
-def _tool_admission_enabled_for_wrap() -> bool:
-    """Whether the proxy wrap launches would run tool admission (rollout)."""
+def _wrap_rollout_enabled(*names: str) -> bool:
     from headroom.rollout import apply_wrap_feature_defaults, resolve_rollout
 
     try:
         snapshot = resolve_rollout(apply_wrap_feature_defaults(dict(os.environ)))
-        return bool(snapshot.is_enabled("agent_tool_admission"))
+        return any(bool(snapshot.is_enabled(name)) for name in names)
     except Exception:  # pragma: no cover - a bad rollout env never blocks a launch
         return False
+
+
+def _tool_admission_enabled_for_wrap() -> bool:
+    """Whether the proxy wrap launches would run tool admission (rollout)."""
+    return _wrap_rollout_enabled("agent_tool_admission")
+
+
+def _tool_enforcement_enabled_for_wrap() -> bool:
+    """Whether the proxy would run change scope / tool contracts (rollout)."""
+    return _wrap_rollout_enabled("agent_change_scope", "agent_tool_contracts")
+
+
+def _host_hooks_enabled_for_wrap() -> bool:
+    return _tool_admission_enabled_for_wrap() or _tool_enforcement_enabled_for_wrap()
+
+
+def _claude_tool_hook_entries(
+    *, admission: bool | None = None, enforcement: bool | None = None
+) -> list[tuple[str, str, int]]:
+    """``(event, matcher, timeout)`` for every hook entry this launch installs."""
+    admission = _tool_admission_enabled_for_wrap() if admission is None else admission
+    enforcement = _tool_enforcement_enabled_for_wrap() if enforcement is None else enforcement
+    entries: list[tuple[str, str, int]] = []
+    if admission or enforcement:
+        matcher, timeout = _CLAUDE_TOOL_HOOK_EVENTS["PreToolUse"]
+        entries.append(("PreToolUse", matcher, timeout))
+    if admission:
+        matcher, timeout = _CLAUDE_TOOL_HOOK_EVENTS["PostToolUse"]
+        entries.append(("PostToolUse", matcher, timeout))
+    if enforcement:
+        for event, (matcher, timeout) in _CLAUDE_ENFORCEMENT_HOOK_EVENTS.items():
+            entries.append((event, matcher, timeout))
+    return entries
 
 
 def _claude_tool_hook_command(proxy_url: str | None = None) -> str:
@@ -2099,16 +2138,18 @@ def _claude_tool_hook_command(proxy_url: str | None = None) -> str:
     return _command_string(parts)
 
 
-def _claude_tool_hooks_config(command: str) -> dict[str, list[dict[str, Any]]]:
-    return {
-        event: [
+def _claude_tool_hooks_config(
+    command: str, entries: list[tuple[str, str, int]] | None = None
+) -> dict[str, list[dict[str, Any]]]:
+    config: dict[str, list[dict[str, Any]]] = {}
+    for event, matcher, timeout in entries if entries is not None else _claude_tool_hook_entries():
+        config.setdefault(event, []).append(
             {
                 "matcher": matcher,
                 "hooks": [{"type": "command", "command": command, "timeout": timeout}],
             }
-        ]
-        for event, (matcher, timeout) in _CLAUDE_TOOL_HOOK_EVENTS.items()
-    }
+        )
+    return config
 
 
 def _is_claude_tool_hook(item: Any) -> bool:
@@ -2140,26 +2181,32 @@ def _ensure_claude_tool_hooks(settings_path: Path, command: str) -> None:
     with _wrap_settings_lock(settings_path):
         payload = _read_settings_for_write(settings_path)
         hooks = dict(payload.get("hooks") or {}) if isinstance(payload.get("hooks"), dict) else {}
-        for event, (matcher, timeout) in _CLAUDE_TOOL_HOOK_EVENTS.items():
+        wanted: dict[str, list[tuple[str, int]]] = {}
+        for event, matcher, timeout in _claude_tool_hook_entries():
+            wanted.setdefault(event, []).append((matcher, timeout))
+        for event, specs in wanted.items():
             entries = list(hooks.get(event) or []) if isinstance(hooks.get(event), list) else []
-            marked = [
-                item
-                for entry in entries
-                if isinstance(entry, dict) and isinstance(entry.get("hooks"), list)
-                for item in entry["hooks"]
-                if _is_claude_tool_hook(item)
-            ]
-            if marked:
-                for item in marked:
-                    item["command"] = command
-                    item["timeout"] = timeout
-            else:
-                entries.append(
-                    {
-                        "matcher": matcher,
-                        "hooks": [{"type": "command", "command": command, "timeout": timeout}],
-                    }
-                )
+            for matcher, timeout in specs:
+                marked = [
+                    item
+                    for entry in entries
+                    if isinstance(entry, dict)
+                    and isinstance(entry.get("hooks"), list)
+                    and (entry.get("matcher") == matcher or len(specs) == 1)
+                    for item in entry["hooks"]
+                    if _is_claude_tool_hook(item)
+                ]
+                if marked:
+                    for item in marked:
+                        item["command"] = command
+                        item["timeout"] = timeout
+                else:
+                    entries.append(
+                        {
+                            "matcher": matcher,
+                            "hooks": [{"type": "command", "command": command, "timeout": timeout}],
+                        }
+                    )
             hooks[event] = entries
         payload["hooks"] = hooks
         _claim_wrap_key(settings_path, _CLAUDE_TOOL_HOOK_CLAIM, None)
@@ -2228,6 +2275,26 @@ def _report_tool_admission(client: str, *, hook_installed: bool, reason: str = "
         click.echo(
             f"  Tool admission: {capability} (tool results are compressed only in the "
             f"proxy live zone; they still enter the client's own history{detail})"
+        )
+
+
+def _report_tool_enforcement(client: str, *, hook_installed: bool, reason: str = "") -> None:
+    """One honest line: whether change scope / tool contracts can enforce here."""
+    from headroom.agent.change_scope import EnforcementPolicy
+    from headroom.agent.enforcement import HOST_PRETOOL, enforcement_capability
+
+    policy = EnforcementPolicy.from_env()
+    if enforcement_capability(client, hook_installed=hook_installed) == HOST_PRETOOL:
+        click.echo(
+            "  Change scope / tool checks: host pre-tool hook "
+            f"(scope={policy.change_scope.value}; only explicit forbidden or hard-protected "
+            "writes are denied, everything else is advice)"
+        )
+    else:
+        detail = f"; {reason}" if reason else ""
+        click.echo(
+            "  Change scope / tool checks: observe-only (the proxy sees tool calls after "
+            f"the client ran them, so nothing is blocked{detail})"
         )
 
 
@@ -5859,6 +5926,8 @@ def _launch_tool(
             click.echo(f"  Extra args: {' '.join(args)}")
         if _tool_admission_enabled_for_wrap():
             _report_tool_admission(agent_type, hook_installed=False)
+        if _tool_enforcement_enabled_for_wrap():
+            _report_tool_enforcement(agent_type, hook_installed=False)
         _print_telemetry_notice()
         click.echo()
 
@@ -6601,7 +6670,7 @@ def claude(
         # mode writes them (locked, marker-tagged, removed by the last
         # session / unwrap) so daemon-spawned workers get them too; otherwise
         # they ride on this launch's --settings flag and no file is touched.
-        if _tool_admission_enabled_for_wrap():
+        if _host_hooks_enabled_for_wrap():
             env[_CLAUDE_TOOL_HOOK_PROXY_ENV] = proxy_url
             _tool_hooks_reason = ""
             if _wrote_project_settings[0]:
@@ -6614,9 +6683,14 @@ def claude(
                 )
                 if not _tool_hooks_installed:
                     _tool_hooks_reason = "your own --settings flag is kept, so no hook is added"
-            _report_tool_admission(
-                "claude", hook_installed=_tool_hooks_installed, reason=_tool_hooks_reason
-            )
+            if _tool_admission_enabled_for_wrap():
+                _report_tool_admission(
+                    "claude", hook_installed=_tool_hooks_installed, reason=_tool_hooks_reason
+                )
+            if _tool_enforcement_enabled_for_wrap():
+                _report_tool_enforcement(
+                    "claude", hook_installed=_tool_hooks_installed, reason=_tool_hooks_reason
+                )
 
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.

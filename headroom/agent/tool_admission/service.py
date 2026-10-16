@@ -44,7 +44,11 @@ def handle_host_hook_request(data: dict[str, Any], config: Any) -> dict[str, Any
     """
     client = str(data.get("client") or "claude").lower()
     capability = host_adapter.host_capability(client)
-    if not feature_enabled(config):
+    admission_on = feature_enabled(config)
+    enforcement_on = feature_enabled(config, "agent_change_scope") or feature_enabled(
+        config, "agent_tool_contracts"
+    )
+    if not (admission_on or enforcement_on):
         return {"output": None, "stage": "feature_disabled", "capability": capability}
     if capability != host_adapter.HOST_PRE_CONTEXT:
         return {"output": None, "stage": "unsupported_client", "capability": capability}
@@ -65,6 +69,16 @@ def handle_host_hook_request(data: dict[str, Any], config: Any) -> dict[str, Any
             registered_cwd=get_registered_cwd(),
             attribution=get_current_project(),
         )
+        if payload.get("hook_event_name") == "PreToolUse" and enforcement_on:
+            # Unified-21 Phase 6: the trusted pre-tool boundary. Admission's
+            # edit-target observation still runs (it never prints anything).
+            from headroom.agent.enforcement import host_pretool
+
+            if admission_on:
+                host_adapter.handle_hook(payload, identity=identity)
+            return host_pretool(payload, identity=identity, client=client)
+        if not admission_on:
+            return {"output": None, "stage": "admission_disabled", "capability": capability}
         relevance = latest_session_query(identity.session_id)
         query = relevance.text if relevance is not None else ""
         return host_adapter.handle_hook(

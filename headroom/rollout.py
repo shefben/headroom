@@ -222,6 +222,18 @@ FEATURES: dict[str, FeatureSpec] = {
             "indexes (one worker per request, discarded when late)."
         ),
     ),
+    # Phase-6 change scope. Default-on for `wrap`: unexplained paths only warn;
+    # explicit forbidden/hard-protected writes are denied solely at a trusted
+    # host pre-tool hook (HEADROOM_CHANGE_SCOPE_MODE=observe|warn|protect).
+    "agent_change_scope": FeatureSpec(
+        name="agent_change_scope",
+        available_in=RolloutChannel.STABLE,
+        description=(
+            "Change-Scope / Drift Firewall: task-derived change contracts, "
+            "revision-pinned write authorization at the host pre-tool hook "
+            "(needs agent_runtime)."
+        ),
+    ),
 }
 
 #: Safe, non-destructive features `headroom wrap` turns on for the proxy it
@@ -237,6 +249,7 @@ WRAP_DEFAULT_FEATURES: tuple[str, ...] = (
     "agent_complexity_routing",
     "agent_feedback",
     "agent_speculation",
+    "agent_change_scope",
 )
 
 

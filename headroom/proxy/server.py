@@ -3875,6 +3875,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             from headroom.agent.tool_admission.service import tool_admission_health
 
             payload["tool_admission"] = tool_admission_health(proxy.config)
+            from headroom.agent.enforcement import enforcement_health
+
+            # Unified-21 Phase 6: host pre-tool enforcement vs observe-only paths.
+            payload["agent_enforcement"] = enforcement_health(proxy.config)
         return payload
 
     # ---------------------------------------------------------------------------
