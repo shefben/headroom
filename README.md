@@ -17,6 +17,7 @@
 <p>
   <b><a href="https://docs.headroomlabs.ai/docs/quickstart">Quickstart</a></b> ·
   <b><a href="#headroom-for-teams">Headroom for Teams</a></b> ·
+  <a href="#whats-different-in-this-fork">Fork changes</a> ·
   <a href="#get-started-60-seconds">Install</a> ·
   <a href="#proof">Proof</a> ·
   <a href="#agent-compatibility">Agents</a> ·
@@ -46,6 +47,71 @@ file content is sent anywhere to be compressed.
   <img src="HeadroomDemo-Fast.gif" alt="Headroom compressing a 10,144 token log dump to 1,260 tokens while preserving the FATAL line" width="820">
   <br><sub>10,144 → 1,260 tokens. The same <code>FATAL</code> found.</sub>
 </div>
+
+## What's different in this fork
+
+This tree is a fork of upstream [`headroomlabs-ai/headroom`](https://github.com/headroomlabs-ai/headroom)
+**v0.41.0** (`76133cff`). On top of that base it carries the **unified-21** agent
+intelligence + token-efficiency stack: 52 commits, 179 files, **+60,786 / −335** lines.
+Everything upstream does still works the same way; the fork adds subsystems and
+tightens the compression safety contract. Full engineering detail, per-phase
+history, benchmarks and open issues: [`IMPLEMENTATION_REPORT.md`](IMPLEMENTATION_REPORT.md).
+
+**Added** — new subsystems that do not exist upstream:
+
+| Area | What it adds |
+|---|---|
+| `headroom/agent/` | Shared agent runtime: digest-only event log, WAL-SQLite (or stateless in-memory) store, one stream-safe TurnHook. On top of it: task-state compiler, evidence ledger, code/symbol graph, pre-context tool-result admission with per-family interceptors (Read/Grep/Glob/Bash/test/diff/JSON), cross-turn structural deltas, multi-candidate transform arbiter, global token allocator, progressive tool catalog, complexity-aware effort/verbosity routing, retrieval-feedback retention, bounded speculation, change-scope firewall, tool-contract validator, test-impact/verification planner, workflow-macro compiler, bounded retention + `headroom agent purge`. |
+| `headroom/intelligence/` | **JevK5** — an optional *local* advisory classifier (llama.cpp). Typed settings, GGUF + SHA-256 verification, llama-server discovery or a managed CMake build, a 127.0.0.1 service that never kills foreign processes, shared deadline, circuit breaker, confidence floor. It advises the arbiter/catalog/router; it can never establish facts, run commands or overrule an invariant check. |
+| `headroom/ccr/indexed.py` | Indexed/selective CCR retrieval with HMAC cursors — exact full retrieval is still available unchanged. |
+| Rust core | `safety_gate.rs` (semantic invariants + automatic backoff ladder), `relevance/semantic.rs` (hybrid BM25 + semantic scorer, cache-only model, BM25 fallback), query-conditioned live zone, `DecisionHints` across the FFI boundary. |
+| CLI | `headroom agent status|doctor|purge`, `headroom intelligence setup|status|doctor|stop`. |
+| Benchmarks | `benchmarks/unified21_eval.py` — 18 offline fixtures running the real Python pipeline and the real Rust live zone, plus recorded baselines. |
+
+**Changed** — upstream behaviour that now differs:
+
+- **A SafetyGate sits on every compression path.** Irreversible-loss budget is
+  enforced separately from the wire drop, and each candidate transform must clear
+  semantic invariants or back off. Must-keep recall is 1.00 in the eval.
+- **`headroom wrap` enables the 14 agent features by default**; a bare
+  `headroom proxy` keeps them opt-in. Any of them can be turned off individually
+  with `HEADROOM_DISABLE_FEATURES`, and `agent_runtime=off` removes the hook entirely.
+- **Claude Code gets real pre-tool enforcement** (scope firewall, tool contracts,
+  workflow tickets via PreToolUse; admission via PostToolUse, passed through
+  `--settings` — no file is edited unless you ask for `--project-settings`).
+- **Measured effect** (same offline harness, 18 fixtures, recall 1.00 everywhere):
+
+  | Path | Upstream v0.41.0 | This fork |
+  |---|---|---|
+  | Python wrap path | n/a (no wrap rollout) | **55.95%** reduction (58.13% with JevK5 on) |
+  | Python bare | 29.39% | 29.39% (unchanged) |
+  | Rust live zone | 70.68% | **35.19%** — deliberately lower |
+
+  The Rust live-zone drop is the point, not a regression: that binding has no
+  retrieval path, so the enforced irreversible-loss budget now refuses to shred
+  search/log output 98% and reject-trims diffs. Full tracebacks survive
+  (`tool_error` 71% → 0% loss).
+- **Linux-specific fixes** carried here: path case folding is decided per
+  workspace filesystem instead of per OS, and a stopped-but-unreaped child is no
+  longer counted as a running service on POSIX.
+
+**Removed / not included:**
+
+- No upstream feature was removed. The −335 lines are interface alignment: four
+  upstream tests updated for the SafetyGate and workspace-scoped CCR signatures,
+  plus replaced call sites. No assertion was deleted.
+- `HEADROOM_LICENSE` / usage reporting stays opt-in, as upstream v0.41.0 left it.
+
+**Known limits** (deliberate, documented):
+
+- Pre-tool *enforcement* exists only where the host exposes a boundary — Claude
+  Code. Codex, OpenCode, Copilot, Cursor, Aider and Gemini are **observe-only**;
+  they still get the proxy-side admission fallback.
+- The native Rust proxy shares the SafetyGate and live zone but runs no Python
+  hooks, so agent admission does not apply there.
+- JevK5 on CPU exceeds its 1200 ms budget and correctly disables itself; it wants a GPU.
+- The eval is offline: provider-billed savings, cache costs and task success are
+  not measured, and no quality gain is claimed for JevK5.
 
 ## What it does
 
