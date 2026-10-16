@@ -148,6 +148,60 @@ def platform_case_insensitive() -> bool:
     return sys.platform in ("win32", "cygwin", "darwin")
 
 
+_FOLD_CACHE: dict[str, bool] = {}
+_FOLD_CACHE_LIMIT = 512
+
+
+def _swapped_exists(directory: str, name: str) -> bool | None:
+    """Whether ``directory`` resolves ``name`` with its case swapped (None: no letters)."""
+    swapped = name.swapcase()
+    if swapped == name:
+        return None
+    original = os.path.join(directory, name)
+    candidate = os.path.join(directory, swapped)
+    try:
+        return os.path.exists(candidate) and os.path.samefile(original, candidate)
+    except OSError:
+        return False
+
+
+def case_insensitive_at(root: str | None) -> bool:
+    """Whether the filesystem holding ``root`` matches names case-insensitively.
+
+    A property of the filesystem, not of the OS: a Linux worktree on a Windows
+    drive (WSL ``/mnt/c``, drvfs/9p), an SMB share or a case-insensitive macOS
+    volume folds case; a case-sensitive APFS volume does not. Probed once per
+    root (an entry inside it, else the root's own name) and cached; falls back
+    to the platform default when nothing can be probed.
+    """
+    if sys.platform in ("win32", "cygwin") or not root:
+        return platform_case_insensitive()
+    try:
+        real = os.path.realpath(root)
+    except (OSError, ValueError):
+        return platform_case_insensitive()
+    cached = _FOLD_CACHE.get(real)
+    if cached is not None:
+        return cached
+    verdict: bool | None = None
+    try:
+        with os.scandir(real) as entries:
+            for entry in entries:
+                verdict = _swapped_exists(real, entry.name)
+                if verdict is not None:
+                    break
+    except OSError:
+        verdict = None
+    if verdict is None:
+        parent, name = os.path.split(real.rstrip("/"))
+        verdict = _swapped_exists(parent, name) if parent and name else None
+    result = platform_case_insensitive() if verdict is None else verdict
+    if len(_FOLD_CACHE) >= _FOLD_CACHE_LIMIT:
+        _FOLD_CACHE.clear()
+    _FOLD_CACHE[real] = result
+    return result
+
+
 _MSYS_DRIVE = re.compile(r"^/(?:cygdrive/)?([A-Za-z])(?:/(.*))?$")
 
 
@@ -199,7 +253,7 @@ def canonicalize(
     case_insensitive: bool | None = None,
 ) -> CanonicalPath:
     """Canonical form of a model-supplied path (see module docstring)."""
-    fold = platform_case_insensitive() if case_insensitive is None else case_insensitive
+    fold = case_insensitive_at(root) if case_insensitive is None else case_insensitive
     text = _unwrap(raw)
     base = cwd or root or os.getcwd()
     if root and cwd:
@@ -913,7 +967,9 @@ class ChangeScopeFirewall:
         self.runtime = runtime
         self.policy = policy or EnforcementPolicy.from_env()
         self._clock = clock
-        self.fold = platform_case_insensitive() if case_insensitive is None else case_insensitive
+        #: Explicit case folding (tests / callers); None probes each workspace's filesystem.
+        self._fold_override = case_insensitive
+        self._workspace_fold: OrderedDict[str, bool] = OrderedDict()
         self._lock = threading.RLock()
         self._contracts: OrderedDict[tuple[str, str], ChangeContract] = OrderedDict()
         self._dependencies: OrderedDict[tuple[str, str, str], dict[str, str]] = OrderedDict()
@@ -936,6 +992,21 @@ class ChangeScopeFirewall:
         }
 
     # -- inputs --------------------------------------------------------------
+
+    def _fold_root(self, root: str | None) -> bool:
+        if self._fold_override is not None:
+            return self._fold_override
+        return case_insensitive_at(root)
+
+    def _fold(self, identity: WorkspaceIdentity) -> bool:
+        """Case folding for paths in this identity's worktree (filesystem-specific)."""
+        fold = self._fold_root(identity.root)
+        with self._lock:
+            self._workspace_fold[identity.workspace_id] = fold
+            self._workspace_fold.move_to_end(identity.workspace_id)
+            while len(self._workspace_fold) > _CONTRACTS_LIMIT:
+                self._workspace_fold.popitem(last=False)
+        return fold
 
     def _snapshot(self, identity: WorkspaceIdentity) -> TaskSnapshot | None:
         runtime = self.runtime
@@ -984,7 +1055,7 @@ class ChangeScopeFirewall:
             rel = self._mention_rel(mention.path, identity)
             if rel is None:
                 continue
-            latest[path_key(rel, self.fold)] = Mention(
+            latest[path_key(rel, self._fold(identity))] = Mention(
                 rel, mention.kind, mention.ts, mention.atom_id
             )
         expected = tuple(sorted({m.path for m in latest.values() if m.kind == "expect"}))
@@ -1042,7 +1113,9 @@ class ChangeScopeFirewall:
                 forbidden_effects=tuple(sorted(forbidden_effects)),
                 mode=mode,
                 created_at=current.created_at if same_task and current is not None else now,
-                approved_protected=tuple(p for p in expected if hard_protection(p, fold=self.fold)),
+                approved_protected=tuple(
+                    p for p in expected if hard_protection(p, fold=self._fold(identity))
+                ),
                 recent_writes=writes,
                 dependency_reasons=deps,
                 fingerprint=fingerprint,
@@ -1062,7 +1135,7 @@ class ChangeScopeFirewall:
         root = identity.root
         if root is None:
             return None
-        canon = canonicalize(raw, root=root, cwd=root, case_insensitive=self.fold)
+        canon = canonicalize(raw, root=root, cwd=root, case_insensitive=self._fold(identity))
         relative = not (os.path.isabs(_unwrap(raw)) or raw.startswith(("\\\\", "//")))
         parent_exists = os.path.isdir(os.path.dirname(canon.resolved.rstrip("/")))
         if canon.rel is not None and (canon.exists or parent_exists or not relative):
@@ -1085,7 +1158,7 @@ class ChangeScopeFirewall:
                 if not rel:
                     continue
                 cls = self._classified.get(
-                    (identity.workspace_id, task_id, path_key(rel, self.fold))
+                    (identity.workspace_id, task_id, path_key(rel, self._fold(identity)))
                 )
                 if cls in (ScopeClass.UNRELATED, ScopeClass.FORBIDDEN):
                     continue  # a drifted write never legitimizes itself
@@ -1110,7 +1183,9 @@ class ChangeScopeFirewall:
                 if ":" in rel[2 if drive else 0 :]:
                     rel = rel[: rel.index(":", 2 if drive else 0)]
                 if root is not None and (drive or rel.startswith("/")):
-                    inside = _relative(os.path.realpath(rel), os.path.realpath(root), self.fold)
+                    inside = _relative(
+                        os.path.realpath(rel), os.path.realpath(root), self._fold_root(root)
+                    )
                     if inside is None:
                         continue
                     rel = inside
@@ -1143,12 +1218,14 @@ class ChangeScopeFirewall:
     ) -> ScopeVerdict:
         """Scope class of a write to ``raw_path`` (no side effects except expansions)."""
         root = identity.root if identity.can_authorize_paths() else None
-        canon = canonicalize(raw_path, root=root, cwd=cwd or root, case_insensitive=self.fold)
+        canon = canonicalize(
+            raw_path, root=root, cwd=cwd or root, case_insensitive=self._fold(identity)
+        )
         target_for_protection = canon.rel if canon.rel is not None else canon.resolved
         lexical_target = canon.lexical_rel or raw_path
-        protection = hard_protection(target_for_protection, fold=self.fold) or hard_protection(
-            lexical_target, fold=self.fold
-        )
+        protection = hard_protection(
+            target_for_protection, fold=self._fold(identity)
+        ) or hard_protection(lexical_target, fold=self._fold(identity))
         if root is None:
             return ScopeVerdict(
                 ScopeClass.UNRELATED, "scope.untrusted_workspace", canon.rel, protection=protection
@@ -1159,7 +1236,7 @@ class ChangeScopeFirewall:
             approved = (
                 protection != "git_internal"
                 and rel is not None
-                and matches_any(current.approved_protected, rel, self.fold) is not None
+                and matches_any(current.approved_protected, rel, self._fold(identity)) is not None
             )
             if not approved:
                 return ScopeVerdict(
@@ -1170,7 +1247,7 @@ class ChangeScopeFirewall:
                     protection=protection,
                 )
         if rel is not None:
-            hit = matches_any(current.forbidden_paths, rel, self.fold)
+            hit = matches_any(current.forbidden_paths, rel, self._fold(identity))
             if hit is not None:
                 return ScopeVerdict(ScopeClass.FORBIDDEN, "scope.user_forbidden", rel, trace=hit)
         if effect in current.forbidden_effects:
@@ -1179,22 +1256,25 @@ class ChangeScopeFirewall:
             )
         if rel is None:
             named = canon.resolved
-            if any(_cmp(named, self.fold) == _cmp(p, self.fold) for p in current.expected_paths):
+            if any(
+                _cmp(named, self._fold(identity)) == _cmp(p, self._fold(identity))
+                for p in current.expected_paths
+            ):
                 return ScopeVerdict(
                     ScopeClass.IN_SCOPE, "scope.outside_worktree.user_named", None, trace=named
                 )
             code = "scope.symlink_escape" if canon.symlink_escape else "scope.outside_worktree"
             return ScopeVerdict(ScopeClass.UNRELATED, code, None, trace="unc" if canon.unc else "")
-        hit = matches_any(current.expected_paths, rel, self.fold)
+        hit = matches_any(current.expected_paths, rel, self._fold(identity))
         if hit is not None:
             return ScopeVerdict(ScopeClass.IN_SCOPE, "scope.expected", rel, trace=hit)
-        hit = matches_any(current.recent_writes, rel, self.fold)
+        hit = matches_any(current.recent_writes, rel, self._fold(identity))
         if hit is not None:
             return ScopeVerdict(ScopeClass.IN_SCOPE, "scope.recent_write", rel, trace=hit)
-        hit = matches_any(current.generated_paths, rel, self.fold)
+        hit = matches_any(current.generated_paths, rel, self._fold(identity))
         if hit is not None:
             return ScopeVerdict(ScopeClass.GENERATED_EFFECT, "scope.generated", rel, trace=hit)
-        hit = matches_any(current.dependency_paths, rel, self.fold)
+        hit = matches_any(current.dependency_paths, rel, self._fold(identity))
         if hit is not None:
             reason = current.dependency_reasons.get(hit, "scope.dependency")
             code, _, trace = reason.partition(":")
@@ -1233,7 +1313,7 @@ class ChangeScopeFirewall:
         """A traceable reason ``rel`` belongs to the change, or None."""
         if not anchors:
             return None
-        fold = self.fold
+        fold = self._fold(identity)
         target_key = path_key(rel, fold)
         anchor_keys = {path_key(a, fold): a for a in anchors}
         name = target_key.rsplit("/", 1)[-1]
@@ -1367,7 +1447,7 @@ class ChangeScopeFirewall:
         """Per-resource revision: bumped on recorded writes and observed fs changes."""
         if rel is None:
             return 0
-        key = (identity.workspace_id, path_key(rel, self.fold))
+        key = (identity.workspace_id, path_key(rel, self._fold(identity)))
         stat = self._stat(identity, rel)
         with self._lock:
             revision, last = self._resources.get(key, (0, stat))
@@ -1386,7 +1466,10 @@ class ChangeScopeFirewall:
     def record_write(self, workspace_id: str, session_id: str, rel: str) -> None:
         """An executed write (FILE_CHANGE): bumps the resource revision."""
         clean = rel[5:] if rel.startswith("path:") else rel
-        key = (workspace_id, path_key(clean, self.fold))
+        key = (
+            workspace_id,
+            path_key(clean, self._workspace_fold.get(workspace_id, self._fold_root(None))),
+        )
         with self._lock:
             revision, stat = self._resources.get(key, (0, ()))
             self._resources[key] = (revision + 1, ("written", time.monotonic_ns()))
@@ -1405,7 +1488,7 @@ class ChangeScopeFirewall:
     ) -> None:
         if rel is None:
             return
-        key = (identity.workspace_id, task_id or "", path_key(rel, self.fold))
+        key = (identity.workspace_id, task_id or "", path_key(rel, self._fold(identity)))
         with self._lock:
             previous = self._classified.get(key)
             if (
@@ -1667,7 +1750,10 @@ class ChangeScopeFirewall:
             return {
                 "policy": self.policy.to_dict(),
                 "contracts": len(self._contracts),
-                "case_insensitive": self.fold,
+                "case_insensitive": (
+                    self._fold_override if self._fold_override is not None else "per_filesystem"
+                ),
+                "workspaces_case_insensitive": sum(self._workspace_fold.values()),
                 "counters": dict(self.counters),
             }
 

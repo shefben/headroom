@@ -2317,7 +2317,11 @@ _TEST_ID = re.compile(r"^[\w./:\[\]\-+=,@ ]+$")
 
 
 def _check_value(kind: str, raw: Any, root: str) -> Any:
-    from headroom.agent.change_scope import canonicalize, hard_protection
+    from headroom.agent.change_scope import (
+        canonicalize,
+        case_insensitive_at,
+        hard_protection,
+    )
 
     def path(value: Any) -> str:
         if not isinstance(value, str) or not value or len(value) > 512 or value.startswith("-"):
@@ -2329,7 +2333,7 @@ def _check_value(kind: str, raw: Any, root: str) -> Any:
             raise WorkflowError(
                 "workflow.input_outside_workspace", f"{value} is outside the workspace"
             )
-        if hard_protection(canon.rel):
+        if hard_protection(canon.rel, fold=case_insensitive_at(root)):
             raise WorkflowError("workflow.input_protected", f"{canon.rel} is a protected path")
         if not canon.exists:
             raise WorkflowError("workflow.input_missing", f"{canon.rel} does not exist")

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -759,3 +760,34 @@ def test_relative_mentions_from_a_subdirectory_anchor_on_components(project: Pat
     assert matches_any(("**/src/app.py",), "proj/src/app.py") is not None
     assert matches_any(("**/src/app.py",), "proj/xsrc/app.py") is None
     e.runtime.stop(timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Case folding is a property of the workspace filesystem, not of the OS
+# ---------------------------------------------------------------------------
+
+
+def test_case_folding_follows_the_workspace_filesystem(env: _Env, monkeypatch):
+    from headroom.agent import change_scope as cs
+
+    root = str(env.root)
+    probed = cs.case_insensitive_at(root)
+    # The probe agrees with the filesystem itself.
+    upper = env.root / "SRC"
+    assert probed == (upper.exists() and os.path.samefile(upper, env.root / "src"))
+    # A worktree on a case-insensitive filesystem (e.g. a Windows drive under
+    # WSL, drvfs) must fold: "CONFIG/Secrets.yaml" is the forbidden file there.
+    monkeypatch.setitem(cs._FOLD_CACHE, os.path.realpath(root), True)
+    env.instruct("Fix src/app.py but do not touch config/secrets.yaml")
+    blocked = env.authorize("CONFIG/Secrets.yaml")
+    assert blocked.scope is ScopeClass.FORBIDDEN and blocked.verdict is Verdict.BLOCK
+    assert cs.hard_protection(".GIT/config", fold=cs.case_insensitive_at(root)) == "git_internal"
+    if sys.platform in ("win32", "cygwin"):
+        return  # Windows filesystems always fold (and the probe is not consulted)
+    # On a case-sensitive filesystem the differently-cased name is another file.
+    monkeypatch.setitem(cs._FOLD_CACHE, os.path.realpath(root), False)
+    fresh = ChangeScopeFirewall(env.runtime, policy=EnforcementPolicy())
+    other = fresh.authorize(
+        env.identity, PlannedChange("edit", "CONFIG/Secrets.yaml"), cwd=root, enforceable=True
+    )
+    assert other.scope is not ScopeClass.FORBIDDEN
