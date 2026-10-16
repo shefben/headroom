@@ -256,6 +256,12 @@ def _install_enforcement(runtime: Any, *, scope_on: bool, contracts_on: bool) ->
         runtime.services["change_scope"] = firewall
         registry.register_commit_listener(LISTENER_WRITES, firewall.on_commit)
         names.append(LISTENER_WRITES)
+    if contracts_on:
+        from headroom.agent.tool_contracts import ToolContractValidator
+
+        runtime.services["tool_contracts"] = ToolContractValidator(
+            runtime, firewall=firewall, policy=policy
+        )
     registry.register_request_stage(STAGE_OBSERVE, observe_stage, order=60)
     names.append(STAGE_OBSERVE)
     return names

@@ -234,6 +234,15 @@ FEATURES: dict[str, FeatureSpec] = {
             "(needs agent_runtime)."
         ),
     ),
+    "agent_tool_contracts": FeatureSpec(
+        name="agent_tool_contracts",
+        available_in=RolloutChannel.STABLE,
+        description=(
+            "Tool Contract and Argument Validator: family contracts, argument / "
+            "path / command / ref checks and learned repair suggestions (never "
+            "auto-executed; needs agent_runtime)."
+        ),
+    ),
 }
 
 #: Safe, non-destructive features `headroom wrap` turns on for the proxy it
@@ -250,6 +259,7 @@ WRAP_DEFAULT_FEATURES: tuple[str, ...] = (
     "agent_feedback",
     "agent_speculation",
     "agent_change_scope",
+    "agent_tool_contracts",
 )
 
 

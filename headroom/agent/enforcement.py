@@ -235,9 +235,7 @@ def host_pretool(
             source=client,
             cwd=cwd,
             enforcement=HOST_PRETOOL if enforceable else OBSERVE_ONLY,
-            probe=payload.get("headroom_probe")
-            if isinstance(payload.get("headroom_probe"), dict)
-            else None,
+            call_id=call_id,
         )
         kind, reason, message = decision.kind.value, decision.reason_code, decision.message()
         details: dict[str, Any] = decision.to_dict()
@@ -343,7 +341,6 @@ def observe_calls(
                 evaluated_at_host=prior is not None,
                 tools=tools,
             )
-            continue
         if prior is not None or firewall is None or failed:
             continue  # the host already decided, or nothing was changed
         decisions = scope_decisions(
