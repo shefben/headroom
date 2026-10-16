@@ -171,3 +171,41 @@ Spec: `HEADROOM_WRAP_UNIFIED_21_FEATURE_IMPLEMENTATION_PLAN_OPUS_5_5.md`. One sh
 **Tests.** New: `tests/agent/test_phase5_{arbiter,catalog,complexity,feedback_speculation}.py` (56), including e2e `/v1/messages` through the wrap rollout, arbitrary tool ordering, cache/policy decisions, tool-free and introspection cases, bounded and reversible feedback, and speculation on/off giving identical bytes. `tests/agent` 183 passed. Targeted CCR/gate/prefix/pipeline/wrap: 997 passed (1 failure that predates Phase 5, `test_canonical_pipeline::…compresses_tool_outputs`, also on clean HEAD). Proxy/handler/output/tool suites: 2485 passed. Their 7 failures reproduce on clean HEAD (loopback gating ×2, client-decision ×4, fsync). `test_proxy_anthropic_cache_stability` failed once under xdist and passes on rerun. Live JevK5 (llama-server, 4B Q8_0): arbiter blend applied (w .25, conf .81); catalog and effort advice were low-confidence and correctly ignored.
 
 **Eval** (`benchmarks/results/phase5.json`): Python bare 29.39% and Rust 35.19%, both unchanged. Wrap path 55.95% (Phase 4: 56.91%), recall 1.0, 0 errors/structure/prefix violations. The only move is `tool_error`, 71% → 0%: the arbiter keeps the full traceback because the folded view shows only 19% of the traceback facts (they were recoverable, not visible).
+
+## Phase 6: change scope, then tool contracts (commits 21aa81b7, 95782ebb, 741b1eb3, 928f1725, 7a69d701, this entry)
+
+**6A Change-Scope / Drift Firewall (#23), `headroom/agent/change_scope.py`.** A `ChangeContract` is built per (workspace, session) from four inputs: live USER-origin TaskState atoms, live negative test/error evidence that names files, the task's recorded writes, and writes the firewall authorized. Reads never feed it.
+- User text, clause by clause: named files, directories and globs become expected paths; "do not touch / leave … alone / off-limits / exclude" make paths forbidden; "only edit … / nothing else" sets FROZEN; "don't push / commit / delete files" forbids an effect. The latest instruction wins per path.
+- Modes are LEARNING, ACTIVE and FROZEN. Classes are IN_SCOPE, DEPENDENCY_SCOPE, GENERATED_EFFECT, UNRELATED and FORBIDDEN.
+- A dependency must be traceable: a direct import (code graph, or a lexical fallback), a shared interface (callers or subclasses), failing evidence (fact id), a config or package file on the anchor's path, or a related test. The reason is recorded on the contract, which bumps its revision. JevK5 is never an input.
+- Hard-protected: `.git` internals (never approvable), private keys, credentials and `.env*` (templates excepted), AI-client provider config and `.headroom/`. Unknown and untrusted workspaces never get authority. Untracked deletion (`git clean -f`), push and history rewrite only warn unless the user permitted them. Dry runs pass.
+- Each decision carries a revision-pinned `ActionAuthorization` (task, scope and resource revision; the resource revision comes from recorded writes plus stat changes). It is verified right before the hook returns. On a mismatch the call is re-evaluated once; if it still mismatches, the call is denied with `scope.stale_revision`.
+- Paths are canonicalized: relative paths resolve against cwd and `cd` preludes; MSYS, `\?\` and `\?\UNC\` forms are unwrapped; symlinks are resolved, and a symlink that escapes the worktree warns; UNC paths are flagged; case folds only on Windows and macOS. Relative mentions written from a subdirectory are matched on path components.
+- Shell writes are parsed into planned changes: redirections, rm, mv, cp, `Set-Content`, `sed -i`, apply_patch and git operations.
+- The policy is `HEADROOM_CHANGE_SCOPE_MODE=observe|warn|protect`, default warn. FORBIDDEN is blocked only at a trusted host. `protect` also blocks UNRELATED edits under FROZEN.
+
+**6B Tool Contract + Argument Validator (#19), `headroom/agent/tool_contracts.py`.**
+- `ToolContract` and `Decision` (ALLOW, WARN, BLOCK, REPAIR_SUGGEST) cover the Read, Edit/Write, exec, search, Git, test/build and HTTP families. The Claude, Codex and OpenCode names map to them with provider schemas left untouched. Unknown tools are observed and never certified.
+- Checks: client JSON schema when the proxy has it (else the documented required arguments), types, enums, mutually exclusive arguments, no-op edits; cwd and `cd` targets; input existence; UNC; command availability (built-ins, PowerShell cmdlets and aliases); cmd.exe switches in Bash and `rm -rf` in PowerShell; git ref names (`check-ref-format`); privilege escalation the user didn't ask for (blocked at the host); malformed pytest, npm and cargo calls. Writes go through the firewall.
+- Repairs (typo paths and commands, learned recoveries) are suggestions only. The input is never rewritten.
+- Learned recovery reuses `TrafficLearner._build_recovery_pattern` and `classify_error`. A recovery is promoted after 3 distinct corroborations and is bound to an environment fingerprint, with a 7-day TTL. It is invalidated when the suggested form fails or the failing form succeeds.
+- JevK5 only reorders already-safe repairs. An invented option or a hard scope decision cannot be overridden.
+- The policy is `HEADROOM_TOOL_CONTRACTS_MODE`, default warn. The OpenAI extractor now also returns `call_id`.
+
+**Interception matrix (`agent/enforcement.py`).** `wrap claude` adds a separate PreToolUse `Bash|PowerShell` entry; the earlier entries are unchanged. The proxy returns one of three outputs:
+- `permissionDecision: "deny"`, only for BLOCK at a trusted workspace.
+- `additionalContext` with a compact diagnostic and reason code, for WARN or REPAIR_SUGGEST.
+- Nothing otherwise.
+
+No other permission field is ever set. User permissions and hooks are kept, and `--settings` carries hooks only. The proxy and TurnHook path (stage order 60) is observe-only: it records the calls a client already executed, failures (kept apart from prevention and warnings), the after-edit and `git.changed_paths` diff check, and learning observations. It never reports anything as blocked. `/health.agent_enforcement` reports capabilities (claude `host_pretool`, others `observe_only`) and counters. Wrap prints one honest line per client. Rollout features `agent_change_scope` and `agent_tool_contracts` are wrap defaults and opt-in for a bare proxy. Also fixed from Phase 1: the intelligence subprocess calls now go through `headroom._subprocess`.
+
+**Tests.**
+- New tests, 66 in total:
+  - `test_phase6_change_scope` (33)
+  - `test_phase6_tool_contracts` (27)
+  - `test_phase6_gate_host` (6). These run the real hook subprocess against a uvicorn proxy, with the instructions sent through `/v1/messages`. Results: a forbidden write is denied and the file stays untouched; an edit and an import dependency produce no output; a typo gets a suggestion and nothing is created; the user narrowing scope denies the next write, including 4 concurrent hooks; codex and proxy-only report observe; permissions are byte-identical.
+- `test_host_hook_live` is extended.
+- Targeted suites (agent, intelligence, CLI and wrap, rollout, traffic learner, health, handler helpers, turn hooks, CCR, SafetyGate, tool, byte-faithful, canonical pipeline): 2531 passed. All 7 failures predate this phase: 5 are on the known list; `TestProjectForPattern` ×2 also fails on clean 98ba36b1.
+- Live JevK5 (4B Q8_0): the advisor was ready but repair ranking was low-confidence, so the deterministic order was kept. A forbidden write stayed BLOCK with the advisor attached. The service was stopped.
+
+**Eval** (`benchmarks/results/phase6.json`): identical to Phase 5. Python bare 29.39%, Rust 35.19%, wrap 55.95%, recall 1.0, 0 errors/structure/prefix violations. Phase 6 adds no transforms.
