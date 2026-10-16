@@ -309,7 +309,10 @@ def test_anthropic_ccr_continuation_uses_buffered_timeout() -> None:
             tools,
             api_call_fn,
             provider,
+            *,
+            workspace="",
         ):
+            # Same signature as CCRResponseHandler.handle_response (workspace-scoped CCR).
             return await api_call_fn(
                 optimized_messages
                 + [{"role": "assistant", "content": response.get("content", [])}],

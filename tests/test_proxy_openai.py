@@ -357,6 +357,13 @@ def _native_responses_client():  # noqa: ANN202
         yield client, seen, transport
 
 
+def _assert_resolved_policy(kwargs: dict[str, object]) -> None:
+    """The route also hands the compressor the resolved SafetyGate policy (unified-21 #13)."""
+    from headroom.transforms.compression_policy import CompressionPolicy
+
+    assert isinstance(kwargs.get("compression_policy"), CompressionPolicy), kwargs
+
+
 def _responses_body() -> dict[str, object]:
     return {"model": TOOL_SEARCH_MODEL, "input": "hello", "tools": _tool_payload()}
 
@@ -390,7 +397,12 @@ def test_native_responses_route_carries_the_client_decision(
         assert transport.call_count == 1, response.text
         assert response.status_code == 200, response.text
         assert seen, "the Responses compressor was never reached"
-        assert {k: v for k, v in seen[0].items() if k not in {"timing", "savings_tags"}} == expected
+        _assert_resolved_policy(seen[0])
+        assert {
+            k: v
+            for k, v in seen[0].items()
+            if k not in {"timing", "savings_tags", "compression_policy"}
+        } == expected
 
 
 # --- production route: the Codex WebSocket handler ---------------------------
@@ -448,6 +460,9 @@ def test_websocket_route_carries_the_client_decision(
         asyncio.run(handler.handle_openai_responses_ws(client_ws))
 
     assert seen, "the Responses compressor was never reached on the WS path"
+    _assert_resolved_policy(seen[0])
     assert {
-        k: v for k, v in seen[0].items() if k not in {"timing", "deadline_started_at"}
+        k: v
+        for k, v in seen[0].items()
+        if k not in {"timing", "deadline_started_at", "compression_policy"}
     } == expected

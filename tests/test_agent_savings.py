@@ -521,7 +521,7 @@ def test_proxy_cli_reads_agent_90_profile_env() -> None:
     assert proxy_pipeline_kwargs(config)["target_ratio"] == 0.10
 
 
-def test_unit_router_receives_agent_target_ratio() -> None:
+def test_unit_router_receives_agent_target_ratio(permissive_lossy_budget) -> None:
     seen: dict[str, object] = {}
 
     class Tokenizer:

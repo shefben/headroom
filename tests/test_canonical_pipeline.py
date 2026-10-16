@@ -157,7 +157,9 @@ def test_default_transform_pipeline_always_uses_content_router() -> None:
     assert not any(type(transform).__name__ == "SmartCrusher" for transform in pipeline.transforms)
 
 
-def test_content_router_protects_instruction_roles_but_compresses_tool_outputs() -> None:
+def test_content_router_protects_instruction_roles_but_compresses_tool_outputs(
+    permissive_lossy_budget,
+) -> None:
     class Tokenizer:
         def count_text(self, text: str) -> int:
             return max(1, len(text.split()))
