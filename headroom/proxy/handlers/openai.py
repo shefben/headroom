@@ -3051,6 +3051,9 @@ class OpenAIHandlerMixin:
             # Unified-21 #10: complexity-aware effort/verbosity routing.
             from headroom.agent.complexity import route_request
 
+            # Already inside the executor closure, so an uncertain turn may
+            # consult JevK5 here without blocking the event loop (bounded by
+            # the advisor's 1200 ms decision deadline).
             _route = route_request(
                 payload,
                 shape="responses",

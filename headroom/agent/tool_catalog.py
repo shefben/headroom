@@ -5,6 +5,15 @@ defers (Claude Code ``ENABLE_TOOL_SEARCH``, a ``tool_search_tool_*`` /
 ``defer_loading`` shape) or that Headroom's own server-side deferral already
 handled is left exactly as is, and a tool-free request is never given tools.
 
+That stand-down is deliberate and it is the normal state on first-party
+Anthropic, where ``HEADROOM_TOOL_SEARCH`` defers the non-core schemas before
+this runs. Two competing defer systems would fight, and the deferral has to
+stay byte-deterministic for the tools prefix to prompt-cache, so advisory
+input into *which* tools stay resident is not available there either. The
+catalog's JevK5 tie-break is therefore structurally unreachable on that path,
+and says so: ``bypassed_native_tool_search`` counts every such request and a
+DEBUG line records ``reason=native_tool_search``.
+
 Otherwise every tool stays in the request — so each name remains callable and
 ``tool_choice`` / history ``tool_use`` references stay valid — but only the
 resident set and the top :data:`DEFAULT_MATERIALIZE` ranked tools keep their
@@ -14,7 +23,9 @@ parameters typed, optional ones listed), with their cache breakpoints kept.
 
 Ranking: task relevance (lexical + the Rust hybrid/embedding scorer), graph
 neighbours, recent successful use and a bounded learned preference; JevK5 may
-break ties among the top :data:`MAX_FINALISTS` when the cut is ambiguous.
+break ties among the top :data:`MAX_FINALISTS` when :func:`cut_uncertainty`
+says the cut itself is uncertain (close scores across it, a cluster on the
+boundary, or a task text the lexical ranker could not use).
 
 Cache rule: the materialized set is sticky per (session, client tool set).
 While the prefix is cache-hot it never changes to shave nominal schema tokens;
@@ -39,14 +50,34 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.intelligence.policy import (
+    FAMILY_TOOL_CATALOG,
+    Uncertainty,
+    ambiguity_threshold,
+    ask_choice,
+    closeness,
+    consumer_stats,
+    frontier_density,
+    should_consult,
+)
+from headroom.intelligence.policy import applied as policy_applied
 from headroom.log_safety import describe_exception
 
 log = logging.getLogger(__name__)
+
+#: This consumer's JevK5 counters (``/health.agent_runtime.intelligence.consumers``).
+_STATS = consumer_stats("tool_catalog")
 
 FEATURE_TOOL_CATALOG = "agent_tool_catalog"
 DEFAULT_MATERIALIZE = 5
 MIN_CATALOG_TOOLS = 12
 MAX_FINALISTS = 16
+#: Options actually sent to JevK5. The cut sits at :data:`DEFAULT_MATERIALIZE`,
+#: so candidates far below it cannot win the tie-break, and a smaller question
+#: keeps one catalog decision comfortably inside the 1200 ms deadline (measured
+#: on an RTX A4000: a 16-option catalog question can exceed it on a cold
+#: prompt, and a timed-out decision is a wasted one).
+CATALOG_FINALISTS = 8
 JEV_MARGIN = 0.15
 MAX_SESSIONS = 1024
 CATALOG_TAG = "[catalog]"
@@ -379,6 +410,10 @@ class ProgressiveToolCatalog:
             "applied": 0,
             "reused": 0,
             "native_search": 0,
+            "bypassed_native_tool_search": 0,
+            "jev_eligible": 0,
+            "jev_calls": 0,
+            "jev_applied": 0,
             "tool_free": 0,
             "too_few_tools": 0,
             "unsupported_shape": 0,
@@ -398,7 +433,16 @@ class ProgressiveToolCatalog:
         from headroom.proxy.helpers import request_already_defers_tools
 
         if request_already_defers_tools(tools):
+            # Provider-native (or Headroom's own server-side) tool search owns
+            # the resident/deferred decision for this request. Two competing
+            # defer systems is the one thing we must not do, so the catalog --
+            # and with it its JevK5 tie-break -- stands down entirely. This is
+            # the normal state on first-party Anthropic, where the deferral is
+            # on by default: see ``docs/.../configuration.mdx``.
             self._bump("native_search")
+            self._bump("bypassed_native_tool_search")
+            _STATS.skipped("native_tool_search")
+            log.debug("jevk5 skipped family=%s reason=native_tool_search", FAMILY_TOOL_CATALOG)
             return CatalogResult(tools, (), (), "native_search")
         shape = _shape_of(tools)
         if shape is None:
@@ -464,7 +508,9 @@ class ProgressiveToolCatalog:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
-            return {"sessions": len(self._sessions), **self.counters}
+            counters = {"sessions": len(self._sessions), **self.counters}
+        counters["jevk5"] = _STATS.snapshot()
+        return counters
 
     def reset(self) -> None:
         with self._lock:
@@ -589,36 +635,48 @@ class ProgressiveToolCatalog:
         scored.sort(key=lambda x: (-round(x[1], 9), x[0]))
         k = req.materialize
         jev_w = 0.0
-        if (
-            req.advisor is not None
-            and len(scored) > k
-            and (not qwords or scored[k - 1][1] - scored[k][1] < JEV_MARGIN)
+        budget = None
+        if req.advisor is not None:
+            try:
+                budget = req.advisor.request_budget(req.request_id)
+            except Exception as exc:  # noqa: BLE001 - advisory only
+                log.debug("catalog advisor budget failed: %s", describe_exception(exc))
+                return scored, 0.0
+        uncertainty = cut_uncertainty(scored, k, has_task_terms=bool(qwords))
+        if should_consult(
+            FAMILY_TOOL_CATALOG,
+            uncertainty,
+            advisor=req.advisor,
+            budget=budget,
+            stats=_STATS,
         ):
-            jev_w, scored = self._jev_ties(req, scored, candidates, shape)
+            self._bump("jev_eligible")
+            jev_w, scored = self._jev_ties(req, scored, candidates, shape, budget)
         return scored, jev_w
 
-    @staticmethod
     def _jev_ties(
+        self,
         req: CatalogRequest,
         scored: list[tuple[str, float]],
         candidates: list[Mapping[str, Any]],
         shape: str,
+        budget: Any,
     ) -> tuple[float, list[tuple[str, float]]]:
-        finalists = scored[:MAX_FINALISTS]
+        finalists = scored[:CATALOG_FINALISTS]
         purposes = {_name(t, shape): _purpose(_description(t, shape))[:120] for t in candidates}
         options = {f"t{i}": f"{n}: {purposes.get(n, '')}" for i, (n, _) in enumerate(finalists)}
-        try:
-            budget = req.advisor.request_budget(req.request_id)
-            advice = req.advisor.choose(
-                "tool_catalog",
-                {"task": (req.query or " ".join(req.terms))[:600], "tools": options},
-                "Which tool is the agent most likely to need next for this task?",
-                options,
-                budget=budget,
-            )
-        except Exception as exc:  # noqa: BLE001 - advisory only
-            log.debug("catalog advisor failed: %s", describe_exception(exc))
-            return 0.0, scored
+        self._bump("jev_calls")
+        advice = ask_choice(
+            req.advisor,
+            FAMILY_TOOL_CATALOG,
+            # The options ride in the question's criteria; repeating them in the
+            # state only doubles the prompt (and the decision's latency).
+            {"task": (req.query or " ".join(req.terms))[:600], "cut_at": req.materialize},
+            "Which tool is the agent most likely to need next for this task?",
+            options,
+            budget=budget,
+            stats=_STATS,
+        )
         if advice is None:
             return 0.0, scored
         w = max(0.0, min(0.40, float(getattr(advice, "weight", 0.0) or 0.0)))
@@ -628,7 +686,46 @@ class ProgressiveToolCatalog:
             for i, (n, s) in enumerate(finalists)
         ]
         blended.sort(key=lambda x: (-round(x[1], 9), x[0]))
+        if w > 0:
+            self._bump("jev_applied")
+            policy_applied(FAMILY_TOOL_CATALOG, advice, _STATS)
         return w, blended + scored[MAX_FINALISTS:]
+
+
+def cut_uncertainty(
+    scored: Sequence[tuple[str, float]], k: int, *, has_task_terms: bool
+) -> Uncertainty:
+    """Whether the materialize/compact cut at ``k`` is genuinely uncertain.
+
+    The cut is what JevK5 can help with: which borderline non-core tools keep
+    their full schema. Uncertain means the scores straddling the cut are close,
+    several candidates are clustered on the boundary, or the task text gave the
+    lexical ranker nothing to work with. A decisive cut is left alone.
+    """
+    if k <= 0 or len(scored) <= k:
+        return Uncertainty(blocked="no_cut")
+    gap = scored[k - 1][1] - scored[k][1]
+    band = max(scored[0][1] - scored[-1][1], 1e-9)
+    near = [s for _n, s in scored if abs(s - scored[k - 1][1]) <= JEV_MARGIN]
+    close = closeness(gap, JEV_MARGIN)
+    density = frontier_density([s for _n, s in scored[: 2 * k]], JEV_MARGIN)
+    threshold = ambiguity_threshold()
+    reasons: list[str] = []
+    score = 0.0
+    if close > 0:
+        reasons.append("close_cut")
+        score += 0.9 * threshold * close
+    if density > 0:
+        reasons.append("crowded_cut")
+        score += 0.4 * threshold * density
+    if not has_task_terms:
+        reasons.append("no_task_terms")
+        score += 0.6 * threshold
+    return Uncertainty(
+        score=min(1.0, score),
+        reasons=tuple(reasons),
+        detail={"candidates": len(scored), "cluster": len(near), "spread": round(band, 4)},
+    )
 
 
 def _latest_user_text(messages: Sequence[Any]) -> str:
@@ -741,6 +838,7 @@ __all__ = [
     "REGISTRY",
     "ToolRegistry",
     "apply_request_catalog",
+    "cut_uncertainty",
     "get_catalog",
     "signature",
     "stub_tool",

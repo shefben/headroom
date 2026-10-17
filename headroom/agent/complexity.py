@@ -10,8 +10,11 @@ Two independent decisions per request:
   an unresolved completion gate, or an explicit user request for deep
   thinking. On a mechanical continuation the remaining complexity signals
   (new symbols, multi-file scope, unknown requirements, uncertainty) give a
-  0-4 score; JevK5 scores 0-4 only when the deterministic score is the
-  uncertain middle. A short answer with high effort is a valid outcome.
+  0-4 score. JevK5 is consulted only when :func:`should_consult_advisor` finds
+  that score genuinely uncertain, and then only about the single boundary the
+  routed effort turns on, so its answer is always one of the two scores the
+  deterministic logic was already choosing between. A short answer with high
+  effort is a valid outcome.
 * **Visible verbosity** — the output shaper's conversation-stable level
   (verbosity learning, controller, env; system-tail placement) stays the
   base. A complex new ask may *relax* it for that one reply through a
@@ -33,15 +36,41 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.intelligence.policy import (
+    FAMILY_COMPLEXITY,
+    Uncertainty,
+    ambiguity_threshold,
+    ask_choice,
+    consumer_stats,
+    should_consult,
+)
+from headroom.intelligence.policy import applied as policy_applied
+from headroom.intelligence.policy import clip as _clip
 from headroom.log_safety import describe_exception
 
 log = logging.getLogger(__name__)
+
+#: This consumer's JevK5 counters (``/health.agent_runtime.intelligence.consumers``).
+_STATS = consumer_stats("complexity_router")
 
 FEATURE_COMPLEXITY = "agent_complexity_routing"
 EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
 EFFORT_FLOOR = "medium"
 TURN_BLOCK_TAG = "headroom_turn_verbosity"
 MAX_SESSIONS = 1024
+#: Thresholds the three positive-evidence booleans fire at. The uncertainty
+#: policy reads the raw counts against them, so a turn that sits on a
+#: threshold is treated as the borderline case it is.
+NEW_SYMBOL_THRESHOLD = 8
+PATH_THRESHOLD = 3
+HEDGE_THRESHOLD = 2
+#: Score boundaries of :func:`lowered_effort` (drop 2 / 1 / 0).
+SCORE_BOUNDARIES = (1.0, 2.0)
+#: How close the continuous score must come to a boundary to count as borderline.
+BOUNDARY_BAND = 0.40
+#: Positive evidence (0..3) a turn needs before its effort is worth a question.
+#: Below it the turn is a clean mechanical continuation: deterministic, no call.
+MIN_EVIDENCE = 0.30
 
 _EXPLICIT_DEEP = re.compile(
     r"\b(?:ultrathink|megathink|think\s+(?:very\s+)?(?:hard(?:er)?|deeply|carefully|longer)|"
@@ -81,6 +110,14 @@ class ComplexitySignals:
     multi_file: bool = False
     uncertainty: bool = False
     explains: bool = False
+    # Magnitudes behind the three positive-evidence booleans above, plus what
+    # the projector knew. The booleans are the deterministic score; these give
+    # the uncertainty policy a continuous view of how close each threshold is.
+    new_symbol_count: int = 0
+    path_count: int = 0
+    hedge_count: int = 0
+    snapshot_available: bool = False
+    open_work: bool = False
 
     @property
     def protected(self) -> str | None:
@@ -161,7 +198,9 @@ def _bump(name: str) -> None:
 
 def status() -> dict[str, Any]:
     with _lock:
-        return {"sessions": len(_sessions), **_counters}
+        counters = {"sessions": len(_sessions), **_counters}
+    counters["jevk5"] = _STATS.snapshot()
+    return counters
 
 
 def _memory(session_key: str) -> _SessionMemory:
@@ -338,6 +377,7 @@ def assess(turn: _Turn, *, session_key: str, snapshot: Any = None) -> Complexity
     )
     contradictions = False
     unresolved_gate = False
+    open_work = False
     unknown = snapshot is None
     if snapshot is not None:
         contradictions = any(
@@ -352,8 +392,13 @@ def assess(turn: _Turn, *, session_key: str, snapshot: Any = None) -> Complexity
             "pytest" in str(inp) or "test" in name.lower() for name, inp in turn.recent_calls[-2:]
         )
         unresolved_gate = bool(open_acceptance) and (claimed or test_ran)
+        # Known, still-unsatisfied acceptance work: the task carries more
+        # complexity than this turn's text shows (an uncertainty signal, not a
+        # protected turn — only ``unresolved_gate`` protects).
+        open_work = bool(open_acceptance)
     symbols = list(dict.fromkeys(_SYMBOL.findall(trailing_text)))[:400]
-    new_symbols = _remember(mem.symbols, symbols) > 8
+    new_symbol_count = _remember(mem.symbols, symbols)
+    new_symbols = new_symbol_count > NEW_SYMBOL_THRESHOLD
     paths: set[str] = set()
     for _name, inp in turn.recent_calls[-6:]:
         for key in ("file_path", "path", "notebook_path"):
@@ -361,8 +406,9 @@ def assess(turn: _Turn, *, session_key: str, snapshot: Any = None) -> Complexity
             if isinstance(value, str) and value:
                 paths.add(value)
     paths.update(_PATH.findall(trailing_text)[:50])
-    multi_file = len(paths) >= 3
-    uncertainty = len(_HEDGE.findall(turn.last_assistant or "")) >= 2
+    multi_file = len(paths) >= PATH_THRESHOLD
+    hedge_count = len(_HEDGE.findall(turn.last_assistant or ""))
+    uncertainty = hedge_count >= HEDGE_THRESHOLD
     return ComplexitySignals(
         turn_kind=turn.kind,
         errors=errors,
@@ -376,6 +422,11 @@ def assess(turn: _Turn, *, session_key: str, snapshot: Any = None) -> Complexity
         multi_file=multi_file,
         uncertainty=uncertainty,
         explains=bool(_EXPLAIN.search(turn.latest_user or "")),
+        new_symbol_count=new_symbol_count,
+        path_count=len(paths),
+        hedge_count=hedge_count,
+        snapshot_available=snapshot is not None,
+        open_work=open_work,
     )
 
 
@@ -390,30 +441,199 @@ def lowered_effort(current: str, score: int) -> str:
     return EFFORT_ORDER[min(target, idx)]
 
 
+def positive_evidence(signals: ComplexitySignals) -> float:
+    """Continuous strength of the three *positive* complexity signals (0..3)."""
+    return (
+        _clip(signals.new_symbol_count / NEW_SYMBOL_THRESHOLD)
+        + _clip(signals.path_count / PATH_THRESHOLD)
+        + _clip(signals.hedge_count / HEDGE_THRESHOLD)
+    )
+
+
+def soft_score(signals: ComplexitySignals) -> float:
+    """The deterministic score without its thresholds rounded away (0..4).
+
+    ``score`` counts four booleans; this counts how far each of them is from
+    firing. Where the two land on different sides of a :data:`SCORE_BOUNDARIES`
+    boundary, the deterministic answer rests on a threshold, not on evidence.
+    """
+    unknown = 1.0 if signals.unknown_requirements else 0.0
+    return min(4.0, unknown + positive_evidence(signals))
+
+
+def effective_boundaries(effort: str | None) -> tuple[float, ...]:
+    """Score boundaries that actually change the routed effort for ``effort``.
+
+    ``lowered_effort`` clamps at :data:`EFFORT_FLOOR`, so for a client effort
+    close to the floor some boundaries route to the same value on both sides.
+    Asking JevK5 about a boundary whose answer cannot move the effort is pure
+    latency, so those are dropped — and an effort already at (or below) the
+    floor leaves none, which skips the family entirely for that request.
+    """
+    if effort is None or effort not in EFFORT_ORDER:
+        return ()
+    return tuple(
+        b
+        for b in SCORE_BOUNDARIES
+        if lowered_effort(effort, int(b) - 1) != lowered_effort(effort, int(b))
+    )
+
+
+def should_consult_advisor(
+    signals: ComplexitySignals,
+    deterministic_score: int,
+    *,
+    effort: str | None = None,
+) -> Uncertainty:
+    """Whether the effort decision is genuinely uncertain (unified-21 #10).
+
+    Uncertain means one of:
+
+    * **borderline threshold** — the continuous score sits within
+      :data:`BOUNDARY_BAND` of a boundary where :func:`lowered_effort` changes
+      its answer;
+    * **signals disagree** — the thresholded score and the continuous one fall
+      on opposite sides of such a boundary;
+    * **task state is heavier than the turn** — the projector still has
+      unsatisfied acceptance work while this turn looks simple.
+
+    It is *never* uncertain when the advisor's answer cannot change the routed
+    effort (the client's effort is already at the floor), and never when there
+    is no material positive evidence at all (a clean mechanical continuation:
+    the obviously safe case this must stay out of).
+    """
+    soft = soft_score(signals)
+    evidence = positive_evidence(signals)
+    detail = {"score": deterministic_score, "soft": round(soft, 2)}
+    boundaries = effective_boundaries(effort)
+    if not boundaries:
+        # Nothing JevK5 could answer would move the effort: don't ask.
+        return Uncertainty(blocked="no_effort_change_possible", detail=detail)
+    if evidence < MIN_EVIDENCE:
+        return Uncertainty(blocked="no_complexity_evidence", detail=detail)
+    reasons: list[str] = []
+    score = 0.0
+    nearest = min(boundaries, key=lambda b: abs(soft - b))
+    distance = abs(soft - nearest)
+    detail["boundary"] = nearest
+    threshold = ambiguity_threshold()
+    if distance <= BOUNDARY_BAND:
+        # Inside the band the routed effort rests on a threshold, not on
+        # evidence: decisive on its own. BOUNDARY_BAND is the tuning knob.
+        reasons.append("borderline_threshold")
+        score += threshold + (1.0 - threshold) * 0.4 * (1.0 - distance / BOUNDARY_BAND)
+    if any((soft - b) * (deterministic_score - b) < 0 for b in boundaries):
+        reasons.append("signals_disagree")
+        score += threshold
+    if signals.open_work and soft < SCORE_BOUNDARIES[-1]:
+        reasons.append("task_state_heavier")
+        score += 0.5 * threshold
+    if signals.explains and deterministic_score < 2:
+        reasons.append("explanatory_ask")
+        score += 0.3 * threshold
+    return Uncertainty(score=_clip(score), reasons=tuple(reasons), detail=detail)
+
+
+#: What each side of a boundary means, in the terms the turn is actually in.
+#: The question JevK5 gets is the *one* binary choice the routed effort turns
+#: on, not a five-level scale over a bag of flags: measured on the published 4B
+#: model, a concrete two-way question comes back at 0.86-0.999 confidence while
+#: a flags-and-levels one sits at ~0.5 and is rejected by the 0.60 floor, so
+#: the scale shape alone decided whether this family was ever usable.
+_BOUNDARY_OPTIONS: Mapping[float, tuple[str, str]] = {
+    1.0: (
+        "a routine mechanical step: carry on and finish it directly",
+        "one real step of reasoning is needed before acting",
+    ),
+    2.0: (
+        "one step of reasoning is enough",
+        "several interacting unknowns: this needs careful reasoning",
+    ),
+}
+
+
+def turn_description(signals: ComplexitySignals) -> str:
+    """A content-free sentence describing the turn's shape for the advisor.
+
+    Counts and flags only — never a path, an identifier, a command or any user
+    or tool text — so the advisor gets something it can reason about without
+    any payload leaving the process.
+    """
+    parts = [f"The agent is in a {signals.turn_kind.replace('_', ' ')}."]
+    parts.append(
+        f"{signals.path_count} file path(s) in play"
+        if signals.path_count
+        else "no file paths in play"
+    )
+    parts.append(
+        f"{signals.new_symbol_count} identifier(s) not seen before in this session"
+        if signals.new_symbol_count
+        else "no new identifiers"
+    )
+    parts.append(
+        f"{signals.hedge_count} hedging phrase(s) in the agent's own last message"
+        if signals.hedge_count
+        else "no hedging in the agent's own last message"
+    )
+    parts.append(
+        "the task goal is not known yet" if signals.unknown_requirements else "the task goal is known"
+    )
+    if signals.open_work:
+        parts.append("acceptance criteria are still unsatisfied")
+    if signals.explains:
+        parts.append("the user asked for an explanation or a comparison")
+    return parts[0] + " " + ", ".join(parts[1:]) + "."
+
+
 def _jev_score(
-    advisor: Any, signals: ComplexitySignals, request_id: str | None = None
+    advisor: Any,
+    signals: ComplexitySignals,
+    deterministic_score: int,
+    *,
+    effort: str | None = None,
+    request_id: str | None = None,
 ) -> int | None:
-    if advisor is None:
+    """JevK5's complexity score for an uncertain turn, or ``None``.
+
+    It is asked only about the single boundary the routed effort turns on, and
+    may only answer with one of that boundary's two sides — so the result is
+    always one of the two scores the deterministic logic was already choosing
+    between, and can never route above what the client sent.
+    """
+    uncertainty = should_consult_advisor(signals, deterministic_score, effort=effort)
+    # The request's shared allowance (arbiter + catalog + this call <= 4).
+    budget = None
+    if advisor is not None:
+        try:
+            budget = advisor.request_budget(request_id)
+        except Exception as exc:  # noqa: BLE001 - advisory only
+            log.debug("complexity advisor budget failed: %s", describe_exception(exc))
+            return None
+    if not should_consult(
+        FAMILY_COMPLEXITY, uncertainty, advisor=advisor, budget=budget, stats=_STATS
+    ):
         return None
-    try:
-        # The request's shared allowance (arbiter + catalog + this call <= 4).
-        budget = advisor.request_budget(request_id)
-        advice = advisor.score(
-            "effort_complexity",
-            {"signals": signals.to_dict()},
-            "How much reasoning does the agent's next step need (0 trivial .. 4 very hard)?",
-            ["0", "1", "2", "3", "4"],
-            budget=budget,
-        )
-    except Exception as exc:  # noqa: BLE001 - advisory only
-        log.debug("complexity advisor failed: %s", describe_exception(exc))
-        return None
+    boundary = float(uncertainty.detail.get("boundary") or SCORE_BOUNDARIES[0])
+    below, at_or_above = _BOUNDARY_OPTIONS.get(boundary, _BOUNDARY_OPTIONS[1.0])
+    advice = ask_choice(
+        advisor,
+        FAMILY_COMPLEXITY,
+        {"turn": turn_description(signals), "signals": signals.to_dict()},
+        "How much reasoning does the agent's next step need?",
+        {"below": below, "at_or_above": at_or_above},
+        budget=budget,
+        stats=_STATS,
+    )
     if advice is None:
         return None
-    try:
-        return max(0, min(4, int(round(float(advice.value)))))
-    except (TypeError, ValueError):
+    choice = str(getattr(advice, "value", ""))
+    if choice not in ("below", "at_or_above"):
+        _STATS.skipped("malformed")
+        _STATS.bump("deterministic_fallback")
         return None
+    value = int(boundary) - 1 if choice == "below" else int(boundary)
+    policy_applied(FAMILY_COMPLEXITY, advice, _STATS)
+    return max(0, min(4, value))
 
 
 # ---------------------------------------------------------------------------
@@ -595,11 +815,10 @@ def _route(
         _bump("effort_kept_protected")
     else:
         score = signals.score
-        if score == 2:
-            jev = _jev_score(advisor, signals, request_id)
-            if jev is not None:
-                score, source = jev, "jevk5"
-                _bump("jevk5_scores")
+        jev = _jev_score(advisor, signals, score, effort=effort, request_id=request_id)
+        if jev is not None:
+            score, source = jev, "jevk5"
+            _bump("jevk5_scores")
         effort_after = lowered_effort(effort, score)
         if effort_after != effort:
             _set_effort(body, shape, effort_after)
@@ -655,8 +874,13 @@ __all__ = [
     "FEATURE_COMPLEXITY",
     "RoutingDecision",
     "assess",
+    "effective_boundaries",
     "lowered_effort",
+    "positive_evidence",
     "route_request",
+    "should_consult_advisor",
+    "soft_score",
     "status",
+    "turn_description",
     "turn_verbosity_block",
 ]

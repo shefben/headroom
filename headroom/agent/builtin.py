@@ -27,9 +27,20 @@ from typing import Any
 
 from headroom.agent import registry
 from headroom.agent.events import AgentEvent, EventKind
+from headroom.intelligence.policy import (
+    FAMILY_TASK_STATE,
+    Uncertainty,
+    ask_choice,
+    consumer_stats,
+    should_consult,
+)
+from headroom.intelligence.policy import applied as policy_applied
 from headroom.log_safety import describe_exception
 
 log = logging.getLogger(__name__)
+
+#: JevK5 counters for the task-state target chooser (``/health`` consumers).
+_TASK_STATE_STATS = consumer_stats("task_state")
 
 FEATURE_TASK_STATE = "agent_task_state"
 FEATURE_EVIDENCE = "agent_evidence"
@@ -81,27 +92,62 @@ def _evidence_lookup(evidence: Any) -> Callable[[AgentEvent], list[str]]:
 
 
 def _chooser_factory(runtime: Any) -> Callable[[AgentEvent], Any]:
-    """JevK5 may pick WHICH existing atom a correction targets — nothing more."""
+    """JevK5 may pick WHICH existing atom a correction targets — nothing more.
+
+    Reached only from :class:`TaskStateProjector`, on the runtime worker
+    thread, and only for a correction whose deterministic Jaccard match is
+    genuinely ambiguous (a runner-up within 75% of the top, or no match above
+    the floor with several correctable atoms live). The projector runs after
+    the proxy request has already been answered, so it legitimately takes its
+    own :class:`RequestBudget` rather than the request's shared allowance.
+
+    The advisor can only ever return one of the ids it was shown: an id that
+    is not in ``labels`` is discarded, so it can never invent an atom.
+    """
 
     def factory(event: AgentEvent) -> Any:
         advisor = runtime.advisor
         if advisor is None:
             return None
+        # Off-request: the projector runs on the worker thread after the
+        # response. A private allowance here cannot starve a live request.
         budget = advisor.request_budget()
 
         def choose(correction: str, options: list[Any]) -> str | None:
             labels = {atom.id: atom.text[:200] for atom in options}
-            advice = advisor.choose(
-                "task_state_target",
+            uncertainty = Uncertainty(
+                score=1.0,
+                reasons=("ambiguous_correction",),
+                detail={"candidates": len(labels)},
+            )
+            if len(labels) < 2:
+                return None
+            if not should_consult(
+                FAMILY_TASK_STATE,
+                uncertainty,
+                advisor=advisor,
+                budget=budget,
+                stats=_TASK_STATE_STATS,
+            ):
+                return None
+            advice = ask_choice(
+                advisor,
+                FAMILY_TASK_STATE,
                 {"correction": correction[:600], "items": labels},
                 "Which existing task item does the user's correction replace?",
                 labels,
                 budget=budget,
+                stats=_TASK_STATE_STATS,
             )
             if advice is None:
                 return None
             value = str(advice.value)
-            return value if value in labels else None
+            if value not in labels:
+                _TASK_STATE_STATS.skipped("unknown_atom")
+                _TASK_STATE_STATS.bump("deterministic_fallback")
+                return None
+            policy_applied(FAMILY_TASK_STATE, advice, _TASK_STATE_STATS)
+            return value
 
         return choose
 

@@ -163,7 +163,18 @@ def agent_runtime_health(app: Any, config: Any) -> dict[str, Any]:
     if runtime is not None:
         block["runtime"] = runtime.status()
     if intelligence is not None:
+        # The LIVE advisor's counters (stats, by_family) and the per-consumer
+        # JevK5 attribution. ``headroom intelligence status`` builds its own
+        # manager in the CLI process, so only this block proves proxy usage.
         block["intelligence"] = intelligence.health()
+    if _feature(config, "agent_complexity_routing"):
+        from headroom.agent.complexity import status as complexity_status
+
+        block["complexity_routing"] = complexity_status()
+    if _feature(config, "agent_tool_catalog"):
+        from headroom.agent.tool_catalog import get_catalog
+
+        block["tool_catalog"] = get_catalog().status()
     return block
 
 

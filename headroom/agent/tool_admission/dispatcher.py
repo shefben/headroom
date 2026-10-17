@@ -572,7 +572,10 @@ class ToolAdmissionDispatcher:
             cache_ttl_seconds=request.cache_ttl_seconds,
             feedback=request.feedback,
             feedback_key=_feedback_key(envelope, family, request),
-            ambiguous=not terms,
+            # No query term of this task occurs in the unit, so relevance could
+            # not discriminate between the forms. One weak amplifier for
+            # ``arbiter_uncertainty``, never an ambiguity verdict by itself.
+            ambiguous=not [t for t in terms if t and t in original],
             advisor=request.advisor,
             advisor_budget=request.advisor_budget,
             limits=request.limits,

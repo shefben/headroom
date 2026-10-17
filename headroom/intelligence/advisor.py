@@ -15,7 +15,11 @@ Per decision:
 * if a required option letter is absent from ``top_logprobs`` the decision is
   retried once with ``n_probs`` raised to the retry bound (default 128); still
   missing → the advisory is unavailable for that decision (a failure);
-* top-choice confidence below ``min_confidence`` (0.60) is ignored;
+* top-choice confidence below ``min_confidence`` (0.60) is ignored. Measured on
+  the published 4B model, JevK5 clears that floor comfortably on a decision
+  with real semantic content (0.86-0.999) and stays under it on a muddy one
+  (~0.5), so a consumer should ask a small, concrete question rather than hand
+  it a bag of flags and a five-level scale;
 * the utility weight is ``min(weight, weight_cap)`` (0.25, cap 0.40).
 
 Across decisions: a 30 s TTL cache (a cached answer is held to the same
@@ -227,6 +231,7 @@ class DecisionAdvisor:
         adapter_factory: Callable[..., Any] = make_deadline_adapter,
         systemone_factory: Callable[[str], SystemOneClient] = SystemOneClient,
         effective_ctx: Callable[[], int | None] | None = None,
+        state_provider: Callable[[], tuple[str, str]] | None = None,
     ) -> None:
         self.settings = settings
         self._endpoint_provider = endpoint_provider
@@ -234,6 +239,7 @@ class DecisionAdvisor:
         self._adapter_factory = adapter_factory
         self._systemone_factory = systemone_factory
         self._effective_ctx = effective_ctx or (lambda: None)
+        self._state_provider = state_provider
         self._lock = threading.Lock()
         self._cache: OrderedDict[str, tuple[float, Advice]] = OrderedDict()
         self._breaker = _Breaker(settings.breaker_failures, settings.breaker_open_s)
@@ -348,22 +354,35 @@ class DecisionAdvisor:
         question: Mapping[str, Any],
         budget: RequestBudget,
     ) -> Advice | None:
+        return self.decide_outcome(family, state, question, budget=budget)[0]
+
+    def decide_outcome(
+        self,
+        family: str,
+        state: Any,
+        question: Mapping[str, Any],
+        *,
+        budget: RequestBudget,
+    ) -> tuple[Advice | None, str]:
+        """:meth:`decide` plus *why* it said nothing (one of a fixed, low-cardinality
+        set of reasons), so a consumer can record the outcome of its own request
+        without reading process-wide counters."""
         settings = self.settings
         if settings.policy is ServicePolicy.OFF:
-            return None
+            return None, "disabled"
         problem = self._validate(question)
         if problem:
             log.debug("advisor rejected malformed question (%s)", problem)
-            return None
+            return None, "malformed"
         state_text = state if isinstance(state, str) else json.dumps(
             state, default=str, ensure_ascii=False
         )
         if len(state_text) / _CHARS_PER_TOKEN > settings.max_state_tokens * 1.5:
-            return None  # cannot fit the local-decision budget; do not send
+            return None, "context_overflow"  # cannot fit the budget; do not send
         if not english_enough(state_text, *_question_text(question)):
             with self._lock:
                 self.stats.non_english += 1
-            return None  # JevK5 is English-only: no advice rather than noise
+            return None, "non_english"  # English-only: no advice rather than noise
         key = self._cache_key(family, state, question)
         now = self._clock()
         with self._lock:
@@ -373,21 +392,21 @@ class DecisionAdvisor:
                 self.stats.cache_hits += 1
                 if cached[1].confidence < settings.min_confidence:
                     self.stats.low_confidence += 1
-                    return None  # the floor applies to a cached answer too
-                return _replace_cached(cached[1])
+                    return None, "low_confidence"  # the floor applies to a cached answer too
+                return _replace_cached(cached[1]), "ok"
         if not budget.take():
             with self._lock:
                 self.stats.budget_exhausted += 1
-            return None
+            return None, "budget_exhausted"
         endpoint = self._endpoint_provider()
         if endpoint is None:
             with self._lock:
                 self.stats.unavailable += 1
-            return None
+            return None, "unavailable"
         with self._lock:
             if not self._breaker.allow(now):
                 self.stats.breaker_rejections += 1
-                return None
+                return None, "breaker"
             self.stats.calls += 1
             self.stats.by_family[family] = self.stats.by_family.get(family, 0) + 1
         deadline = Deadline(settings.decision_timeout_ms / 1000.0, clock=self._clock)
@@ -402,24 +421,25 @@ class DecisionAdvisor:
             )
         except DeadlineExceeded as exc:
             self._record_failure(exc, timeout=True)
-            return None
+            return None, "timeout"
         except ContextOverflow:
             # This state is too large for the running context: refuse this one
             # decision. It is not a service failure, so the breaker is untouched.
             with self._lock:
                 self._breaker.release_trial()
                 self.stats.context_overflow += 1
-            return None
+            return None, "context_overflow"
         except MissingLetters as exc:
             with self._lock:
                 self.stats.missing_letter_failures += 1
                 self.missing_letter_unhealthy = True
             self._record_failure(exc)
-            return None
+            return None, "failure"
         except (TransportError, ValueError, KeyError, TypeError, ImportError) as exc:
             # A socket timeout sized to the remaining budget is the deadline firing.
-            self._record_failure(exc, timeout=deadline.remaining() <= 0.01)
-            return None
+            timed_out = deadline.remaining() <= 0.01
+            self._record_failure(exc, timeout=timed_out)
+            return None, "timeout" if timed_out else "failure"
         with self._lock:
             self._breaker.success()
             self.stats.successes += 1
@@ -431,8 +451,8 @@ class DecisionAdvisor:
         if advice.confidence < settings.min_confidence:
             with self._lock:
                 self.stats.low_confidence += 1
-            return None
-        return advice
+            return None, "low_confidence"
+        return advice, "ok"
 
     def _record_failure(self, exc: BaseException, *, timeout: bool = False) -> None:
         with self._lock:
@@ -485,13 +505,47 @@ class DecisionAdvisor:
             "missing_retried": used is not adapter,
         }
 
+    # -- readiness -----------------------------------------------------------
+
+    @property
+    def readiness(self) -> str:
+        """Cheap, network-free state: ``disabled``/``starting``/``ready``/
+        ``unavailable``/``too_slow``/``breaker_open``.
+
+        Consumers check this before building a question so an unavailable
+        advisor costs nothing. It is a hint, never a guarantee: readiness can
+        change between the check and the call, so :meth:`decide` stays
+        fail-open either way.
+        """
+        if self.settings.policy is ServicePolicy.OFF:
+            return "disabled"
+        with self._lock:
+            if self._breaker.state == "open":
+                return "breaker_open"
+        if self._state_provider is not None:
+            try:
+                state, _detail = self._state_provider()
+            except Exception:  # noqa: BLE001 - a diagnostic must not raise
+                state = ""
+            if state in ("disabled", "starting", "unavailable", "too_slow", "idle"):
+                return "starting" if state == "idle" else state
+            if state == "ready":
+                return "ready"
+        return "ready" if self._endpoint_provider() is not None else "unavailable"
+
+    @property
+    def ready(self) -> bool:
+        return self.readiness == "ready"
+
     # -- diagnostics ---------------------------------------------------------
 
     def status(self) -> dict[str, Any]:
+        readiness = self.readiness  # takes the lock itself; never inside it
         with self._lock:
             stats = self.stats
             return {
                 "policy": self.settings.policy.value,
+                "readiness": readiness,
                 "breaker": self._breaker.state,
                 "consecutive_failures": self._breaker.consecutive_failures,
                 "missing_letter_unhealthy": self.missing_letter_unhealthy,
@@ -512,6 +566,9 @@ class DecisionAdvisor:
                     "context_overflow": stats.context_overflow,
                     "last_failure": stats.last_failure,
                     "last_latency_ms": stats.last_latency_ms,
+                    # Which subsystem actually used the advisor. Fixed, small
+                    # key set (the four decision families); never a request id.
+                    "by_family": dict(stats.by_family),
                 },
                 "limits": {
                     "decision_timeout_ms": self.settings.decision_timeout_ms,

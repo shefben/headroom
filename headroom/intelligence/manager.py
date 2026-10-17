@@ -101,8 +101,22 @@ class IntelligenceManager:
         self._stopping = threading.Event()
         self._last_start_problem = ""
         self.advisor = DecisionAdvisor(
-            self.settings, self.ready_endpoint, effective_ctx=lambda: self._n_ctx
+            self.settings,
+            self.ready_endpoint,
+            effective_ctx=lambda: self._n_ctx,
+            # Lets a consumer tell "starting" from "unavailable"/"too_slow"
+            # without any network setup (``DecisionAdvisor.readiness``).
+            state_provider=self._state_snapshot,
         )
+
+    def _state_snapshot(self) -> tuple[str, str]:
+        with self._lock:
+            return self._state, self._state_detail
+
+    @property
+    def ready(self) -> bool:
+        """Whether the advisor can answer right now (cheap, never probes)."""
+        return self.advisor.readiness == "ready"
 
     # -- state ------------------------------------------------------------------
 
@@ -499,7 +513,18 @@ class IntelligenceManager:
         self.advisor.shutdown()
 
     def health(self) -> dict[str, Any]:
-        """Cheap, non-probing status for /health."""
+        """Cheap, non-probing status for /health.
+
+        ``advisor`` carries the LIVE advisor's own counters, so
+        ``/health -> agent_runtime -> intelligence -> advisor.stats`` is proof
+        of real proxy usage (``headroom intelligence status`` runs its own
+        manager in the CLI process and its counters prove nothing about this
+        one). ``consumers`` attributes those calls to the subsystem that asked.
+        Counters only: no prompt, task text, path or user content.
+        """
+        from headroom.intelligence.policy import consumer_snapshot
+
+        advisor = self.advisor.status()
         with self._lock:
             state, detail, endpoint = self._state, self._state_detail, self._endpoint
         return {
@@ -507,7 +532,15 @@ class IntelligenceManager:
             "advisor_state": state,
             "advisor_detail": detail,
             "endpoint_type": endpoint[0] if endpoint else None,
-            "breaker": self.advisor.status()["breaker"],
+            "breaker": advisor["breaker"],
+            "ready": advisor["readiness"] == "ready",
+            "readiness": advisor["readiness"],
+            "advisor": {
+                "stats": advisor["stats"],
+                "limits": advisor["limits"],
+                "cache_entries": advisor["cache_entries"],
+            },
+            "consumers": consumer_snapshot(),
         }
 
 

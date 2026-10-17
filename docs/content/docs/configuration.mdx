@@ -534,20 +534,81 @@ naming overlap note (`HEADROOM_WORKSPACE` is *not* the same as
 
 The `wrap` intelligence stack can consult JevK5 (runtime v0.3.3, model
 `jevk5-4b-v0.3-Q8_0.gguf`) as an optional, local, English-only advisory
-classifier. It only breaks close calls: transform-arbiter finalists, ambiguous
-tool-catalog ties, the uncertain middle of effort routing, which existing task
-item a correction targets, and the order of already-safe repair suggestions.
-It never establishes facts, authorizes a file change or a command, or overrides
-the SafetyGate, scope or contract checks. When it is unavailable, slow or
-unsure, Headroom behaves exactly as without it.
+classifier. It only breaks close calls, and it never establishes facts,
+authorizes a file change or a command, or overrides the SafetyGate, Change
+Scope, Tool Contracts, protected paths or any other hard check. When it is
+unavailable, slow or unsure, Headroom behaves exactly as without it.
 
 `HEADROOM_JEVK5` is a *service policy*, not a rollout feature:
 
 | Value | Behavior |
 |-------|----------|
-| `auto` (default) | Use the advisor when it is ready. On first run, setup runs in a background thread, only when online, and never delays `wrap` or request traffic. |
+| `auto` (default) | Use the advisor when it is ready. On first run, setup runs in a background thread, only when online, and never delays `wrap` or request traffic. A request never waits for setup and never fails because the advisor is missing. |
 | `on` | Same request behavior (requests always fail open), but setup and start failures are logged as explicit warnings and shown by `headroom intelligence status`. |
-| `off` | No setup, no service start, no advisor calls. |
+| `off` | No setup, no service start, no advisor calls. Every decision is deterministic. |
+
+#### What it may advise, and on which client paths
+
+| Decision family | What it decides | When it is eligible | Claude (Anthropic) | Codex (OpenAI) |
+|---|---|---|---|---|
+| `effort_complexity` | The 0-4 complexity score that chooses how far a client-sent reasoning effort is lowered | The continuous score sits on a boundary where the routed effort changes, the thresholded and continuous signals disagree, or task state carries more open work than the turn shows | yes (`/v1/messages`) | yes (Responses and chat) |
+| `transform_arbiter` | Which safe form of a tool result is forwarded | Candidate utilities are close, the winner does not survive a small weight perturbation, components disagree, the frontier is crowded with materially different irreversible loss, or a learned prior conflicts | yes | yes |
+| `tool_catalog` | Which borderline non-core tools keep their full schema | Scores across the materialize cut are close, a cluster sits on the boundary, or the task text gave the lexical ranker nothing | **only when no tool search is active** (see below) | same |
+| `task_state_target` | Which *existing* task item a user correction replaces | Two or more live items match the correction nearly equally | yes (after the response, on the runtime worker) | yes |
+| `tool_repair_rank` | The order of already-safe repair suggestions for a refused tool call | Two or more safe repairs, nothing deterministic between them | yes (trusted `PreToolUse` boundary) | no (observe-only path never reaches it) |
+
+Effort is only ever **lowered**, never raised, and never on a new user ask, an
+error or failed retry, contradicted evidence, an open completion gate or an
+explicit request to think harder. An advisory answer that cannot change the
+routed effort (a client effort already at the floor) is never requested.
+
+`HEADROOM_JEVK5_AMBIGUITY` (default `0.5`) is the uncertainty a decision needs
+before a call is made. Lower it to consult more often, raise it to consult
+less; `1.0` is effectively "only dead ties".
+
+#### Tool search owns the tool decision
+
+Server-side Tool Search is on by default on first-party Anthropic
+(`HEADROOM_TOOL_SEARCH`), and Claude Code may defer client-side as well. When a
+request already defers, the progressive tool catalog — and with it the
+`tool_catalog` advisory — **stands down completely**. That is deliberate: two
+competing defer systems would fight, and the deferral must stay
+byte-deterministic for the tools prefix to prompt-cache, so advisory input into
+which tools stay resident is not available on that path either. It is not
+hidden: every such request increments
+`tool_catalog.bypassed_native_tool_search` and logs
+`jevk5 skipped family=tool_catalog reason=native_tool_search` at DEBUG. To make
+the catalog (and its advisory) reachable on Claude, set
+`HEADROOM_TOOL_SEARCH=0`.
+
+#### Verifying real usage
+
+The live proxy's own advisor counters are on `/health`:
+
+```powershell
+(Invoke-RestMethod http://127.0.0.1:<WRAP_PORT>/health).agent_runtime.intelligence |
+  ConvertTo-Json -Depth 20
+```
+
+`advisor.stats` carries `calls`, `cache_hits`, `successes`, `failures`,
+`timeouts`, `low_confidence`, `budget_exhausted`, `breaker_rejections`,
+`unavailable`, `non_english`, `context_overflow`, `last_latency_ms` and
+`by_family` (which subsystem used it); `advisor.limits` carries the deadline,
+the per-request call budget, the confidence floor and the blend weight;
+`consumers` carries each subsystem's `eligible` / `calls_requested` /
+`advice_applied` / `deterministic_fallback` / `budget_exhausted` and its
+`skipped` reasons. Counters only — no prompt, task text, path or user content
+is ever exposed there. `headroom intelligence status` builds its *own* manager
+in the CLI process, so its counters say nothing about the running proxy.
+
+**Zero calls during simple work is the correct outcome.** A mechanical
+continuation whose tool output carries no new symbols, no multiple files and no
+hedging is not ambiguous, so nothing is sent; so is any request whose effort is
+already at the floor, and any request on a path where tool search owns the tool
+decision. Counters move when an ambiguous decision actually appears. At most
+`HEADROOM_JEVK5_CALLS_PER_REQUEST` (4) calls are made per proxy request, shared
+by every consumer of that request, and identical questions inside the cache TTL
+are answered from the cache without a call.
 
 Commands: `headroom intelligence setup` (discover or build `llama-server`,
 install the pinned GGUF client, download and verify the model, start the
@@ -567,6 +628,7 @@ health, process ownership), and `stop`.
 | `HEADROOM_JEVK5_DECISION_TIMEOUT_MS` | Hard wall-clock deadline for a whole decision (tokenize, every completion pass, the missing-letter retry). A late result is discarded. | `1200` |
 | `HEADROOM_JEVK5_CALLS_PER_REQUEST` / `HEADROOM_JEVK5_CACHE_TTL_S` | Advisor calls per proxy request (shared by all consumers) and answer cache lifetime. | `4` / `30` |
 | `HEADROOM_JEVK5_MIN_CONFIDENCE` | Advice below this top-choice confidence is ignored. | `0.60` |
+| `HEADROOM_JEVK5_AMBIGUITY` | Decision uncertainty (0..1) a consumer needs before it may ask. Lower = consulted more often. | `0.50` |
 | `HEADROOM_JEVK5_WEIGHT` / `HEADROOM_JEVK5_WEIGHT_CAP` | Weight of the advisor in a utility blend. Never above `0.40`. | `0.25` / `0.40` |
 | `HEADROOM_JEVK5_BREAKER_FAILURES` / `HEADROOM_JEVK5_BREAKER_OPEN_S` | Consecutive failures that open the circuit breaker, and for how long. | `3` / `60` |
 

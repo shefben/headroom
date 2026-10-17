@@ -187,28 +187,54 @@ def test_feature_off_returns_none():
     assert route(body, cfg) is None and body["output_config"]["effort"] == "xhigh"
 
 
-def test_jevk5_scores_only_the_uncertain_middle(monkeypatch):
+def test_jevk5_scores_only_a_genuinely_uncertain_turn(monkeypatch):
+    """The trigger is decision uncertainty, not one arbitrary score bucket."""
     calls = []
 
     class Adv:
-        def request_budget(self, request_key=None):
-            return SimpleNamespace()
+        readiness = "ready"
 
-        def score(self, family, state, instructions, levels, *, budget):
-            calls.append(levels)
-            return SimpleNamespace(value=0.2, confidence=0.9, weight=0.25)
+        def __init__(self, pick="below"):
+            self.pick = pick
+
+        def request_budget(self, request_key=None):
+            return SimpleNamespace(remaining=4)
+
+        def choose(self, family, state, instructions, options, *, budget):
+            calls.append(sorted(options))
+            return SimpleNamespace(
+                value=self.pick, confidence=0.9, weight=0.25, latency_ms=12.0
+            )
 
     monkeypatch.setattr(
         complexity, "_snapshot_and_advisor", lambda hint: (None, Adv(), f"ws|{hint}")
     )
-    # Score 1 (only unknown requirements): deterministic, no JevK5 call.
+    # Clean mechanical continuation: no complexity evidence at all, so the
+    # deterministic answer is obviously safe and nothing is sent.
     route(mechanical(), session_key="j1")
     assert calls == []
-    # Multi-file + unknown => score 2 => JevK5 0-4 scoring decides.
-    body = mechanical(result="\n".join(f"src/pkg/mod_{i}.py: ok" for i in range(5)))
-    d = route(body, session_key="j2")
-    assert calls == [["0", "1", "2", "3", "4"]] and d.score_source == "jevk5" and d.score == 0
-    assert body["output_config"]["effort"] == "medium"
+    # Overwhelming evidence on every axis: deterministic again, far from any
+    # boundary where the routed effort changes.
+    loud = "\n".join(f"src/pkg/mod_{i}.py: new_symbol_{i} maybe_wrong_{i}" for i in range(12))
+    route(mechanical(result=loud), session_key="j2")
+    assert calls == []
+    # Two touched files and no known goal: the continuous score sits near the
+    # boundary the routed effort turns on, so JevK5 decides that one boundary.
+    body = mechanical(result="src/pkg/alpha.py: ok\nsrc/pkg/beta.py: ok")
+    d = route(body, session_key="j3")
+    assert calls == [["at_or_above", "below"]]  # the one binary choice, not a scale
+    assert d.score_source == "jevk5" and d.score == 1
+    assert body["output_config"]["effort"] == "high"
+    # The other side of the same boundary keeps the client's effort.
+    monkeypatch.setattr(
+        complexity,
+        "_snapshot_and_advisor",
+        lambda hint: (None, Adv("at_or_above"), f"ws|{hint}"),
+    )
+    body = mechanical(result="src/pkg/gamma.py: ok\nsrc/pkg/delta.py: ok")
+    d = route(body, session_key="j4")
+    assert d.score_source == "jevk5" and d.score == 2
+    assert body["output_config"]["effort"] == "xhigh"
 
 
 def test_contradicted_evidence_and_open_gate_protect(monkeypatch):

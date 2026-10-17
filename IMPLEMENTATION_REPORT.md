@@ -63,6 +63,126 @@ Wrap defaults are enabled by `headroom wrap` through `rollout.apply_wrap_feature
 
 **Phase 8 code.** `HEADROOM_TRANSFORM_HOLDOUT` is a fraction, default 0, max 0.5, read live. A scope-stable share of sessions gets exact originals. The arbiter's would-be lossy choice registers a *control* observation on the same reread/retrieval/repair/correction signals, and its savings count as forgone, never realized. Per tool family: once the treatment arm has ≥8 resolved observations and its negative rate exceeds control by 0.25 (or reaches 0.5 without control data), the arbiter admits only reversible forms for that family. The feature stays on and safe; `reinstate()` or `reset()` clears it. Control observations never move strategy priors. `/health.tool_admission.feedback` reports arms and reverted families. `headroom agent status` summarizes `/health`: effective rollout of all 14 agent features (new `/health.agent_runtime.rollout`), host-enforcing vs observe-only capabilities, trusted workspaces, the store, JevK5 state, policies, holdout and counters. `doctor` adds read-only local checks. Neither command writes state.
 
+## JevK5 utilization (Phase 9)
+
+Phase 1-8 shipped the advisor and five consumers, but a wrapped Claude session
+produced almost no inference traffic. Four root causes, all in the *gating and
+observability*, none in the advisor itself:
+
+1. **Over-gated complexity.** The effort router asked JevK5 only when the
+   thresholded 0-4 score was exactly `2` — one arbitrary bucket, not an
+   uncertainty test. Replaced by `complexity.should_consult_advisor()`: a
+   *continuous* score (`soft_score`, the same four signals read against their
+   thresholds instead of rounded through them) is compared with the boundaries
+   where `lowered_effort` actually changes its answer, restricted to the
+   boundaries that are *effective* for the client's effort
+   (`effective_boundaries`). Uncertain = inside `BOUNDARY_BAND` of such a
+   boundary, or the thresholded and continuous scores disagree across one, or
+   task state carries unsatisfied acceptance work the turn does not show. A
+   turn with no positive evidence (`MIN_EVIDENCE`), and an effort whose routed
+   value cannot move, are never asked about.
+2. **Arbiter "ambiguity" meant "no query terms."** Normal coding prompts always
+   have query terms, so the clause was dead and the only live trigger was a
+   `< 0.15` utility margin. Replaced by `arbiter.arbiter_uncertainty()`:
+   closeness of the top two utilities, rank instability under a ±20% component
+   weight perturbation, disagreement between the scoring components, frontier
+   density, irreversible-loss spread across that frontier, and a conflicting
+   learned prior. Missing task evidence is now only an amplifier of an already
+   close call (and the dispatcher computes it honestly: no query term of the
+   task *occurs in this unit*). Only SafetyGate survivors are ever considered.
+3. **Tool catalog unreachable on Claude.** Documented, not papered over — see
+   *Intentional design choices*.
+4. **No proof of life.** `IntelligenceManager.health()` exposed five fields and
+   `DecisionAdvisor.status()` dropped `by_family`, so the only visible counters
+   came from `headroom intelligence status`, which builds its own manager in
+   the CLI process and proves nothing about the proxy.
+
+**One policy.** `headroom/intelligence/policy.py` holds the shared ladder:
+`Uncertainty` (score, reasons, a hard `blocked` reason), the cheap deterministic
+primitives (`closeness`, `frontier_density`, `component_disagreement`,
+`rank_unstable`, `spread`), `should_consult()` (readiness → budget → ambiguity,
+each refusal counted and logged), `ask_*()` (one call, outcome attributed), and
+`ConsumerStats` per subsystem. `HEADROOM_JEVK5_AMBIGUITY` is the single
+threshold knob. Subsystem-specific criteria stay in the subsystem.
+
+**Readiness.** `DecisionAdvisor.readiness` is a network-free
+`disabled|starting|ready|unavailable|too_slow|breaker_open` (the manager feeds
+it the service state), with `IntelligenceManager.ready` on top. Consumers check
+it before building a question; the advisor stays fail-open regardless, because
+readiness can change between the check and the call.
+
+**Telemetry.** `/health.agent_runtime.intelligence` now carries `readiness`,
+`ready`, `advisor.stats` (every counter including `by_family`),
+`advisor.limits` and `consumers` (`eligible`, `calls_requested`,
+`advice_received`, `advice_applied`, `advice_ignored_low_confidence`,
+`deterministic_fallback`, `budget_exhausted`, `not_ready`, plus `skipped`
+reasons) for `complexity_router`, `transform_arbiter`, `tool_catalog` and
+`task_state`. `/health.agent_runtime.complexity_routing` and
+`.tool_catalog` expose the subsystem counters, the latter including
+`bypassed_native_tool_search`. Counts only: a `/health` assertion in the gate
+test fails if any prompt, task text or path appears. DEBUG adds
+`jevk5 eligible|called|applied|ignored|skipped family=... reason=...` with no
+content.
+
+**The question shape was the other half of the bug.** With the gating fixed,
+every `effort_complexity` answer was still thrown away: 29 of 29 hit the 0.60
+confidence floor. Measured against the operator's llama-server (JevK5 4B Q8_0,
+RTX A4000), the model is well calibrated — 0.86-0.999 on a question with real
+semantic content (`transform_arbiter` with two clearly different forms, a
+`tool_catalog` pick for a Sentry task, a `task_state_target` correction) and
+~0.5 on a muddy one. A five-level score over a dict of booleans is a muddy
+question *by construction*: 0.282/0.358/0.174/0.079/0.106 is a correct and
+useless answer. So the complexity family now asks the one **binary** question
+the routed effort actually turns on — which side of the single effective
+boundary this turn falls on — with a content-free sentence describing the
+turn's shape (counts only: no path, identifier, command or user text). Measured
+confidence on that question: 0.578-0.938, and the advice is applied. The
+advisor itself was left alone: the floor is correct, the question was wrong.
+
+**Every production call site, classified.**
+
+| Call site | Family | Reachable |
+|---|---|---|
+| `complexity._jev_score` ← `route_request` in the Anthropic, Responses and chat handlers | `effort_complexity` | Claude **and** Codex/OpenAI; off the event loop on all three |
+| `arbiter._jev_blend` ← `TransformArbiter.choose` ← admission dispatcher | `transform_arbiter` | both; only for a unit with ≥2 SafetyGate survivors |
+| `tool_catalog._jev_ties` ← `apply_request_catalog` | `tool_catalog` | both, **unless** tool search owns the request (the Claude default) |
+| `builtin._chooser_factory` ← `TaskStateProjector` | `task_state_target` | both; background (runtime worker, after the response), own allowance |
+| `tool_contracts._rank` ← `enforcement.host_pretool` | `tool_repair_rank` | **Claude only** (trusted pre-tool boundary); its own request to the proxy, so its own allowance. The proxy's observe-only path never reaches it. |
+
+No dead advisor call site was found; `_active_runtime()` and `runtime.advisor`
+both resolve to the advisor owned by `app.state.agent_intelligence`, which a
+gate test asserts across app recreation.
+
+**Measured (60-request synthetic Claude workload through the real Anthropic
+handler: 20 obvious continuations, 20 borderline, 10 heavy, 10 bulk).**
+
+| | |
+|---|---|
+| complexity eligible | 30 of 60 routed turns (29 skipped `no_complexity_evidence`, 1 `deterministic_margin`) |
+| advice applied | 29 of 30; 1 low-confidence rejection |
+| advisor calls / cache hits | 4 / 27 (≈87% cache hit rate; ~7 upstream calls per 100 turns) |
+| failures / timeouts | 0 / 0 |
+| by_family | `effort_complexity` 3, `tool_catalog` 1 |
+| decision latency | 140-422 ms (deadline 1200 ms) |
+| added per-request wall clock | median 12.9 ms (JevK5 off) vs 13.5-15.2 ms (on), two rounds each; p95 is identical in both arms (~6 s, bulk-result compression, not the advisor) |
+| tool catalog, `HEADROOM_TOOL_SEARCH=1` (default) | `bypassed_native_tool_search` 50/50, zero calls |
+| tool catalog, `HEADROOM_TOOL_SEARCH=0` | 1 eligible, 1 call (rejected on confidence) |
+| transform arbiter | 0 eligible, 10 × `single_candidate`: this fixture's tool results produced no second form that both passed the gate and saved billed cost. Scenario C/D are covered by unit tests, not by this workload. |
+
+A catalog question over 16 options exceeded the 1200 ms deadline on a cold
+prompt (1789 ms), so the shortlist is now `CATALOG_FINALISTS = 8` and the
+options are no longer duplicated into the decision state; the same workload
+then peaks at 665 ms.
+
+**Budget.** Unchanged by design: one `RequestBudget` per proxy request id,
+shared by every consumer. The Anthropic, Responses and chat handlers all pass
+the same `request_id`, so complexity + arbiter + catalog of one Claude request
+together stay within `calls_per_request` (4). The task-state chooser keeps its
+own allowance because it runs on the runtime worker *after* the response, which
+the gate test asserts. Fail-open paths are untouched: timeout, breaker,
+low confidence, malformed output, missing answer letter, context overflow and
+unavailable endpoint all mean "no advice".
+
 ## Files changed
 
 171 files, +57,001/−321 against `76133cff`. Main components:
@@ -214,6 +334,8 @@ serialization) plus additions to `tests/test_install/test_{runtime,planner}.py`.
 
 ### Intentional design choices
 - Phase 7 (test selection, macro promotion, authorization) is deterministic and never consults JevK5.
+- **The `tool_catalog` advisory is structurally unavailable whenever tool search owns the tool decision**, which on first-party Anthropic is the default (`HEADROOM_TOOL_SEARCH=1`) and on Claude Code can also be client-side. The catalog stands down entirely rather than defer on top of a deferral, and the server-side deferral must stay byte-deterministic for the tools prefix to prompt-cache, so JevK5 cannot pick which tools stay resident there either. This is counted (`tool_catalog.bypassed_native_tool_search`) and logged (`jevk5 skipped family=tool_catalog reason=native_tool_search`), never silently claimed as active. `HEADROOM_TOOL_SEARCH=0` makes both the catalog and its advisory reachable on Claude.
+- JevK5 may lower the routed effort but never raise it, and never past the `medium` floor; a protected turn (new ask, error, failed retry, contradicted evidence, open completion gate, explicit deep-thinking request) is not asked about at all.
 - Coverage uses existing coverage.py data only; stale or foreign data is reported as unavailable.
 - A reverted family falls back to reversible forms, not to "off". Reverts are process-local, so a restart re-measures.
 - Workflow Grep content/count output is path-ordered, because the host leaves that order unspecified. Read/search tools of hosts without a verified dialect are never generalized.

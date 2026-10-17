@@ -19,10 +19,14 @@ over from the SafetyGate ladder in the tool-admission dispatcher:
    the winner is independent of scheduling and of tool-result order.
 4. Stable tie-break: less irreversible loss, then lower net cost, then the
    original.
-5. JevK5 compares at most :data:`MAX_FINALISTS` finalists only when the task
-   is ambiguous or the top utilities are within :data:`JEV_MARGIN`; the
-   blend is ``(1-w)*utility + w*probability`` with the advisor's capped
-   weight (default .25, max .40). No advisor/advice => ``w = 0``.
+5. JevK5 compares at most :data:`MAX_FINALISTS` finalists only when
+   :func:`arbiter_uncertainty` says the decision is genuinely uncertain —
+   close utilities, a winner that does not survive a small weight
+   perturbation, components that disagree, a crowded frontier with
+   materially different irreversible loss, a conflicting learned prior (and,
+   as an amplifier only, no task evidence about this unit). The blend is
+   ``(1-w)*utility + w*probability`` with the advisor's capped weight
+   (default .25, max .40). No advisor/advice => ``w = 0``.
 
 Work is bounded per *request* (:class:`RequestLimits`), not just per block.
 Accounting keeps realized token/cost savings separate from estimated avoided
@@ -41,9 +45,24 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from headroom.agent.feedback import NEUTRAL_PRIOR, FeedbackKey, RetentionFeedback
-from headroom.log_safety import describe_exception
+from headroom.intelligence.policy import (
+    FAMILY_ARBITER,
+    Uncertainty,
+    ask_choice,
+    closeness,
+    component_disagreement,
+    consumer_stats,
+    frontier_density,
+    rank_unstable,
+    should_consult,
+    spread,
+)
+from headroom.intelligence.policy import applied as policy_applied
 
 log = logging.getLogger(__name__)
+
+#: This consumer's JevK5 counters (``/health.agent_runtime.intelligence.consumers``).
+_STATS = consumer_stats("transform_arbiter")
 
 FEATURE_ARBITER = "agent_arbiter"
 
@@ -70,6 +89,11 @@ assert abs(sum(WEIGHTS.values()) - 1.0) < 1e-9
 
 MAX_FINALISTS = 16
 JEV_MARGIN = 0.15
+#: Utility distance from the winner that still counts as "on the frontier".
+FRONTIER_BAND = 0.05
+#: Irreversible-loss difference across the frontier that makes the choice
+#: materially different rather than cosmetic.
+LOSS_SPREAD_BAND = 0.20
 LATENCY_BUDGET_MS = 50.0
 #: Selective retrieval returns at most this many tokens (indexed CCR default).
 RETRIEVAL_TOKENS_CAP = 1200
@@ -329,6 +353,76 @@ def relevance_retained(original: str, text: str, terms: Sequence[str]) -> float:
     return 0.5 + 0.5 * coverage
 
 
+def arbiter_uncertainty(
+    survivors: Sequence[CandidateRecord], ctx: ArbiterContext
+) -> Uncertainty:
+    """Whether the *transform* choice is genuinely uncertain (unified-21 #6).
+
+    Every input is a cheap number the deterministic pass already produced, and
+    only SafetyGate survivors are considered — a rejected candidate never
+    reaches this function, let alone JevK5. The absence of query terms is one
+    weak amplifier here, never a decision on its own:
+
+    * **closeness** of the top two utilities;
+    * **rank instability** — the winner changes when one component weight is
+      nudged by 20%;
+    * **component disagreement** — relevance, soft recall, recovery and
+      savings prefer different candidates;
+    * **frontier density** — how many candidates sit within
+      :data:`FRONTIER_BAND` of the winner;
+    * **irreversible-loss spread** across that frontier (materially different
+      tradeoffs, not cosmetic ones);
+    * **conflicting feedback priors** — the learned prior favours a candidate
+      the utility does not;
+    * **no task evidence** — no query term of this task occurs in the unit, so
+      relevance could not discriminate.
+    """
+    if len(survivors) < 2:
+        return Uncertainty(blocked="single_candidate")
+    finalists = list(survivors[:MAX_FINALISTS])
+    top = finalists[0].utility
+    margin = top - finalists[1].utility
+    comps = [r.components for r in finalists]
+    close = closeness(margin, JEV_MARGIN)
+    density = frontier_density([r.utility for r in finalists], FRONTIER_BAND)
+    disagreement = component_disagreement(comps, list(WEIGHTS))
+    unstable = rank_unstable(comps, WEIGHTS)
+    frontier = [r for r in finalists if top - r.utility <= FRONTIER_BAND]
+    loss = (
+        min(1.0, spread([r.irreversible_loss for r in frontier]) / LOSS_SPREAD_BAND)
+        if len(frontier) > 1
+        else 0.0
+    )
+    prior_conflict = 0.0
+    if len(frontier) > 1:
+        by_prior = max(range(len(frontier)), key=lambda i: round(frontier[i].prior, 9))
+        if by_prior != 0:
+            prior_conflict = 1.0
+    reasons: list[str] = []
+    score = 0.0
+    for name, value, weight in (
+        ("close_utilities", close, 0.40),
+        ("rank_unstable", 1.0 if unstable else 0.0, 0.20),
+        ("component_disagreement", disagreement, 0.15),
+        ("crowded_frontier", density, 0.10),
+        ("loss_tradeoff", loss, 0.08),
+        ("prior_conflict", prior_conflict, 0.07),
+    ):
+        if value > 0:
+            reasons.append(name)
+            score += weight * value
+    if ctx.ambiguous and close > 0:
+        # No task evidence about this unit: amplifies an already close call,
+        # never a trigger on its own.
+        reasons.append("no_task_evidence")
+        score += 0.10 * close
+    return Uncertainty(
+        score=min(1.0, score),
+        reasons=tuple(reasons),
+        detail={"candidates": len(survivors), "margin": round(margin, 4)},
+    )
+
+
 def confidence_bin(margin: float) -> str:
     if margin < 0.05:
         return "lt_0.05"
@@ -357,6 +451,7 @@ class _Telemetry:
         self.realized_tokens = 0
         self.realized_cost_units = 0.0
         self.estimated_avoided_turns = 0.0
+        self.jev_eligible = 0
         self.jev_calls = 0
         self.jev_applied = 0
         self.pressured = 0
@@ -388,7 +483,12 @@ class _Telemetry:
                     "units": self.holdout_units,
                     "forgone_tokens": self.holdout_forgone_tokens,
                 },
-                "jev": {"calls": self.jev_calls, "applied": self.jev_applied},
+                "jev": {
+                    "eligible": self.jev_eligible,
+                    "calls": self.jev_calls,
+                    "applied": self.jev_applied,
+                    "consumer": _STATS.snapshot(),
+                },
                 "pressured_units": self.pressured,
                 "insufficient_budget_units": self.insufficient,
                 "allocations": self.allocations,
@@ -584,7 +684,18 @@ class TransformArbiter:
         survivors.sort(key=order)
         margin = survivors[0].utility - survivors[1].utility if len(survivors) > 1 else 1.0
         jev_w, jev_conf = 0.0, None
-        if len(survivors) > 1 and (ctx.ambiguous or margin < JEV_MARGIN):
+        uncertainty = arbiter_uncertainty(survivors, ctx)
+        if should_consult(
+            FAMILY_ARBITER,
+            uncertainty,
+            advisor=ctx.advisor,
+            budget=ctx.advisor_budget,
+            stats=_STATS,
+        ):
+            with self.telemetry.lock:
+                self.telemetry.jev_eligible += 1
+            # Only SafetyGate survivors are here, so a rejected candidate is
+            # never shown to the advisor.
             finalists = survivors[:MAX_FINALISTS]
             jev_w, jev_conf = self._jev_blend(finalists, ctx, family)
             if jev_w > 0:
@@ -614,6 +725,7 @@ class TransformArbiter:
         advisor, budget = ctx.advisor, ctx.advisor_budget
         if advisor is None or budget is None:
             return 0.0, None
+        assert all(r.allowed for r in finalists)  # never show a gate-rejected form
         options = {
             f"c{i}": (
                 f"{r.kind}: {r.tokens} tokens, recall {r.soft_recall:.2f}, "
@@ -629,18 +741,16 @@ class TransformArbiter:
         }
         with self.telemetry.lock:
             self.telemetry.jev_calls += 1
-        try:
-            advice = advisor.choose(
-                "transform_arbiter",
-                state,
-                "Which form of this tool output best serves the task while keeping "
-                "every needed fact?",
-                options,
-                budget=budget,
-            )
-        except Exception as exc:  # noqa: BLE001 - advisory only
-            log.debug("arbiter advisor failed: %s", describe_exception(exc))
-            return 0.0, None
+        advice = ask_choice(
+            advisor,
+            FAMILY_ARBITER,
+            state,
+            "Which form of this tool output best serves the task while keeping "
+            "every needed fact?",
+            options,
+            budget=budget,
+            stats=_STATS,
+        )
         if advice is None:
             return 0.0, None
         w = max(0.0, min(0.40, float(getattr(advice, "weight", 0.0) or 0.0)))
@@ -652,6 +762,7 @@ class TransformArbiter:
             rec.blended = (1.0 - w) * rec.utility + w * p
         with self.telemetry.lock:
             self.telemetry.jev_applied += 1
+        policy_applied(FAMILY_ARBITER, advice, _STATS)
         return w, float(getattr(advice, "confidence", 0.0) or 0.0)
 
     def _record(

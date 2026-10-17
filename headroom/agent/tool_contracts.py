@@ -65,9 +65,21 @@ from headroom.agent.change_scope import (
     split_command,
 )
 from headroom.agent.events import EventEnvelope, EventKind, Origin, make_event
+from headroom.intelligence.policy import (
+    Uncertainty,
+    ask_choice,
+    consumer_stats,
+    should_consult,
+)
+from headroom.intelligence.policy import applied as policy_applied
 from headroom.log_safety import describe_exception
 
 log = logging.getLogger(__name__)
+
+#: Repair-order advisory: Claude's trusted pre-tool boundary only, never the
+#: proxy's observe-only path (``/health`` consumers).
+FAMILY_REPAIR_RANK = "tool_repair_rank"
+_REPAIR_STATS = consumer_stats("tool_repair_rank")
 
 FEATURE_TOOL_CONTRACTS = "agent_tool_contracts"
 SCHEMA_VERSION = 1
@@ -1208,28 +1220,54 @@ class ToolContractValidator:
         return DecisionKind.ALLOW, "contract.ok"
 
     def _rank(self, repairs: list[str], tool_name: str, args: Mapping[str, Any]) -> list[str]:
-        """JevK5 may reorder already-safe repairs; it can never add one."""
+        """JevK5 may reorder already-safe repairs; it can never add one.
+
+        Reached only from the trusted host pre-tool boundary
+        (:func:`headroom.agent.enforcement.host_pretool`), which is its own
+        request to the proxy rather than a step inside a ``/v1/messages``
+        request, so it legitimately takes its own allowance. The proxy's
+        observe-only path never reaches here. Ambiguity is structural: it is
+        asked only when two or more *already safe* repairs are on offer and
+        nothing deterministic separates them.
+        """
         unique = list(dict.fromkeys(repairs))
         runtime = self.runtime
         advisor = getattr(runtime, "advisor", None) if runtime is not None else None
-        if len(unique) < 2 or advisor is None:
+        if len(unique) < 2:
             return unique
         options = {f"r{i}": r[:200] for i, r in enumerate(unique[:8])}
-        try:
-            advice = advisor.choose(
-                "tool_repair_rank",
-                {"tool": tool_name, "call": str(dict(args))[:400], "options": options},
-                "Which suggested replacement most likely matches what the call intended?",
-                options,
-                budget=advisor.request_budget(),
-            )
-        except Exception as exc:  # noqa: BLE001 - advisory only
-            log.debug("repair ranking advisor failed: %s", describe_exception(exc))
+        budget = None
+        if advisor is not None:
+            try:
+                budget = advisor.request_budget()
+            except Exception as exc:  # noqa: BLE001 - advisory only
+                log.debug("repair ranking advisor budget failed: %s", describe_exception(exc))
+                return unique
+        if not should_consult(
+            FAMILY_REPAIR_RANK,
+            Uncertainty(score=1.0, reasons=("tied_repairs",), detail={"options": len(options)}),
+            advisor=advisor,
+            budget=budget,
+            stats=_REPAIR_STATS,
+        ):
             return unique
+        advice = ask_choice(
+            advisor,
+            FAMILY_REPAIR_RANK,
+            {"tool": tool_name, "call": str(dict(args))[:400], "options": options},
+            "Which suggested replacement most likely matches what the call intended?",
+            options,
+            budget=budget,
+            stats=_REPAIR_STATS,
+        )
         if advice is None or str(advice.value) not in options:
+            if advice is not None:
+                _REPAIR_STATS.skipped("unknown_option")
+                _REPAIR_STATS.bump("deterministic_fallback")
             return unique
         chosen = unique[int(str(advice.value)[1:])]
         self._bump("jevk5_ranked")
+        policy_applied(FAMILY_REPAIR_RANK, advice, _REPAIR_STATS)
         return [chosen] + [r for r in unique if r != chosen]
 
     # -- revisions / state ---------------------------------------------------
