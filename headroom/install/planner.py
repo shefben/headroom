@@ -151,6 +151,7 @@ def build_manifest(
     proxy_mode: str,
     memory_enabled: bool,
     telemetry_enabled: bool,
+    learn_enabled: bool = False,
     image: str,
     no_rate_limit: bool = False,
     no_http2: bool = False,
@@ -185,6 +186,13 @@ def build_manifest(
     else:
         supervisor_kind = SupervisorKind.NONE.value
 
+    # The traffic learner stores what it extracts through the memory backend, so
+    # `--learn` without `--memory` would start a learner with nowhere to write.
+    # The proxy CLI already implies one from the other (cli/proxy.py); keep the
+    # manifest consistent with it rather than persisting a combination the
+    # runtime would silently have to repair at every start.
+    effective_memory = memory_enabled or learn_enabled
+
     resolved_targets = resolve_targets(provider_mode, targets, scope=scope)
     tool_envs = build_tool_envs(port, backend, resolved_targets)
     base_env = {
@@ -204,7 +212,7 @@ def build_manifest(
     # Telemetry is opt-in (off by default). Write the value explicitly so the
     # generated manifest is unambiguous and doesn't depend on the runtime default.
     base_env["HEADROOM_TELEMETRY"] = "on" if telemetry_enabled else "off"
-    if memory_enabled:
+    if effective_memory:
         base_env["HEADROOM_MEMORY_ENABLED"] = "1"
     # Grok / Grok Build need proxy upstream = xAI. Only auto-set when no other
     # OpenAI-compatible tools share this proxy (those may need api.openai.com /
@@ -268,7 +276,7 @@ def build_manifest(
     # (see: https://github.com/headroomlabs-ai/headroom/issues/1350)
     if no_rate_limit:
         proxy_args.append("--no-rate-limit")
-    if memory_enabled:
+    if effective_memory:
         proxy_args.append("--memory")
         # `_paths.memory_db_path()` resolves against the HOST home. A container
         # runtime cannot use it: the container's HOME is /tmp/headroom-home and
@@ -282,6 +290,8 @@ def build_manifest(
         # runtime the resolved host path is correct, so keep passing it.
         if runtime_kind != RuntimeKind.DOCKER.value:
             proxy_args.extend(["--memory-db-path", str(_paths.memory_db_path())])
+    if learn_enabled:
+        proxy_args.append("--learn")
     if anyllm_provider:
         proxy_args.extend(["--anyllm-provider", anyllm_provider])
     if region:
@@ -315,7 +325,8 @@ def build_manifest(
         anyllm_provider=anyllm_provider,
         region=region,
         proxy_mode=proxy_mode,
-        memory_enabled=memory_enabled,
+        memory_enabled=effective_memory,
+        learn_enabled=learn_enabled,
         memory_db_path=str(_paths.memory_db_path()),
         telemetry_enabled=telemetry_enabled,
         image=image,

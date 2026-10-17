@@ -469,3 +469,46 @@ def test_detect_targets_finds_antigravity_config_dir(monkeypatch, tmp_path) -> N
     from headroom.install.planner import detect_targets
 
     assert ToolTarget.ANTIGRAVITY.value in detect_targets()
+
+
+def test_build_manifest_omits_learn_by_default() -> None:
+    """Manifests written before `learn_enabled` existed must keep their meaning."""
+    manifest = build_manifest(**_base_manifest_kwargs())
+
+    assert manifest.learn_enabled is False
+    assert "--learn" not in manifest.proxy_args
+
+
+def test_build_manifest_persists_learn_for_the_runtime() -> None:
+    """A deployment can declare traffic learning, so a restart can supply it.
+
+    `headroom wrap --learn` against a shared persistent proxy used to have no
+    way to be satisfied: the capability was not expressible in a manifest, so
+    wrap fell through to killing the proxy and rebinding the deployment's port.
+    """
+    manifest = build_manifest(**_base_manifest_kwargs(learn_enabled=True))
+
+    assert manifest.learn_enabled is True
+    assert "--learn" in manifest.proxy_args
+
+
+def test_build_manifest_learn_implies_memory() -> None:
+    """The learner writes through the memory backend, so it cannot stand alone."""
+    manifest = build_manifest(**_base_manifest_kwargs(memory_enabled=False, learn_enabled=True))
+
+    assert manifest.memory_enabled is True
+    assert "--memory" in manifest.proxy_args
+    assert manifest.base_env["HEADROOM_MEMORY_ENABLED"] == "1"
+
+
+def test_build_manifest_has_no_code_graph_capability() -> None:
+    """`--code-graph` is session-scoped and must never become a deployment flag.
+
+    The watcher indexes the proxy process's own cwd, so a shared runtime would
+    index the supervisor's directory while claiming to serve the caller's
+    project. wrap answers that request with a dedicated proxy instead.
+    """
+    manifest = build_manifest(**_base_manifest_kwargs())
+
+    assert not hasattr(manifest, "code_graph_enabled")
+    assert "--code-graph" not in manifest.proxy_args

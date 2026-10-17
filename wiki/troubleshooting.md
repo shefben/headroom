@@ -44,6 +44,57 @@ ps aux | grep headroom
 sudo pfctl -s rules | grep 8787
 ```
 
+### "Persistent deployment 'default' on port 8787 is not healthy"
+
+**Symptom**: a second `headroom wrap` fails while the first is still running,
+usually right after:
+
+```
+Warning: task-based deployment 'default' cannot be auto-recovered via wrap
+Error: Persistent deployment 'default' on port 8787 is not healthy.
+```
+
+**Cause (fixed)**: `wrap` conflated "a Headroom proxy is listening on 8787" with
+"the persistent deployment owns that proxy". A wrap requesting a capability the
+deployment lacked (`--learn`, `--code-graph`) killed the proxy on the reserved
+port and started an ordinary wrap-owned one there, so the deployment's PID file
+then named a dead process while a live proxy served the port. The next wrap
+could neither recover the deployment (a task deployment is the scheduler's to
+start) nor reuse what was there, and raised.
+
+`wrap` now classifies the port — owned and healthy, owned but starting, owned
+but unhealthy, a Headroom proxy that is *not* deployment-owned, a foreign
+listener, or free — and never kills or rebinds a port a deployment still owns.
+Concurrent wraps share the deployment's proxy when the configuration is
+compatible, and get their own proxy on a free port when it is not.
+
+**If you are still on an older build**, work around it with either:
+
+```bash
+# Share the deployment's proxy and let it keep its own configuration
+headroom wrap claude --no-proxy
+
+# Or give this session its own proxy on another port
+headroom wrap claude --port 8788 --memory --learn --code-graph
+```
+
+**Notes on capabilities when sharing a persistent deployment**:
+
+- `--memory` and `--learn` are deployment capabilities. Install them once with
+  `headroom install apply --memory --learn` and every wrap can share one proxy.
+  `--learn` implies `--memory` (the learner writes through the memory backend).
+- `--code-graph` is session-scoped: the watcher indexes the *proxy process's*
+  working directory, so a shared proxy cannot serve it for another project. A
+  wrap that asks for it gets a dedicated proxy on a free port. That is expected,
+  not a failure.
+
+Check who owns what with:
+
+```bash
+headroom install status            # the deployment's own view
+curl -s localhost:8787/health      # what the listener actually reports
+```
+
 ### "Upstream rejects a beta token the client no longer sends"
 
 **Symptom**: The upstream API returns an error referencing a beta feature (`anthropic-beta` header) even though the client is no longer sending that header.

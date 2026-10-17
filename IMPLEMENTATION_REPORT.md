@@ -156,6 +156,60 @@ The cost is about +235 ms of local latency per advised unit. A 10-fixture offlin
 - **Host hooks:** `wrap claude` passes them through `--settings` and edits no file. `--project-settings` writes them under the lock and they are removed on the last session or by `unwrap`. User `--settings` win.
 - **Restore / rollback:** disable features as above, or check out `backup/main-pre-unified21`. Inspect with `headroom agent status|doctor` and `headroom intelligence status|doctor`.
 
+## Follow-up: concurrent wrap vs task-managed persistent deployments
+
+Reported live on Windows (where `install` downgrades `persistent-service` to
+`persistent-task`, planner.py #2552) with a `default` deployment on 8787: a
+second `headroom wrap claude --1m --dangerously-skip-permissions --memory
+--learn --code-graph` failed with `task-based deployment 'default' cannot be
+auto-recovered via wrap` followed by `Persistent deployment 'default' on port
+8787 is not healthy.`
+
+**Root cause.** `wrap` asked only "is the deployment ready?" and had no state
+for "a Headroom proxy is serving this port but the deployment does not own it".
+Two defects followed from that:
+
+1. The healthy-deployment branch treated a *capability* shortfall as a reason to
+   fall through to the ephemeral restart path, which kills the PID the running
+   proxy reports and rebinds the port with a wrap-owned proxy. On a task
+   deployment this destroyed task ownership: the PID file then named a dead
+   process while a live proxy held 8787. `--learn` and `--code-graph` were not
+   expressible in a manifest at all, so *every* wrap carrying them took this
+   path. (`tests/test_cli/test_wrap_persistent.py` previously asserted this
+   kill as correct behaviour.)
+2. Once ownership was broken, `runtime_ready` was False while a proxy answered.
+   `_recover_persistent_proxy` declined (task deployments are the scheduler's to
+   start) and the next branch raised unconditionally — without ever asking
+   whether the live listener could serve the session.
+
+**Fix.** `runtime_claim` (install/runtime.py) reports whether a deployment still
+holds a live runtime process, separately from whether it is *ready*;
+`unverified` (Windows with neither psutil nor argv markers) counts as owned, so
+an unprovable claim is never grounds for taking the port. `_persistent_port_state`
+(cli/wrap.py) classifies the port as deployment-healthy / -starting / -unhealthy,
+unowned-headroom, foreign, or free, and each state has a defined action. wrap
+never kills or rebinds a port a deployment still owns, never rewrites its
+ownership state, and never fails the session: it shares a listener whose routing
+and capabilities match, and otherwise starts a dedicated proxy one port up.
+A capability shortfall is reconciled through the deployment's own lifecycle only
+when the manifest declares the capability (so the restart can actually supply
+it) and nothing else is attached; otherwise the session gets its own proxy.
+
+**Capability classification.** `learn` became a manifest capability
+(`learn_enabled`, `install apply --learn`, implying `--memory` as the proxy CLI
+does) because the learner is user/agent-scoped and writes through the memory
+backend. `code_graph` did **not**: `CodeGraphWatcher(project_dir=Path.cwd())`
+binds to the proxy process's own working directory, so a shared runtime would
+index the supervisor's directory while reporting success. It is classified
+session-scoped and always answered with a dedicated proxy.
+
+Files: `headroom/cli/wrap.py`, `headroom/install/{runtime,planner,models}.py`,
+`headroom/cli/install.py`, `wiki/troubleshooting.md`. Tests:
+`tests/test_cli/test_wrap_concurrent_persistent.py` (new, 18 cases covering the
+reported command run twice, concurrent reuse, stale PID beside a live proxy,
+unverifiable identity, an `ensure` race, routing strictness and start-lock
+serialization) plus additions to `tests/test_install/test_{runtime,planner}.py`.
+
 ## Open issues
 
 ### Intentional design choices

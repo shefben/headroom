@@ -35,7 +35,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
-from collections.abc import Callable, Mapping, MutableMapping
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
@@ -4943,6 +4943,184 @@ def _find_persistent_manifest(port: int) -> Any:
     return manifests[0] if manifests else None
 
 
+# --- persistent deployment port ownership -----------------------------------
+#
+# "A Headroom proxy is listening on 8787" and "the persistent deployment named
+# by the manifest owns the thing listening on 8787" are different facts.
+# Conflating them produced the contradictory pair
+#
+#   Warning: task-based deployment 'default' cannot be auto-recovered via wrap
+#   Error: Persistent deployment 'default' on port 8787 is not healthy.
+#
+# with no way forward: a perfectly usable proxy was serving the port while wrap
+# insisted the deployment behind it was broken, because the only question it
+# asked was "is the deployment ready?" and the only fallback was to raise. These
+# states keep the two facts apart so every combination has a defined action.
+PERSISTENT_PORT_FREE = "free"
+PERSISTENT_PORT_DEPLOYMENT_HEALTHY = "deployment-healthy"
+PERSISTENT_PORT_DEPLOYMENT_STARTING = "deployment-starting"
+PERSISTENT_PORT_DEPLOYMENT_UNHEALTHY = "deployment-unhealthy"
+PERSISTENT_PORT_UNOWNED_HEADROOM = "unowned-headroom"
+PERSISTENT_PORT_FOREIGN = "foreign-listener"
+
+# States in which a live process still holds the deployment's claim. In all of
+# them wrap must leave the process alone, leave the deployment's ownership
+# state alone, and treat the port as reserved rather than bind it.
+_PERSISTENT_PORT_DEPLOYMENT_OWNED = frozenset(
+    {
+        PERSISTENT_PORT_DEPLOYMENT_HEALTHY,
+        PERSISTENT_PORT_DEPLOYMENT_STARTING,
+        PERSISTENT_PORT_DEPLOYMENT_UNHEALTHY,
+    }
+)
+
+# Capabilities a *shared* proxy can never provide on behalf of another session.
+# `--code-graph` constructs CodeGraphWatcher(project_dir=Path.cwd()) inside the
+# proxy process (proxy/server.py), so the tree it indexes is whichever directory
+# that proxy was launched from: a supervisor's working directory for a
+# persistent deployment, or a different checkout for a proxy started by another
+# wrap. Restarting a shared proxy with the flag would index the wrong project
+# while reporting success, so a wrap that needs it gets its own proxy instead of
+# a faked one.
+_SESSION_SCOPED_PROXY_CAPABILITIES = frozenset({"code_graph"})
+
+# Capabilities a persistent deployment can express, mapped to the manifest field
+# that says so. A restart can only deliver what the manifest already declares:
+# restarting to "add" anything else completes successfully and changes nothing,
+# which is how the previous code could restart a deployment and still find the
+# capability missing on the next look.
+_MANIFEST_CAPABILITY_FIELDS = {
+    "memory": "memory_enabled",
+    "learn": "learn_enabled",
+}
+
+
+def _persistent_port_state(manifest: Any, port: int) -> str:
+    """Classify who holds ``port`` relative to ``manifest``.
+
+    One of the ``PERSISTENT_PORT_*`` constants. ``runtime_ready`` answers only
+    "is the deployment serving?"; this additionally distinguishes a deployment
+    that still owns a live runtime (starting, or wedged) from one whose claim is
+    gone, and a compatible Headroom listener wrap may be able to share from a
+    foreign service it must never touch.
+    """
+    helpers = _live_wrap_module()
+    from headroom.install.runtime import RUNTIME_CLAIM_RELEASED, runtime_claim, runtime_ready
+
+    listening = helpers._check_proxy(port)
+    if listening and helpers._foreign_listener(port):
+        return PERSISTENT_PORT_FOREIGN
+    if runtime_ready(manifest):
+        return PERSISTENT_PORT_DEPLOYMENT_HEALTHY
+    # Identity is what makes a claim checkable. A manifest without the runtime
+    # contract (test doubles, old third-party callers) cannot be matched against
+    # a live process, so it holds no claim we can honour — same guard
+    # `runtime_ready` applies before it consults `runtime_status`.
+    if not hasattr(manifest, "runtime_kind"):
+        return PERSISTENT_PORT_UNOWNED_HEADROOM if listening else PERSISTENT_PORT_FREE
+    if runtime_claim(manifest) != RUNTIME_CLAIM_RELEASED:
+        # A live runtime process holds the claim: either still starting, or
+        # serving nothing. The port is not ours to take in either case.
+        return (
+            PERSISTENT_PORT_DEPLOYMENT_STARTING
+            if listening
+            else PERSISTENT_PORT_DEPLOYMENT_UNHEALTHY
+        )
+    return PERSISTENT_PORT_UNOWNED_HEADROOM if listening else PERSISTENT_PORT_FREE
+
+
+def _missing_proxy_capabilities(
+    running_config: Mapping[str, Any],
+    *,
+    memory: bool,
+    learn: bool,
+    code_graph: bool,
+) -> list[str]:
+    """Requested capabilities the running proxy does not report."""
+    missing = []
+    if memory and not running_config.get("memory"):
+        missing.append("memory")
+    if learn and not running_config.get("learn"):
+        missing.append("learn")
+    if code_graph and not running_config.get("code_graph"):
+        missing.append("code_graph")
+    return missing
+
+
+def _capability_flags(capabilities: Sequence[str]) -> str:
+    """Render capability names as the wrap flags a user typed."""
+    return ", ".join(f"--{name.replace('_', '-')}" for name in capabilities)
+
+
+def _manifest_declares_capability(manifest: Any, capability: str) -> bool:
+    """Whether restarting ``manifest`` could actually supply ``capability``."""
+    field = _MANIFEST_CAPABILITY_FIELDS.get(capability)
+    if field is None:
+        return False
+    return bool(getattr(manifest, field, False))
+
+
+def _deployment_is_task_managed(manifest: Any) -> bool:
+    """Whether a scheduler, not wrap, owns this deployment's start/stop."""
+    from headroom.install.models import SupervisorKind
+
+    return getattr(manifest, "supervisor_kind", None) == SupervisorKind.TASK.value
+
+
+def _deployment_restart_blocked_reason(
+    manifest: Any, port: int, health_payload: dict[str, Any] | None
+) -> str | None:
+    """Why wrap must not restart this deployment now, or ``None`` when it may."""
+    helpers = _live_wrap_module()
+    if helpers._deployment_is_task_managed(manifest):
+        # The scheduler owns start/stop for a task deployment. A wrap-driven
+        # restart would leave the runtime it spawned outside the task's
+        # ownership — the state this whole module exists to avoid.
+        return "it is task-managed"
+    attached = helpers._live_proxy_clients(port, exclude_self=True)
+    if attached:
+        return f"{len(attached)} other wrapper(s) are attached"
+    sessions = helpers._proxy_active_session_count(health_payload)
+    if sessions > 0:
+        return f"{sessions} active session(s) are attached"
+    return None
+
+
+def _persistent_capability_action(
+    manifest: Any,
+    port: int,
+    missing: Sequence[str],
+    health_payload: dict[str, Any] | None,
+) -> tuple[str, str]:
+    """Decide what to do about a capability shortfall on a shared proxy.
+
+    Returns ``(action, reason)`` where action is ``"reuse"`` (nothing missing),
+    ``"reconcile"`` (restart the deployment through its own lifecycle, which can
+    genuinely supply the capability) or ``"dedicate"`` (leave the deployment
+    untouched and serve this session from another port). ``reason`` explains a
+    ``"dedicate"`` verdict for the user.
+    """
+    if not missing:
+        return "reuse", ""
+    session_scoped = [name for name in missing if name in _SESSION_SCOPED_PROXY_CAPABILITIES]
+    if session_scoped:
+        return "dedicate", (
+            f"{_capability_flags(session_scoped)} "
+            f"{'is' if len(session_scoped) == 1 else 'are'} specific to this session's "
+            "project directory and cannot be served by a shared proxy"
+        )
+    undeclared = [name for name in missing if not _manifest_declares_capability(manifest, name)]
+    if undeclared:
+        return "dedicate", (
+            f"the deployment does not declare {_capability_flags(undeclared)}, so "
+            f"restarting it would not add {'it' if len(undeclared) == 1 else 'them'}"
+        )
+    blocked = _deployment_restart_blocked_reason(manifest, port, health_payload)
+    if blocked:
+        return "dedicate", f"it cannot be restarted here because {blocked}"
+    return "reconcile", ""
+
+
 def _recover_persistent_proxy(port: int) -> bool:
     """Start or recover a matching persistent deployment for the requested port."""
     from headroom.install.models import SupervisorKind
@@ -5164,11 +5342,17 @@ def _ensure_proxy_unlocked(
         vertex_api_url=vertex_api_url,
         clear_vertex_api_url=clear_vertex_api_url,
     )
-    # Set True when the proxy on the requested port belongs to a persistent
-    # deployment whose routing config does not match this wrap: the deployment
-    # owns the port and must not be reused, killed, or restarted from the
-    # shared ephemeral path; the wrap starts a dedicated proxy elsewhere.
-    persistent_routing_mismatch = False
+    # Set True when the proxy on the requested port cannot serve this wrap and
+    # must not be reused, killed, or restarted from the shared ephemeral path —
+    # incompatible routing, an unverifiable config, or a capability shortfall
+    # that restarting the deployment could not fix. The wrap then starts a
+    # dedicated proxy beside it instead.
+    persistent_proxy_unusable = False
+    # Set True when a persistent deployment still owns the requested port, so
+    # the port search must skip it rather than bind it. Distinct from the flag
+    # above: a deployment that is merely starting owns its port while nothing
+    # answers on it yet.
+    persistent_port_reserved = False
     # --no-proxy reuses an already-running proxy, so backend/region/provider
     # flags (which only apply when we start one) would be silently dropped.
     if no_proxy and (backend or anyllm_provider or region):
@@ -5200,29 +5384,34 @@ def _ensure_proxy_unlocked(
             )
             manifest = None
         if not isolated_copilot_subscription_proxy and manifest is not None:
-            from headroom.install.runtime import runtime_ready
-
-            if runtime_ready(manifest):
-                health_payload = helpers._query_proxy_health(port)
-                running_config = helpers._proxy_health_config(health_payload)
-                if running_config is None:
-                    running_config = helpers._query_proxy_config(port)
-                routing_mismatches = (
-                    None
-                    if running_config is None
-                    else helpers._proxy_routing_mismatches(
-                        running_config,
-                        backend=requested_backend,
-                        requested_api_urls=requested_api_urls,
-                    )
+            port_state = helpers._persistent_port_state(manifest, port)
+            # Every "deployment-*" state means a live runtime still holds the
+            # deployment's claim, so its port stays reserved even when nothing
+            # answers on it yet: binding it would park a wrap-owned proxy on the
+            # port the supervisor (or Task Scheduler) is about to bind.
+            persistent_port_reserved = port_state in helpers._PERSISTENT_PORT_DEPLOYMENT_OWNED
+            health_payload = helpers._query_proxy_health(port)
+            running_config = helpers._proxy_health_config(health_payload)
+            if running_config is None:
+                running_config = helpers._query_proxy_config(port)
+            routing_mismatches = (
+                None
+                if running_config is None
+                else helpers._proxy_routing_mismatches(
+                    running_config,
+                    backend=requested_backend,
+                    requested_api_urls=requested_api_urls,
                 )
+            )
+
+            if port_state == helpers.PERSISTENT_PORT_DEPLOYMENT_HEALTHY:
                 if running_config is None:
                     click.echo(
                         f"  Persistent deployment '{manifest.profile}' on port {port} "
                         "did not expose routing config; starting a dedicated proxy "
                         "on a different port instead."
                     )
-                    persistent_routing_mismatch = True
+                    persistent_proxy_unusable = True
                 elif routing_mismatches:
                     keys_str = ", ".join(routing_mismatches)
                     click.echo(
@@ -5230,24 +5419,24 @@ def _ensure_proxy_unlocked(
                         f"has incompatible routing config ({keys_str}); "
                         "starting a dedicated proxy on a different port instead."
                     )
-                    persistent_routing_mismatch = True
+                    persistent_proxy_unusable = True
                 elif helpers._proxy_needs_version_restart(health_payload):
                     running_version = helpers._proxy_version(health_payload) or "unknown"
-                    active_sessions = helpers._proxy_active_session_count(health_payload)
-                    other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
-                    if active_sessions > 0 or other_wrappers:
-                        detail = (
-                            f"{active_sessions} active session(s)"
-                            if active_sessions > 0
-                            else f"{len(other_wrappers)} attached wrapper(s)"
-                        )
+                    blocked = helpers._deployment_restart_blocked_reason(
+                        manifest, port, health_payload
+                    )
+                    click.echo(
+                        f"  Proxy on port {port} is running Headroom {running_version}; "
+                        f"current CLI is {_HEADROOM_VERSION}."
+                    )
+                    if blocked is not None:
+                        # A stale build still routes correctly and still has the
+                        # capabilities this session asked for, so upgrading it is
+                        # a nicety rather than a correctness requirement: share it
+                        # instead of disturbing whoever owns it.
                         click.echo(
-                            f"  Proxy on port {port} is running Headroom {running_version}; "
-                            f"current CLI is {_HEADROOM_VERSION}."
-                        )
-                        click.echo(
-                            f"  Leaving it running because {detail} "
-                            "are still attached; it will be restarted when idle."
+                            f"  Leaving it running because {blocked}; "
+                            "it will be restarted when idle."
                         )
                         _warn_proxy_mode_mismatch(running_config)
                         return None, port
@@ -5255,27 +5444,106 @@ def _ensure_proxy_unlocked(
                         # Restarted from the manifest, whose mode need not be ours.
                         _warn_proxy_mode_mismatch(helpers._query_proxy_config(port))
                         return None, port
-                    raise click.ClickException(
-                        f"Persistent deployment '{manifest.profile}' on port {port} "
-                        f"is running stale Headroom {running_version} and could not be restarted."
+                    click.echo(
+                        f"  Warning: persistent deployment '{manifest.profile}' on port "
+                        f"{port} is running stale Headroom {running_version} and could "
+                        "not be restarted; starting a dedicated proxy on a different "
+                        "port instead."
                     )
+                    persistent_proxy_unusable = True
                 else:
-                    # Check if the running proxy has the features we need.
-                    missing = []
-                    if memory and not running_config.get("memory"):
-                        missing.append("memory")
-                    if learn and not running_config.get("learn"):
-                        missing.append("learn")
-                    if code_graph and not running_config.get("code_graph"):
-                        missing.append("code_graph")
-                    if not missing:
+                    missing = helpers._missing_proxy_capabilities(
+                        running_config, memory=memory, learn=learn, code_graph=code_graph
+                    )
+                    action, reason = helpers._persistent_capability_action(
+                        manifest, port, missing, health_payload
+                    )
+                    if action == "reuse":
                         click.echo(_proxy_status_line("Proxy already running", port))
                         _warn_proxy_mode_mismatch(running_config)
                         return None, port
-                # Features mismatch or config unavailable — fall through to the
-                # non-persistent path which handles proxy restart. A routing
-                # mismatch skips that path entirely (see flag above).
-            else:
+                    flags_str = helpers._capability_flags(missing)
+                    if action == "reconcile":
+                        click.echo(
+                            f"  Persistent deployment '{manifest.profile}' on port {port} "
+                            f"is missing: {flags_str}; restarting it through its own "
+                            "lifecycle..."
+                        )
+                        if helpers._restart_persistent_proxy(manifest, port):
+                            _warn_proxy_mode_mismatch(helpers._query_proxy_config(port))
+                            return None, port
+                        click.echo(
+                            f"  Warning: persistent deployment '{manifest.profile}' could "
+                            "not be restarted; starting a dedicated proxy on a different "
+                            "port instead."
+                        )
+                    else:
+                        click.echo(
+                            f"  Persistent deployment '{manifest.profile}' on port {port} "
+                            f"is missing: {flags_str}, but {reason}."
+                        )
+                        click.echo(
+                            "  Leaving the deployment untouched; starting a dedicated "
+                            "proxy for this session instead."
+                        )
+                    persistent_proxy_unusable = True
+
+            elif port_state in (
+                helpers.PERSISTENT_PORT_DEPLOYMENT_STARTING,
+                helpers.PERSISTENT_PORT_DEPLOYMENT_UNHEALTHY,
+                helpers.PERSISTENT_PORT_UNOWNED_HEADROOM,
+            ):
+                # The deployment is not serving this port -- not yet, or not any
+                # more. Whatever holds it, wrap neither kills it nor rewrites the
+                # deployment's ownership state, and it never fails the session:
+                # share the listener when it is provably compatible, else run
+                # beside it. This is the branch that used to raise
+                # "Persistent deployment ... is not healthy" with no way out.
+                deployment_owned = port_state in helpers._PERSISTENT_PORT_DEPLOYMENT_OWNED
+                missing = (
+                    None
+                    if running_config is None
+                    else helpers._missing_proxy_capabilities(
+                        running_config, memory=memory, learn=learn, code_graph=code_graph
+                    )
+                )
+                if running_config is not None and not routing_mismatches and not missing:
+                    click.echo(
+                        f"  Port {port} is served by a Headroom proxy that deployment "
+                        f"'{manifest.profile}' does not currently own; its config matches "
+                        "this session, so reusing it."
+                    )
+                    _warn_proxy_mode_mismatch(running_config)
+                    return None, port
+                if deployment_owned:
+                    click.echo(
+                        f"  Persistent deployment '{manifest.profile}' holds port {port} "
+                        "but is not serving this session's configuration; starting a "
+                        "dedicated proxy on a different port instead."
+                    )
+                elif helpers._check_proxy(port):
+                    if routing_mismatches:
+                        detail = f"its routing is incompatible ({', '.join(routing_mismatches)})"
+                    elif missing:
+                        detail = f"it is missing: {helpers._capability_flags(missing)}"
+                    else:
+                        detail = "its config could not be verified"
+                    click.echo(
+                        f"  Port {port} is served by a Headroom proxy that deployment "
+                        f"'{manifest.profile}' does not own, and {detail}."
+                    )
+                    click.echo(
+                        "  Leaving it and the deployment's ownership state untouched; "
+                        "starting a dedicated proxy on a different port instead."
+                    )
+                else:
+                    click.echo(
+                        f"  Persistent deployment '{manifest.profile}' is not serving "
+                        f"port {port}; starting a dedicated proxy on a different port."
+                    )
+                persistent_proxy_unusable = True
+
+            else:  # PERSISTENT_PORT_FREE -- nothing holds the port
                 if helpers._recover_persistent_proxy(port):
                     if not helpers._check_proxy(port):
                         return None, port
@@ -5291,7 +5559,7 @@ def _ensure_proxy_unlocked(
                             "did not expose routing config; starting a dedicated proxy "
                             "on a different port instead."
                         )
-                        persistent_routing_mismatch = True
+                        persistent_proxy_unusable = True
                     else:
                         routing_mismatches = helpers._proxy_routing_mismatches(
                             running_config,
@@ -5305,48 +5573,76 @@ def _ensure_proxy_unlocked(
                                 f"has incompatible routing config ({keys_str}); "
                                 "starting a dedicated proxy on a different port instead."
                             )
-                            persistent_routing_mismatch = True
+                            persistent_proxy_unusable = True
                         else:
-                            missing = []
-                            if memory and not running_config.get("memory"):
-                                missing.append("memory")
-                            if learn and not running_config.get("learn"):
-                                missing.append("learn")
-                            if code_graph and not running_config.get("code_graph"):
-                                missing.append("code-graph")
-
-                            if not missing:
+                            missing = helpers._missing_proxy_capabilities(
+                                running_config,
+                                memory=memory,
+                                learn=learn,
+                                code_graph=code_graph,
+                            )
+                            action, reason = helpers._persistent_capability_action(
+                                manifest, port, missing, health_payload
+                            )
+                            if action == "reuse":
                                 _warn_proxy_mode_mismatch(running_config)
                                 return None, port
-                            flags_str = ", ".join(f"--{f}" for f in missing)
-                            click.echo(
-                                f"  Recovered persistent deployment '{manifest.profile}' "
-                                f"is missing: {flags_str}; restarting..."
-                            )
-                            if helpers._restart_persistent_proxy(manifest, port):
-                                # Restarted from the manifest, whose mode need not be ours.
-                                _warn_proxy_mode_mismatch(helpers._query_proxy_config(port))
-                                return None, port
-                            raise click.ClickException(
-                                f"Persistent deployment '{manifest.profile}' on port {port} "
-                                "could not be restarted with requested features."
-                            )
-                elif helpers._check_proxy(port) and not helpers._foreign_listener(port):
-                    raise click.ClickException(
-                        f"Persistent deployment '{manifest.profile}' on port {port} is not healthy."
+                            flags_str = helpers._capability_flags(missing)
+                            if action == "reconcile":
+                                click.echo(
+                                    f"  Recovered persistent deployment "
+                                    f"'{manifest.profile}' is missing: {flags_str}; "
+                                    "restarting it..."
+                                )
+                                if helpers._restart_persistent_proxy(manifest, port):
+                                    _warn_proxy_mode_mismatch(helpers._query_proxy_config(port))
+                                    return None, port
+                                click.echo(
+                                    f"  Warning: persistent deployment "
+                                    f"'{manifest.profile}' could not be restarted with "
+                                    "the requested capabilities; starting a dedicated "
+                                    "proxy on a different port instead."
+                                )
+                            else:
+                                click.echo(
+                                    f"  Recovered persistent deployment "
+                                    f"'{manifest.profile}' is missing: {flags_str}, but "
+                                    f"{reason}."
+                                )
+                                click.echo(
+                                    "  Leaving the deployment untouched; starting a "
+                                    "dedicated proxy for this session instead."
+                                )
+                            persistent_proxy_unusable = True
+                elif helpers._deployment_is_task_managed(manifest):
+                    # Wrap must not drive a task deployment's lifecycle, but the
+                    # port still belongs to the scheduler. Stay off it and say
+                    # how to bring the deployment back, rather than squatting it
+                    # with an ephemeral proxy that the next `ensure` collides
+                    # with -- the state that produced the original bug report.
+                    click.echo(
+                        f"  Persistent deployment '{manifest.profile}' is not running and "
+                        "is task-managed, so wrap cannot start it."
                     )
-                # A foreign (non-Headroom) listener squatting the manifest's
-                # port is treated like a stale deployment: fall through and
-                # start a fresh proxy on another port.
-            if not persistent_routing_mismatch:
-                click.echo(
-                    f"  Warning: persistent deployment '{manifest.profile}' on port {port} "
-                    "is stale; starting a fresh proxy instead."
-                )
+                    click.echo(
+                        "  Start it with: headroom install agent ensure --profile "
+                        f"{manifest.profile}"
+                    )
+                    click.echo(
+                        f"  Reserving port {port} for it; starting a dedicated proxy for "
+                        "this session on a different port."
+                    )
+                    persistent_port_reserved = True
+                    persistent_proxy_unusable = True
+                else:
+                    click.echo(
+                        f"  Warning: persistent deployment '{manifest.profile}' on port "
+                        f"{port} is stale; starting a fresh proxy instead."
+                    )
 
         proxy_listener = (
             not isolated_copilot_subscription_proxy
-            and not persistent_routing_mismatch
+            and not persistent_proxy_unusable
             and helpers._check_proxy(port)
         )
         health_payload = helpers._query_proxy_health(port) if proxy_listener else None
@@ -5555,8 +5851,14 @@ def _ensure_proxy_unlocked(
         # Start (or restart) the proxy with the requested flags.
         # Subscription-seeded sessions must not claim the shared port even if
         # it is momentarily free; the persistent install or shared proxy still
-        # owns that slot semantically.
-        port_search_start = port + 1 if isolated_copilot_subscription_proxy else port
+        # owns that slot semantically. The same holds for a port a persistent
+        # deployment still owns: it may be unbound for the moment (the runtime
+        # is starting, or its proxy died and the supervisor has not noticed),
+        # and parking a wrap-owned proxy there is exactly what left the task
+        # deployment and the live listener disagreeing about who owns 8787.
+        port_search_start = (
+            port + 1 if isolated_copilot_subscription_proxy or persistent_port_reserved else port
+        )
         try:
             actual_port = helpers._find_available_port(port_search_start)
         except OSError as e:
@@ -5565,7 +5867,7 @@ def _ensure_proxy_unlocked(
             raise click.ClickException(str(e)) from e
 
         if actual_port != port:
-            if isolated_copilot_subscription_proxy:
+            if isolated_copilot_subscription_proxy or persistent_port_reserved:
                 click.echo(
                     f"  Port {port} is reserved for the shared proxy; "
                     f"using port {actual_port} for this dedicated session instead."
@@ -5580,7 +5882,7 @@ def _ensure_proxy_unlocked(
         # one fills (#3716).
         replaces_running_proxy = (
             isolated_copilot_subscription_proxy
-            or persistent_routing_mismatch
+            or persistent_proxy_unusable
             or (proxy_listener and not reuse_running)
         )
         proxy_extensions: list[str] | None = None

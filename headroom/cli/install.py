@@ -578,6 +578,7 @@ def _build_deployment_manifest(
     region: str | None,
     proxy_mode: str,
     memory: bool,
+    learn: bool,
     telemetry: bool,
     no_telemetry: bool,
     image: str,
@@ -604,6 +605,7 @@ def _build_deployment_manifest(
         region=region,
         proxy_mode=proxy_mode,
         memory_enabled=memory,
+        learn_enabled=learn,
         telemetry_enabled=telemetry and not no_telemetry,
         no_rate_limit=no_rate_limit,
         image=image,
@@ -868,6 +870,11 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
 )
 @click.option("--memory", is_flag=True, help="Enable persistent memory in the proxy runtime.")
 @click.option(
+    "--learn",
+    is_flag=True,
+    help="Enable traffic learning in the proxy runtime (implies --memory).",
+)
+@click.option(
     "--telemetry",
     is_flag=True,
     help="Opt in to anonymous telemetry in the runtime (off by default).",
@@ -958,6 +965,7 @@ def install_apply(
     region: str | None,
     proxy_mode: str,
     memory: bool,
+    learn: bool,
     telemetry: bool,
     no_telemetry: bool,
     no_rate_limit: bool,
@@ -1005,6 +1013,7 @@ def install_apply(
         region=region,
         proxy_mode=proxy_mode,
         memory=memory,
+        learn=learn,
         telemetry=telemetry,
         no_telemetry=no_telemetry,
         no_rate_limit=no_rate_limit,
@@ -1085,6 +1094,11 @@ def install_apply(
 )
 @click.option("--memory", is_flag=True, help="Enable persistent memory in the proxy runtime.")
 @click.option(
+    "--learn",
+    is_flag=True,
+    help="Enable traffic learning in the proxy runtime (implies --memory).",
+)
+@click.option(
     "--telemetry",
     is_flag=True,
     help="Opt in to anonymous telemetry in the runtime (off by default).",
@@ -1121,6 +1135,7 @@ def deploy(
     provider_mode: str,
     targets: tuple[str, ...],
     memory: bool,
+    learn: bool,
     telemetry: bool,
     no_telemetry: bool,
     image: str,
@@ -1144,6 +1159,7 @@ def deploy(
         region=region,
         proxy_mode=proxy_mode,
         memory=memory,
+        learn=learn,
         telemetry=telemetry,
         no_telemetry=no_telemetry,
         image=image,

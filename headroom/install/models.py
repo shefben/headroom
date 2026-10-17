@@ -105,6 +105,15 @@ class DeploymentManifest:
     region: str | None = None
     proxy_mode: str = "cache"
     memory_enabled: bool = False
+    # Traffic learning in the persistent runtime. Defaults to False so manifests
+    # written before this field existed deserialize unchanged (and keep behaving
+    # as they did: no `--learn` in their saved `proxy_args`). It is a deployment
+    # capability because the learner is user/agent-scoped and writes through the
+    # memory backend — nothing about it depends on a caller's project directory.
+    # `--code-graph` deliberately has no counterpart here: its watcher binds to
+    # the proxy process's own cwd, so a shared runtime cannot serve it for
+    # someone else's checkout.
+    learn_enabled: bool = False
     memory_db_path: str = ""
     telemetry_enabled: bool = True
     image: str = "ghcr.io/headroomlabs-ai/headroom:latest"

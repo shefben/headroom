@@ -496,13 +496,22 @@ class TestModeWarningOnEveryReusePath:
 
         import headroom.install.health as install_health
 
-        # Dormant persistent deployment: recovery brings it up without
-        # --memory, so wrap restarts it from the manifest, in the manifest's
-        # (cache) mode.
-        manifest = SimpleNamespace(profile="p", health_url="http://127.0.0.1:8787/readyz")
+        # Healthy persistent deployment serving without --memory, so wrap
+        # restarts it from the manifest, in the manifest's (cache) mode.
+        # `memory_enabled` is what makes the shortfall reconcilable: wrap only
+        # restarts a deployment for a capability its manifest declares, since a
+        # restart cannot supply anything the manifest does not carry. And the
+        # deployment has to be the thing actually serving the port -- when it is
+        # not, wrap leaves the listener alone and takes a port of its own, so no
+        # restart would happen to warn about.
+        manifest = SimpleNamespace(
+            profile="p",
+            health_url="http://127.0.0.1:8787/readyz",
+            memory_enabled=True,
+        )
         monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda _p: manifest)
-        monkeypatch.setattr(install_health, "probe_ready", lambda _url: False)
-        monkeypatch.setattr(wrap_mod, "_recover_persistent_proxy", lambda _p: True)
+        monkeypatch.setattr(install_health, "probe_ready", lambda _url: True)
+        monkeypatch.setattr(wrap_mod, "_live_proxy_clients", lambda *_a, **_k: [])
         monkeypatch.setattr(wrap_mod, "_proxy_routing_mismatches", lambda *_a, **_k: [])
         restarted: list[int] = []
         monkeypatch.setattr(

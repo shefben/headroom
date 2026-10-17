@@ -11,6 +11,9 @@ import pytest
 
 from headroom.install.models import DeploymentManifest, InstallPreset
 from headroom.install.runtime import (
+    RUNTIME_CLAIM_OWNED,
+    RUNTIME_CLAIM_RELEASED,
+    RUNTIME_CLAIM_UNVERIFIED,
     _clear_pid,
     _deployment_env,
     _mount_source,
@@ -22,7 +25,9 @@ from headroom.install.runtime import (
     build_runtime_command,
     resolve_headroom_command,
     run_foreground,
+    runtime_claim,
     runtime_ownership,
+    runtime_ready,
     runtime_status,
     start_detached_agent,
     start_persistent_docker,
@@ -1555,3 +1560,72 @@ def test_stop_runtime_clears_pid_of_dead_process(monkeypatch, tmp_path: Path) ->
 
     stop_runtime(manifest)
     assert _read_pid("default") is None
+
+
+# --- runtime_claim: ownership apart from readiness --------------------------
+
+
+def _pid_file(tmp_path: Path, pid: str = "25212") -> Path:
+    path = tmp_path / ".headroom" / "deploy" / "default" / "runner.pid"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(pid, encoding="utf-8")
+    return path
+
+
+def test_runtime_claim_owned_for_a_live_matching_process(monkeypatch, tmp_path: Path) -> None:
+    """A live process with matching identity holds the deployment's claim."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _pid_file(tmp_path)
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid, manifest: True)
+
+    assert runtime_claim(_python_service_manifest()) == RUNTIME_CLAIM_OWNED
+
+
+def test_runtime_claim_unverified_when_identity_cannot_be_read(monkeypatch, tmp_path: Path) -> None:
+    """Windows without psutil or argv markers: unprovable, so never stealable.
+
+    ``_process_identity`` returns ``None`` there. Reporting "released" would let
+    ``headroom wrap`` bind the deployment's port and kill its proxy on the
+    strength of a check that simply could not run.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    pid_file = _pid_file(tmp_path)
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid, manifest: None)
+
+    assert runtime_claim(_python_service_manifest()) == RUNTIME_CLAIM_UNVERIFIED
+    assert pid_file.exists(), "an unverifiable claim must not be cleared"
+
+
+def test_runtime_claim_released_when_no_pid_file_exists(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    assert runtime_claim(_python_service_manifest()) == RUNTIME_CLAIM_RELEASED
+
+
+def test_runtime_claim_released_for_a_foreign_process(monkeypatch, tmp_path: Path) -> None:
+    """A recycled PID belonging to something else is not a claim."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _pid_file(tmp_path)
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid, manifest: False)
+
+    assert runtime_claim(_python_service_manifest()) == RUNTIME_CLAIM_RELEASED
+
+
+def test_runtime_claim_is_independent_of_health(monkeypatch, tmp_path: Path) -> None:
+    """The point of the split: a deployment mid-start still owns its port.
+
+    ``runtime_ready`` is False here because the health endpoint does not answer,
+    yet the runtime process is alive and matching, so the claim stands.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _pid_file(tmp_path)
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid, manifest: True)
+    monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
+
+    manifest = _python_service_manifest()
+    assert runtime_ready(manifest) is False
+    assert runtime_claim(manifest) == RUNTIME_CLAIM_OWNED

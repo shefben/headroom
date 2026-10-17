@@ -695,6 +695,40 @@ def runtime_status(manifest: DeploymentManifest) -> str:
     return "running"
 
 
+# Verdicts from :func:`runtime_claim`.
+RUNTIME_CLAIM_OWNED = "owned"
+RUNTIME_CLAIM_UNVERIFIED = "unverified"
+RUNTIME_CLAIM_RELEASED = "released"
+
+
+def runtime_claim(manifest: DeploymentManifest) -> str:
+    """Whether this deployment still holds a live runtime process.
+
+    Deliberately weaker than :func:`runtime_ready`, which additionally requires
+    the health endpoint to answer. A deployment that is mid-start, or whose
+    proxy is wedged, still *owns* its runtime process and its reserved port:
+    ``headroom wrap`` must not bind that port or kill that process just because
+    ``/readyz`` has not come up yet. Separating the two facts is what lets wrap
+    tell "the deployment is broken" from "the deployment is not the thing
+    currently listening" (see ``_persistent_port_state`` in ``cli/wrap.py``).
+
+    ``RUNTIME_CLAIM_UNVERIFIED`` means a live process holds the PID file but its
+    identity could not be confirmed — Windows without ``psutil`` and without the
+    argv deployment markers, which is the ordinary case for a task deployment
+    launched by an older installer. It is reported apart from ``OWNED`` so a
+    caller can distinguish "proven ours" from "cannot prove otherwise", but both
+    must be treated as owned: an unprovable claim is never grounds for taking
+    the port or killing the process.
+    """
+
+    status = runtime_status(manifest)
+    if status == "running":
+        return RUNTIME_CLAIM_OWNED
+    if status == "unknown":
+        return RUNTIME_CLAIM_UNVERIFIED
+    return RUNTIME_CLAIM_RELEASED
+
+
 def detect_current_deployment() -> tuple[DeploymentManifest | None, str]:
     """Detect how THIS running proxy was launched.
 

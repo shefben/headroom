@@ -35,6 +35,15 @@ class _Manifest:
     preset = "persistent-service"
     supervisor_kind = "service"
     health_url = "http://127.0.0.1:8787/readyz"
+    # A deployment installed with both capabilities, so restarting it can
+    # genuinely supply them. wrap only reconciles a shortfall the manifest
+    # declares; see `_manifest_declares_capability` in cli/wrap.py.
+    memory_enabled = True
+    learn_enabled = True
+    # Deliberately no `runtime_kind`: this double does not implement the
+    # deployment identity contract, so neither `runtime_ready` nor
+    # `runtime_claim` can match it against a live process, and the tests stay
+    # independent of whatever is installed on the machine running them.
 
 
 def test_ensure_proxy_recovers_matching_persistent_deployment(monkeypatch) -> None:
@@ -66,7 +75,15 @@ def test_ensure_proxy_recovers_matching_persistent_deployment(monkeypatch) -> No
     assert calls == ["start:default"]
 
 
-def test_ensure_proxy_recovers_persistent_deployment_when_socket_is_bound(monkeypatch) -> None:
+def test_ensure_proxy_reuses_a_compatible_listener_instead_of_recovering(monkeypatch) -> None:
+    """A compatible Headroom proxy already on the port is shared, not recovered.
+
+    Previously wrap recovered the deployment here, which in a real run means
+    telling the supervisor to start a runtime that cannot bind the port it is
+    configured for -- the listener already has it. When that listener is
+    Headroom and its config matches the request, sharing it is both correct and
+    the only non-disruptive option.
+    """
     calls: list[str] = []
 
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
@@ -94,7 +111,7 @@ def test_ensure_proxy_recovers_persistent_deployment_when_socket_is_bound(monkey
         wrap_cli,
         "_start_proxy",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("matching recovered proxy should be reused")
+            AssertionError("a matching proxy on the port should be reused")
         ),
     )
 
@@ -102,26 +119,43 @@ def test_ensure_proxy_recovers_persistent_deployment_when_socket_is_bound(monkey
 
     assert proc is None
     assert actual_port == 8787
-    assert calls == ["start:default"]
+    assert calls == [], "the listener already holds the port; nothing to recover"
 
 
-def test_ensure_proxy_rejects_unhealthy_persistent_deployment(monkeypatch) -> None:
+def test_unowned_headroom_listener_gets_a_dedicated_proxy(monkeypatch) -> None:
+    """A Headroom proxy the deployment does not own must not be a fatal error.
+
+    This replaces ``test_ensure_proxy_rejects_unhealthy_persistent_deployment``,
+    which pinned the dead end users actually hit: wrap declined to recover a
+    task deployment, then raised "Persistent deployment ... is not healthy"
+    about a port that a perfectly live proxy was serving, leaving no way
+    forward. The listener here advertises no routing config, so it cannot be
+    verified for reuse -- but the answer is a dedicated proxy beside it, never
+    an exception and never a kill.
+    """
+    calls: list[object] = []
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
     # Headroom-identified listener: a foreign squatter would fall
-    # through to a fresh port instead of raising.
+    # through to a fresh port with a different message.
     monkeypatch.setattr(
         wrap_cli, "_query_proxy_health", lambda port: {"version": "0.0.0-test", "config": {}}
     )
     monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
     monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
     monkeypatch.setattr(wrap_cli, "_recover_persistent_proxy", lambda port: False)
+    monkeypatch.setattr(wrap_cli, "_find_available_port", lambda start, **kw: 8799)
+    monkeypatch.setattr(
+        wrap_cli, "_kill_proxy_by_pid", lambda pid, port: calls.append(("kill", pid, port)) or True
+    )
+    monkeypatch.setattr(
+        wrap_cli, "_start_proxy", lambda *args, **kwargs: calls.append(("start", args[0]))
+    )
 
-    try:
-        wrap_cli._ensure_proxy(8787, False)
-    except click.ClickException as exc:
-        assert "is not healthy" in str(exc)
-    else:
-        raise AssertionError("expected unhealthy persistent deployment to raise")
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False, memory=True)
+
+    assert actual_port == 8799
+    assert proc is None  # the stub returns None; the port is what matters here
+    assert calls == [("start", 8799)], "no kill, no raise: just a proxy of its own"
 
 
 def test_ensure_proxy_falls_back_when_persistent_manifest_is_stale(monkeypatch) -> None:
@@ -827,7 +861,9 @@ def test_ensure_proxy_routing_mismatch_on_persistent_deployment_uses_dedicated_p
 
     assert proc is None
     assert actual_port == 8799
-    assert calls[0] == ("find_port", 8787)
+    # Starts the search one past the reserved port: the deployment still
+    # owns 8787, so wrap never probes (let alone binds) it.
+    assert calls[0] == ("find_port", 8788)
     assert calls[1][0] == "start"
     assert calls[1][1][0] == 8799
 
@@ -1067,7 +1103,9 @@ def test_ensure_proxy_stale_attached_persistent_routing_mismatch_uses_dedicated_
     )
 
     assert wrap_cli._ensure_proxy(8787, False, memory=True) == (None, 8799)
-    assert calls[0] == ("find_port", 8787)
+    # Starts the search one past the reserved port: the deployment still
+    # owns 8787, so wrap never probes (let alone binds) it.
+    assert calls[0] == ("find_port", 8788)
     assert calls[1][0] == "start"
 
 
@@ -1568,14 +1606,25 @@ def test_ensure_proxy_diverts_persistent_deployment_for_routing_mismatch(
     assert actual_port == 8799
     # Deployment left running; dedicated proxy started on the free port with
     # the requested routing.
-    assert calls[0] == ("find_port", 8787)
+    # Starts the search one past the reserved port: the deployment still
+    # owns 8787, so wrap never probes (let alone binds) it.
+    assert calls[0] == ("find_port", 8788)
     assert calls[1][0] == "start"
     assert calls[1][1][0] == 8799
     assert calls[1][2]["openai_api_url"] == "https://api.githubcopilot.com"
 
 
-def test_ensure_proxy_restarts_persistent_deployment_for_memory_mismatch(monkeypatch) -> None:
-    """Persistent deployment should restart when memory is requested but not enabled."""
+def test_persistent_deployment_reconciles_memory_without_being_killed(monkeypatch) -> None:
+    """A capability shortfall is reconciled through the deployment, not by force.
+
+    This replaces ``test_ensure_proxy_restarts_persistent_deployment_for_memory_mismatch``,
+    which asserted the behaviour at the root of the concurrency bug: wrap killed
+    the PID the persistent proxy reported and started an ordinary wrap-owned
+    proxy on the deployment's reserved port. The deployment's PID file then
+    named a dead process while a live proxy served 8787, and no later wrap could
+    reconcile the two. The manifest declares memory, so the fix restarts the
+    deployment through its own lifecycle instead.
+    """
     calls: list[object] = []
     health = {
         "version": wrap_cli._HEADROOM_VERSION,
@@ -1606,15 +1655,21 @@ def test_ensure_proxy_restarts_persistent_deployment_for_memory_mismatch(monkeyp
         lambda *args, **kwargs: calls.append(("start", args, kwargs)),
     )
 
+    monkeypatch.setattr(
+        wrap_cli,
+        "_restart_persistent_proxy",
+        lambda manifest, port: calls.append(("restart", manifest.profile, port)) or True,
+    )
+
     # Request memory that differs from running config (False)
     proc, actual_port = wrap_cli._ensure_proxy(8787, False, memory=True)
 
     assert proc is None
     assert actual_port == 8787
-    # Proxy should be killed and restarted due to memory mismatch
-    assert calls[0] == ("kill", 12345, 8787)
-    assert calls[1][0] == "start"
-    assert calls[1][2]["memory"] is True
+    assert calls == [("restart", "default", 8787)], (
+        "the deployment restarts itself; its runtime is never killed and its "
+        "reserved port is never rebound by a wrap-owned proxy"
+    )
 
 
 def test_ensure_proxy_restarts_recovered_persistent_for_openai_api_url_mismatch(
@@ -1770,7 +1825,6 @@ def test_ensure_proxy_reuses_persistent_deployment_when_features_match(monkeypat
     [
         {"memory": True},
         {"learn": True},
-        {"code_graph": True},
     ],
 )
 def test_ensure_proxy_recovered_persistent_deployment_checks_feature_mismatch(
@@ -1780,7 +1834,10 @@ def test_ensure_proxy_recovered_persistent_deployment_checks_feature_mismatch(
     """Recovered persistent deployments must still restart on feature mismatch.
 
     Regression guard for the recover path: when wrap requests memory, do not
-    early-return right after recover; restart the deployment if needed.
+    early-return right after recover; restart the deployment if needed. Both
+    parameters are capabilities ``_Manifest`` declares, so a restart can supply
+    them; ``code_graph`` is covered separately because no shared proxy can
+    provide it for another session's project directory.
     """
 
     calls: list[object] = []
@@ -1798,8 +1855,17 @@ def test_ensure_proxy_recovered_persistent_deployment_checks_feature_mismatch(
 
     monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
     monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
-    monkeypatch.setattr(wrap_cli, "_recover_persistent_proxy", lambda port: True)
-    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    # Nothing holds the port until recovery brings the deployment up, which is
+    # the only way the recover path is reachable: a listener already on the port
+    # is classified (and handled) before recovery is considered.
+    listening = {"value": False}
+
+    def _recover(_port: int) -> bool:
+        listening["value"] = True
+        return True
+
+    monkeypatch.setattr(wrap_cli, "_recover_persistent_proxy", _recover)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: listening["value"])
     monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
     monkeypatch.setattr(
         wrap_cli,
@@ -1821,28 +1887,87 @@ def test_ensure_proxy_recovered_persistent_deployment_checks_feature_mismatch(
     assert calls == [("restart", "default", 8787)]
 
 
-def test_ensure_proxy_recovered_feature_restart_failure_raises(monkeypatch) -> None:
+def test_recovered_persistent_deployment_dedicates_for_code_graph(monkeypatch) -> None:
+    """``--code-graph`` is session-scoped, so it never restarts a shared proxy.
+
+    The watcher indexes ``Path.cwd()`` of the *proxy* process, so a deployment
+    started by a supervisor would watch the supervisor's directory. Restarting
+    it with the flag would report success and index the wrong tree, so wrap
+    takes a dedicated proxy for this session instead.
+    """
+    calls: list[object] = []
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {
+            "pid": 12345,
+            "memory": True,
+            "learn": True,
+            "code_graph": False,
+            "openai_api_url": None,
+        },
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
+    monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: True)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_find_available_port", lambda start, **kw: 8799)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_restart_persistent_proxy",
+        lambda manifest, port: calls.append(("restart", port)) or True,
+    )
+    monkeypatch.setattr(
+        wrap_cli, "_kill_proxy_by_pid", lambda pid, port: calls.append(("kill", pid)) or True
+    )
+    monkeypatch.setattr(
+        wrap_cli, "_start_proxy", lambda *args, **kwargs: calls.append(("start", args[0]))
+    )
+
+    _proc, actual_port = wrap_cli._ensure_proxy(8787, False, memory=True, code_graph=True)
+
+    assert actual_port == 8799
+    assert calls == [("start", 8799)], "no restart and no kill of the shared deployment"
+
+
+def test_ensure_proxy_recovered_feature_restart_failure_dedicates(monkeypatch) -> None:
+    """A failed reconciliation falls back to a dedicated proxy, never an error.
+
+    Formerly raised "could not be restarted with requested features", which left
+    the session dead in the water over a capability the deployment merely could
+    not supply right now. The deployment is still left exactly as it was.
+    """
     health = {
         "version": wrap_cli._HEADROOM_VERSION,
         "config": {"pid": 12345, "backend": "anthropic", "memory": False},
     }
 
+    started: list[int] = []
+    killed: list[int] = []
+    listening = {"value": False}
+
+    def _recover(_port: int) -> bool:
+        listening["value"] = True
+        return True
+
     monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
     monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
-    monkeypatch.setattr(wrap_cli, "_recover_persistent_proxy", lambda port: True)
-    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_recover_persistent_proxy", _recover)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: listening["value"])
     monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
     monkeypatch.setattr(wrap_cli, "_restart_persistent_proxy", lambda manifest, port: False)
+    monkeypatch.setattr(wrap_cli, "_find_available_port", lambda start, **kw: 8799)
     monkeypatch.setattr(
-        wrap_cli,
-        "_start_proxy",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("failed persistent restart must not start an ephemeral proxy")
-        ),
+        wrap_cli, "_kill_proxy_by_pid", lambda pid, port: killed.append(pid) or True
     )
+    monkeypatch.setattr(wrap_cli, "_start_proxy", lambda *args, **kwargs: started.append(args[0]))
 
-    with pytest.raises(click.ClickException, match="could not be restarted"):
-        wrap_cli._ensure_proxy(8787, False, memory=True)
+    _proc, actual_port = wrap_cli._ensure_proxy(8787, False, memory=True)
+
+    assert actual_port == 8799, "a dedicated proxy beside the deployment, not an exception"
+    assert started == [8799]
+    assert killed == [], "the deployment's runtime is left untouched"
 
 
 def _dedicated_start(monkeypatch, *, health, manifest=None):
